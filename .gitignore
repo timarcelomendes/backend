@@ -1,0 +1,19 @@
+# Ambiente Virtual
+venv/
+.venv/
+env/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Variáveis de ambiente e segredos
+.env
+
+# Banco de dados local (se usar SQLite)
+*.db
+
+# Arquivos do Editor/Sistema
+.vscode/
+.DS_Store

@@ -1,0 +1,13 @@
+pydantic
+openpyxl
+python-dotenv
+fastapi
+uvicorn
+sqlalchemy
+pyodbc
+pandas
+python-multipart
+bcrypt
+pyjwt
+requests
+python-jose[cryptography]
