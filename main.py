@@ -1,3 +1,6 @@
+import os
+import json
+import openai
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -126,6 +129,10 @@ class ClienteUpdate(BaseModel):
 class StatusUpdate(BaseModel):
     ativo: bool
 
+class ConfigItem(BaseModel):
+    chave: str
+    valor: str
+
 # Configurações de Segurança
 SECRET_KEY = "nps_intelligence_secret_key_gauge"
 ALGORITHM = "HS256"
@@ -194,9 +201,6 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="Erro ao validar credenciais. Contacte o suporte."
             )
 
-        # ==========================================
-        # 🛡️ GESTÃO DE SESSÕES (CÓDIGO NOVO AQUI)
-        # ==========================================
         # Captura os dados reais da máquina de quem fez login
         user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
         ip_address = request.client.host if request.client else "IP Desconhecido"
@@ -375,6 +379,102 @@ async def reset_manual_senha(usuario_id: str):
         return {"senha_provisoria": senha_provisoria}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# ⚙️ ROTAS DE CONFIGURAÇÃO
+# ==========================================
+@app.get("/api/configuracoes")
+async def get_configuracoes():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            resultado = conn.execute(text("SELECT chave, valor FROM dbo.nps_configuracoes")).fetchall()
+            configs = {row.chave: row.valor for row in resultado}
+            return {"status": "success", "data": configs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/configuracoes")
+async def save_configuracoes(configs: List[ConfigItem]):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            for item in configs:
+                conn.execute(text("""
+                    UPDATE dbo.nps_configuracoes 
+                    SET valor = :valor, updated_at = GETDATE() 
+                    WHERE chave = :chave
+                """), {"valor": item.valor, "chave": item.chave})
+        return {"status": "success", "detail": "Configurações salvas!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 🤖 MAGIC AI (LENDO CHAVE DO BANCO)
+# ==========================================
+@app.get("/api/dashboard/magic-ai")
+async def get_magic_ai_insights():
+    try:
+        engine = get_engine()
+        
+        # 1. Puxa as configurações diretamente do Banco de Dados
+        with engine.connect() as conn:
+            api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
+            ai_model = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
+            ai_temp = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'ai_temperature'")).scalar() or "0.4"
+            
+            # Validação de segurança: Se a chave estiver vazia, avisa o Frontend
+            if not api_key or api_key.strip() == "":
+                return {
+                    "status": "success", 
+                    "insights": {
+                        "arder": "Atenção necessária:",
+                        "amar": "A funcionalidade de Inteligência Artificial está adormecida.",
+                        "recomendacao": "Vá ao menu Definições > Inteligência Artificial e insira a sua chave da OpenAI."
+                    }
+                }
+
+            # 2. Busca os comentários reais
+            sql = """
+                SELECT TOP 100 nota, motivo, categoria 
+                FROM dbo.nps_respostas 
+                WHERE motivo IS NOT NULL AND motivo != '' AND excluido = 0
+                ORDER BY created_at DESC
+            """
+            df = pd.read_sql(text(sql), conn)
+
+        if df.empty:
+            return {"status": "success", "insights": {"arder": "Sem dados suficientes.", "amar": "Aguardando submissões.", "recomendacao": "Dispare uma nova pesquisa."}}
+
+        lista_comentarios = [f"Nota: {row['nota']} - Categoria: {row['categoria']} - Comentário: {row['motivo']}" for _, row in df.iterrows()]
+        texto_para_ia = "\n".join(lista_comentarios)
+
+        # 3. Executa a IA com os parâmetros dinâmicos do Banco
+        client = openai.OpenAI(api_key=api_key.strip())
+        prompt_sistema = f"""
+        Atue como um Consultor Executivo de CX. Analise estes feedbacks:
+        {texto_para_ia}
+        
+        Forneça um resumo executivo com exatamente 3 pontos em formato JSON estrito:
+        {{
+            "arder": "1 frase resumindo o principal problema.",
+            "amar": "1 frase resumindo os elogios.",
+            "recomendacao": "1 frase com um plano de ação direto."
+        }}
+        """
+
+        resposta_ia = client.chat.completions.create(
+            model=ai_model,
+            messages=[{"role": "user", "content": prompt_sistema}],
+            response_format={ "type": "json_object" },
+            temperature=float(ai_temp)
+        )
+
+        return {"status": "success", "insights": json.loads(resposta_ia.choices[0].message.content)}
+
+    except Exception as e:
+        print(f"❌ ERRO IA: {str(e)}")
+        raise HTTPException(status_code=500, detail="Falha ao gerar insights. Verifique a API Key.")
     
 # ==========================================
 # 👥 ROTAS: GESTÃO DE OPERADORES (USUÁRIOS)
@@ -437,7 +537,7 @@ def get_dashboard_kpis(empresa: Optional[str] = Query(None)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql_set = text("SELECT valor FROM dbo.nps_settings WHERE chave = 'mostrar_sem_cliente'")
+            sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
             
             tipo_join = "LEFT JOIN" if config_valor == 'true' else "INNER JOIN"
@@ -623,14 +723,17 @@ def get_dashboard_detalhes(empresa: Optional[str] = Query(None)):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.get("/api/dashboard/trend")
 def get_dashboard_trend(empresa: Optional[str] = Query(None)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql_set = text("SELECT valor FROM dbo.nps_settings WHERE chave = 'mostrar_sem_cliente'")
+            # 💡 AQUI ESTÁ A CORREÇÃO: Lê da nps_configuracoes em vez de nps_settings
+            sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
+            
+            # Se a configuração for 'true', usa LEFT JOIN, senão usa INNER JOIN (padrão)
             tipo_join = "LEFT JOIN" if config_valor == 'true' else "INNER JOIN"
 
             condicao = ""
