@@ -37,23 +37,20 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Tenta ler a URL do Azure. Se não houver, assume que é local.
-front_url_azure = os.getenv("FRONTEND_URL")
-
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://blue-sand-0bbaa2010.6.azurestaticapps.net"
-    "https://blue-sand-0bbaa2010.6.azurestaticapps.net/"
 ]
 
-# Se existir uma URL de produção, adiciona ela na lista permitida
+front_url_azure = os.getenv("FRONTEND_URL")
 if front_url_azure:
-    origins.append(front_url_azure)
+    origins.append(front_url_azure.rstrip("/"))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -277,7 +274,7 @@ def registrar_usuario(requisicao: RegistroRequest):
         
         query_insert = text("""
             INSERT INTO dbo.nps_usuarios (nome, email, senha_hash, cargo, ativo, tipo)
-            VALUES (:nome, :email, :senha_hash, 'Analista', 'False', 'Usuário')
+            VALUES (:nome, :email, :senha_hash, 'Analista', 0, 'Usuário')
         """)
         
         conn.execute(query_insert, {
@@ -286,7 +283,7 @@ def registrar_usuario(requisicao: RegistroRequest):
             "senha_hash": senha_hash
         })
         
-    return {"mensagem": "Conta criada com sucesso e aguarda aprovação!"}
+    return {"mensagem": "Conta criada com sucesso e aguarda aprovação do administrador!"}
 
 
 @app.post("/api/reset-password") # Ou apenas "/reset-password" como ajustámos no frontend
@@ -295,7 +292,6 @@ async def resetar_senha(req: ResetPasswordRequest):
     engine = get_engine()
     
     try:
-        # PASSO 1: Abrir e validar o Token JWT
         try:
             payload = jwt.decode(req.token, SECRET_KEY, algorithms=[ALGORITHM])
             email_usuario = payload.get("sub")
@@ -306,10 +302,8 @@ async def resetar_senha(req: ResetPasswordRequest):
         except JWTError:
             raise HTTPException(status_code=400, detail="O link de recuperação expirou ou é inválido.")
 
-        # PASSO 2: Criptografar a nova senha
         senha_encriptada = pwd_context.hash(req.nova_senha)
         
-        # PASSO 3: Guardar a nova senha no banco de dados usando o e-mail
         with engine.begin() as conn:
             query_update = text("""
                 UPDATE dbo.nps_usuarios 
@@ -321,7 +315,6 @@ async def resetar_senha(req: ResetPasswordRequest):
                 "email": email_usuario
             })
             
-            # Verificar se o utilizador realmente existe/foi alterado
             if resultado.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
             
@@ -338,16 +331,13 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
     engine = get_engine()
     try:
         with engine.connect() as conn:
-            # Procure o utilizador (removi o filtro de 'True' para teste, caso o seu user esteja como 1 ou True string)
             query = text("SELECT email FROM dbo.nps_usuarios WHERE email = :email")
             resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
             
             if not resultado:
-                # Retornamos sucesso por segurança, mas avisamos no log
                 print(f"ℹ️ Recuperação solicitada para e-mail inexistente: {requisicao.email}")
                 return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
 
-            # 2. Gera o token
             expira = datetime.utcnow() + timedelta(minutes=30)
             token = jwt.encode(
                 {"sub": resultado['email'], "exp": expira, "tipo": "reset"}, 
@@ -357,7 +347,6 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
             
             link = f"http://localhost:5173/reset-password?token={token}"
             
-            # 3. Dispara o envio
             print(f"📧 A disparar e-mail de recuperação para: {resultado['email']}")
             background_tasks.add_task(enviar_email_recuperacao, resultado['email'], link)
                 
@@ -372,17 +361,14 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
 async def alterar_minha_senha(requisicao: AlterarSenhaRequest, usuario_email: str = Depends(get_current_user)):
     engine = get_engine()
     with engine.connect() as conn:
-        # 1. Busca a senha atual no banco
         user = conn.execute(
             text("SELECT senha_hash FROM dbo.nps_usuarios WHERE email = :email"),
             {"email": usuario_email}
         ).fetchone()
 
-        # 2. Valida a senha atual
         if not bcrypt.checkpw(requisicao.senha_atual.encode('utf-8'), user.senha_hash.encode('utf-8')):
             raise HTTPException(status_code=400, detail="A senha atual está incorreta.")
 
-        # 3. Gera o novo hash e salva
         novo_hash = bcrypt.hashpw(requisicao.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         conn.execute(
             text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE email = :email"),
@@ -442,6 +428,7 @@ async def save_configuracoes(configs: List[ConfigItem]):
 # ==========================================
 # 🤖 MAGIC AI (LENDO CHAVE DO BANCO)
 # ==========================================
+
 @app.get("/api/dashboard/magic-ai")
 async def get_magic_ai_insights():
     try:
