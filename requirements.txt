@@ -14,3 +14,4 @@ python-jose[cryptography]
 gunicorn
 openai
 passlib[bcrypt]
+email-validator
