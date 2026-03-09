@@ -12,3 +12,5 @@ pyjwt
 requests
 python-jose[cryptography]
 gunicorn
+openai
+passlib[bcrypt]
