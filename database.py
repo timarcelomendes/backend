@@ -2,7 +2,6 @@ import os
 import urllib.parse
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-import pyodbc
 
 # Carrega as variáveis do arquivo .env
 load_dotenv()
@@ -11,19 +10,6 @@ def exec_sql(sql: str, params: dict | None = None):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(text(sql), params or {})
-
-def _build_conn_str(driver: str, server: str, database: str, username: str, password: str) -> str:
-    return (
-        f"Driver={{{driver}}};"
-        f"Server=tcp:{server},1433;"
-        f"Database={database};"
-        f"Uid={username};"
-        f"Pwd={password};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=yes;"
-        "MARS_Connection=yes;"
-        "Connection Timeout=30;"
-    )
 
 # Engine instanciado de forma global para aproveitar o Pool de conexões do SQLAlchemy
 _engine_instance = None
@@ -39,24 +25,17 @@ def get_engine():
     username = os.getenv("SQL_USER")
     password = os.getenv("SQL_PASSWORD")
 
-    # 👇 MÁGICA AQUI: Verifica qual driver está instalado no sistema
-    drivers_instalados = pyodbc.drivers()
+    # Codificamos a senha e o usuário para evitar que caracteres como @ ou # quebrem a URL
+    senha_codificada = urllib.parse.quote_plus(password)
+    usuario_codificado = urllib.parse.quote_plus(username)
     
-    if "ODBC Driver 18 for SQL Server" in drivers_instalados:
-        driver = "ODBC Driver 18 for SQL Server"
-    elif "ODBC Driver 17 for SQL Server" in drivers_instalados:
-        driver = "ODBC Driver 17 for SQL Server"
-    else:
-        # Fallback genérico caso o nome seja ligeiramente diferente no Linux
-        driver = "ODBC Driver 17 for SQL Server" 
-        
-    print(f"🔌 Usando o driver: {driver}") # Isto vai aparecer no Log do Azure para o ajudar
-
-    conn_str = _build_conn_str(driver, server, database, username, password)
-    params = urllib.parse.quote_plus(conn_str)
+    # 👇 A MÁGICA: Usamos mssql+pymssql. Sem necessidade de drivers do Windows/Linux!
+    conn_url = f"mssql+pymssql://{usuario_codificado}:{senha_codificada}@{server}:1433/{database}"
+    
+    print("🔌 Conectando ao banco de dados com pymssql (Driver Embutido)...")
     
     _engine_instance = create_engine(
-        f"mssql+pyodbc:///?odbc_connect={params}",
+        conn_url,
         pool_pre_ping=True,
         pool_recycle=1800,
         future=True,
