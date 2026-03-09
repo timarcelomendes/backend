@@ -11,3 +11,4 @@ bcrypt
 pyjwt
 requests
 python-jose[cryptography]
+gunicorn
