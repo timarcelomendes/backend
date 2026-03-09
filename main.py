@@ -43,7 +43,8 @@ front_url_azure = os.getenv("FRONTEND_URL")
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://blue-sand-0bbaa2010.6.azurestaticapps.net" 
+    "https://blue-sand-0bbaa2010.6.azurestaticapps.net"
+    "https://blue-sand-0bbaa2010.6.azurestaticapps.net/"
 ]
 
 # Se existir uma URL de produção, adiciona ela na lista permitida
