@@ -15,7 +15,6 @@ from passlib.context import CryptContext
 import jwt
 from datetime import datetime, timedelta
 import bcrypt
-import uuid
 import requests
 import secrets
 import string
