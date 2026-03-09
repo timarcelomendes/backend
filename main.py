@@ -146,8 +146,12 @@ class ConfigItem(BaseModel):
     chave: str
     valor: str
 
-# Configurações de Segurança
-SECRET_KEY = "nps_intelligence_secret_key_gauge"
+# Configurações de Segurança e Autenticação
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+if not SECRET_KEY:
+    raise RuntimeError("ERRO CRÍTICO: JWT_SECRET_KEY não configurada nas variáveis de ambiente.")
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
