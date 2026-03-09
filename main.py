@@ -38,12 +38,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Configuração de CORS: Permite que o Vue.js (que vai rodar em outra porta) acesse a API
+# Tenta ler a URL do Azure. Se não houver, assume que é local.
+front_url_azure = os.getenv("FRONTEND_URL")
+
 origins = [
-    "https://blue-sand-0bbaa2010.6.azurestaticapps.net",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://blue-sand-0bbaa2010.6.azurestaticapps.net" 
 ]
+
+# Se existir uma URL de produção, adiciona ela na lista permitida
+if front_url_azure:
+    origins.append(front_url_azure)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ==========================================
 # 📦 SCHEMAS (Pydantic Models)
