@@ -2,6 +2,7 @@ import os
 import urllib.parse
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+import pyodbc
 
 # Carrega as variáveis do arquivo .env
 load_dotenv()
@@ -32,13 +33,25 @@ def get_engine():
     if _engine_instance is not None:
         return _engine_instance
 
-    # Agora buscamos do ambiente, não mais do st.secrets
+    # Busca das variáveis de ambiente
     server = os.getenv("SQL_SERVER")
     database = os.getenv("SQL_DB")
     username = os.getenv("SQL_USER")
     password = os.getenv("SQL_PASSWORD")
 
-    driver = "ODBC Driver 18 for SQL Server" # Pode manter a lógica de fallback se quiser
+    # 👇 MÁGICA AQUI: Verifica qual driver está instalado no sistema
+    drivers_instalados = pyodbc.drivers()
+    
+    if "ODBC Driver 18 for SQL Server" in drivers_instalados:
+        driver = "ODBC Driver 18 for SQL Server"
+    elif "ODBC Driver 17 for SQL Server" in drivers_instalados:
+        driver = "ODBC Driver 17 for SQL Server"
+    else:
+        # Fallback genérico caso o nome seja ligeiramente diferente no Linux
+        driver = "ODBC Driver 17 for SQL Server" 
+        
+    print(f"🔌 Usando o driver: {driver}") # Isto vai aparecer no Log do Azure para o ajudar
+
     conn_str = _build_conn_str(driver, server, database, username, password)
     params = urllib.parse.quote_plus(conn_str)
     
