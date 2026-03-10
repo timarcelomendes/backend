@@ -560,18 +560,18 @@ async def listar_operadores():
 @app.get("/api/dashboard/kpis")
 def get_dashboard_kpis(
     empresa: Optional[str] = Query(None),
-    data_inicio: Optional[str] = Query(None), # 🟢 NOVO
-    data_fim: Optional[str] = Query(None)     # 🟢 NOVO
+    data_inicio: Optional[str] = Query(None),
+    data_fim: Optional[str] = Query(None)
 ):
     try:
         engine = get_engine()
         with engine.connect() as conn:
+            # 1. VERIFICA CONFIGURAÇÃO DE VISIBILIDADE
             sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
-            
             tipo_join = "LEFT JOIN" if config_valor == 'true' else "INNER JOIN"
             
-            # 🟢 SISTEMA DINÂMICO DE FILTROS
+            # 2. SISTEMA DINÂMICO DE FILTROS
             filtros_sql = []
             parametros = {}
             
@@ -583,7 +583,6 @@ def get_dashboard_kpis(
                     parametros["empresa"] = empresa
                     
             if data_inicio and data_fim:
-                # Usa COALESCE para garantir que pega a data quer o cliente tenha respondido por email ou direto
                 filtros_sql.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
                 filtros_sql.append("COALESCE(r.data_resposta, r.created_at) <= :data_fim")
                 parametros["data_inicio"] = f"{data_inicio} 00:00:00"
@@ -593,6 +592,29 @@ def get_dashboard_kpis(
             if len(filtros_sql) > 0:
                 condicao_filtro = " WHERE " + " AND ".join(filtros_sql)
 
+            # --- 3. PROCESSAMENTO DE PALAVRAS MAIS USADAS (WORD CLOUD) ---
+            sql_termos = text(f"""
+                SELECT CAST(r.motivo AS NVARCHAR(MAX)) as comentario
+                FROM dbo.nps_respostas r
+                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                {condicao_filtro} 
+                { "AND" if condicao_filtro else "WHERE" } r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 3
+            """)
+            
+            comentarios_raw = conn.execute(sql_termos, parametros).scalars().all()
+            
+            stop_words = {
+                'para', 'com', 'mais', 'esta', 'está', 'pela', 'pelo', 'como', 'muito', 'tudo', 
+                'fazer', 'quando', 'você', 'pode', 'seria', 'estão', 'neste', 'esse', 'isso',
+                'pela', 'pelo', 'uma', 'umas', 'uns', 'tem', 'têm', 'fui', 'foi', 'ser', 'bom', 'bem'
+            }
+            
+            texto_unificado = " ".join([str(c).lower() for c in comentarios_raw if c])
+            palavras = re.findall(r'\b[a-zà-ÿ]{4,}\b', texto_unificado)
+            contagem = Counter([p for p in palavras if p not in stop_words])
+            termos_frequentes = [{"palavra": p, "quantidade": q} for p, q in contagem.most_common(12)]
+
+            # --- 4. QUERY DE KPIS PRINCIPAIS ---
             sql_kpis = text(f"""
                 SELECT 
                     COUNT(r.resposta_id) as total_respostas,
@@ -604,9 +626,7 @@ def get_dashboard_kpis(
                     SUM(CASE WHEN c.perfil_decisor = 'Decisor' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
                     SUM(CASE WHEN c.perfil_decisor = 'Decisor' THEN 1 ELSE 0 END) as decisor_total,
                     
-                    SUM(CASE WHEN r.nota <= 6 AND r.jira_issue_url IS NOT NULL AND LTRIM(RTRIM(r.jira_issue_url)) <> '' THEN 1 ELSE 0 END) as detratores_com_jira,
-                    SUM(CASE WHEN r.nota <= 6 THEN COALESCE(c.valor_contrato, 0) ELSE 0 END) as revenue_at_risk
-
+                    SUM(CASE WHEN r.nota <= 6 AND r.jira_issue_url IS NOT NULL AND LTRIM(RTRIM(r.jira_issue_url)) <> '' THEN 1 ELSE 0 END) as detratores_com_jira
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                 {condicao_filtro};
@@ -614,33 +634,29 @@ def get_dashboard_kpis(
                     
             resumo = conn.execute(sql_kpis, parametros).mappings().first()
             
-            total = resumo['total_respostas'] if resumo and resumo['total_respostas'] else 0
-            promotores = resumo['promotores'] if resumo and resumo['promotores'] else 0
-            neutros = resumo['neutros'] if resumo and resumo['neutros'] else 0
-            detratores = resumo['detratores'] if resumo and resumo['detratores'] else 0
+            total = resumo['total_respostas'] or 0
+            promotores = resumo['promotores'] or 0
+            neutros = resumo['neutros'] or 0
+            detratores = resumo['detratores'] or 0
             
+            # Cálculo NPS Geral
             nps_score = 0
             if total > 0:
-                pct_promotores = (promotores / total) * 100
-                pct_detratores = (detratores / total) * 100
-                nps_score = round(pct_promotores - pct_detratores)
+                nps_score = round(((promotores - detratores) / total) * 100)
                 
-            # 🚀 CÁLCULO: NPS do Decisor
-            dec_total = resumo['decisor_total'] if resumo and resumo['decisor_total'] else 0
+            # Cálculo NPS Decisor
+            dec_total = resumo['decisor_total'] or 0
             nps_decisor = 0
             if dec_total > 0:
-                pct_dec_prom = (resumo['decisor_promotores'] / dec_total) * 100
-                pct_dec_detr = (resumo['decisor_detratores'] / dec_total) * 100
-                nps_decisor = round(pct_dec_prom - pct_dec_detr)
+                nps_decisor = round(((resumo['decisor_promotores'] - resumo['decisor_detratores']) / dec_total) * 100)
 
-            # 🚀 CÁLCULO: Taxa de Ação no Jira
+            # Taxa de Ação Jira
             taxa_jira = 0
             if detratores > 0:
-                qtd_jira = resumo['detratores_com_jira'] if resumo and resumo['detratores_com_jira'] else 0
-                taxa_jira = round((qtd_jira / detratores) * 100)
+                taxa_jira = round(((resumo['detratores_com_jira'] or 0) / detratores) * 100)
 
+            # --- 5. CÁLCULO REVENUE AT RISK (Financeiro) ---
             filtro_sub = condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""
-            
             sql_rev = text(f"""
                 SELECT SUM(e.valor_contrato) as risco
                 FROM dbo.nps_empresas e
@@ -653,51 +669,35 @@ def get_dashboard_kpis(
             """)
             risco_real = conn.execute(sql_rev, parametros).scalar() or 0
                 
-            # 🚀 QUERY FEEDBACKS (Trazendo Perfil e URL do Jira)
+            # --- 6. FEEDBACKS RECENTES E TAGS ---
             sql_feedbacks = text(f"""
-                SELECT TOP 5 
-                    r.nota, 
-                    CAST(r.motivo AS NVARCHAR(MAX)) as comentario, 
-                    r.created_at, 
-                    r.jira_issue_url,
-                    c.nome as cliente, 
-                    c.empresa,
-                    c.perfil_decisor
+                SELECT TOP 10 
+                    r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario, 
+                    r.created_at, r.jira_issue_url,
+                    c.nome as cliente, c.empresa, c.perfil_decisor
                 FROM dbo.nps_respostas r
                 INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE r.motivo IS NOT NULL 
-                  AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
-                  {condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""} 
+                WHERE r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
+                {condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""} 
                 ORDER BY r.created_at DESC;
             """)
             
             feedbacks_raw = conn.execute(sql_feedbacks, parametros).mappings().all()
             
-            # 🚀 MOTOR DE CATEGORIZAÇÃO AUTOMÁTICA (TAGS)
             regras_tags = {
-                "Performance": ["lento", "lentidão", "trava", "demora", "carregar", "peso", "carrega", "cai", "devagar"],
-                "UX/UI": ["difícil", "layout", "design", "confuso", "achar", "tela", "interface", "ux", "ui", "cores", "navegação"],
-                "Atendimento": ["suporte", "atendimento", "ajuda", "ticket", "cs", "demora para responder", "contato"],
-                "Integração": ["integração", "jira", "api", "conectar", "n8n", "sincronizar", "integra", "sistema"],
-                "Bugs/Erros": ["erro", "bug", "falha", "caiu", "quebrou", "não funciona", "problema"],
-                "Preço": ["caro", "preço", "custo", "valor", "pagar", "mensalidade"]
+                "Performance": ["lento", "lentidão", "trava", "demora", "carregar", "devagar"],
+                "UX/UI": ["difícil", "layout", "design", "confuso", "interface", "navegação"],
+                "Atendimento": ["suporte", "atendimento", "ajuda", "cs", "resposta"],
+                "Integração": ["integração", "jira", "api", "conectar", "sincronizar"],
+                "Bugs": ["erro", "bug", "falha", "quebrou", "problema"]
             }
             
-            feedbacks = []
+            feedbacks_processados = []
             for f_raw in feedbacks_raw:
                 f = dict(f_raw)
-                comentario = str(f.get("comentario") or "").lower()
-                tags_encontradas = []
-                
-                # Varrer as regras procurando palavras-chave no comentário
-                if len(comentario) > 3:
-                    for tag, palavras_chave in regras_tags.items():
-                        if any(palavra in comentario for palavra in palavras_chave):
-                            tags_encontradas.append(tag)
-                
-                # Adiciona as tags ao objeto que vai para o Vue.js
-                f["tags"] = tags_encontradas
-                feedbacks.append(f)
+                texto = str(f.get("comentario") or "").lower()
+                f["tags"] = [tag for tag, keys in regras_tags.items() if any(k in texto for k in keys)]
+                feedbacks_processados.append(f)
             
         return {
             "status": "success",
@@ -709,13 +709,12 @@ def get_dashboard_kpis(
                 "detratores": detratores,
                 "nps_decisor": nps_decisor, 
                 "taxa_jira": taxa_jira,
-                "total_decisores": dec_total,
-                "revenue_at_risk": float(risco_real)
+                "revenue_at_risk": float(risco_real),
+                "termos_frequentes": termos_frequentes
             },
-            "feedbacks": feedbacks
+            "feedbacks": feedbacks_processados
         }
     except Exception as e:
-        import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1275,6 +1274,75 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
             raise HTTPException(status_code=400, detail="Já existe outro cliente utilizando este mesmo e-mail.")
             
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/audiencia/plano-acao")
+def gerar_plano_acao_empresa(empresa: str):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 1. BUSCAR CONFIGURAÇÕES DA MAGIC AI (API KEY E MODELO)
+            sql_ai = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('openai_api_key', 'openai_model')")
+            configs = {row.chave: row.valor for row in conn.execute(sql_ai)}
+            
+            api_key = configs.get('openai_api_key')
+            modelo = configs.get('openai_model', 'gpt-4o-mini')
+
+            if not api_key:
+                return {"plano": "Configuração de IA não encontrada. Verifique a chave da OpenAI nas definições."}
+
+            # 2. BUSCAR COMENTÁRIOS DA EMPRESA
+            sql_comentarios = text("""
+                SELECT CAST(r.motivo AS NVARCHAR(MAX)) as comentario, r.nota
+                FROM dbo.nps_respostas r
+                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                WHERE c.empresa = :empresa 
+                  AND r.motivo IS NOT NULL 
+                  AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 5
+            """)
+            resultados = conn.execute(sql_comentarios, {"empresa": empresa}).mappings().all()
+            
+            if not resultados:
+                return {"plano": f"A empresa {empresa} ainda não possui comentários qualitativos suficientes para uma análise de IA."}
+
+            # 3. PREPARAR O CONTEXTO PARA O GPT
+            feedbacks_texto = "\n".join([f"Nota {r['nota']}: {r['comentario']}" for r in resultados])
+            
+            prompt_sistema = "Você é um consultor especialista em Customer Success e retenção de clientes (NPS)."
+            prompt_usuario = f"""
+            Analise estes feedbacks reais dos clientes da empresa '{empresa}':
+            
+            {feedbacks_texto}
+            
+            Com base nisso, gere um PLANO DE ACÇÃO ESTRATÉGICO para evitar cancelamentos (Churn).
+            REGRAS:
+            1. Seja direto e use linguagem executiva.
+            2. Divida em 3 pontos práticos de ação.
+            3. Identifique o maior 'ponto de dor' recorrente.
+            4. Sugira uma ação para os próximos 7 dias.
+            """
+
+            # 4. CHAMADA À OPENAI
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=modelo,
+                messages=[
+                    {"role": "system", "content": prompt_sistema},
+                    {"role": "user", "content": prompt_usuario}
+                ],
+                temperature=0.7
+            )
+
+            plano_gerado = response.choices[0].message.content
+
+            return {
+                "status": "success",
+                "empresa": empresa,
+                "plano": plano_gerado
+            }
+
+    except Exception as e:
+        print(f"Erro na IA: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao processar plano de IA: {str(e)}")
 
 # ==========================================
 # 📋 LISTAR FEEDBACKS (Respostas)
