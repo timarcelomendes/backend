@@ -100,6 +100,7 @@ class ResetPasswordRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+    remember: bool = False
 
 class EsqueciSenhaRequest(BaseModel):
     email: str
@@ -184,6 +185,7 @@ async def login(requisicao: LoginRequest, request: Request):
             FROM dbo.nps_usuarios 
             WHERE email = :email
         """)
+        # .mappings().first() devolve um dicionário (Mapping)
         resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
 
         # 💡 VALIDAÇÃO 1: Utilizador não existe
@@ -194,7 +196,8 @@ async def login(requisicao: LoginRequest, request: Request):
             )
 
         # 💡 VALIDAÇÃO 2: Utilizador inativo ou pendente
-        ativo_val = str(resultado.ativo).strip().lower()
+        # 🔧 CORREÇÃO: Acesso via [" "]
+        ativo_val = str(resultado["ativo"]).strip().lower()
         if ativo_val not in ['1', 'true']:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, 
@@ -203,68 +206,69 @@ async def login(requisicao: LoginRequest, request: Request):
 
         # 💡 VALIDAÇÃO 3: Palavra-passe incorreta
         try:
+            # 🔧 CORREÇÃO: Acesso via [" "]
             senha_correta = bcrypt.checkpw(
                 requisicao.password.encode('utf-8'), 
-                resultado.senha_hash.encode('utf-8')
+                resultado["senha_hash"].encode('utf-8')
             )
             if not senha_correta:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, 
                     detail="A palavra-passe digitada está incorreta."
                 )
-        except Exception:
+        except Exception as e:
+            print(f"Erro Bcrypt: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
                 detail="Erro ao validar credenciais. Contacte o suporte."
             )
 
-        # Captura os dados reais da máquina de quem fez login
+        # Captura os dados reais da máquina
         user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
         ip_address = request.client.host if request.client else "IP Desconhecido"
         
-        # Formata o nome do dispositivo para ficar bonito no Frontend Vue
+        # Lógica de formato de dispositivo (mantida)
+        tipo_disp = "Desktop/Browser"
         if "Mobile" in user_agent or "iPhone" in user_agent or "Android" in user_agent:
             tipo_disp = "Mobile"
         elif "Mac OS" in user_agent:
             tipo_disp = "Mac/Apple"
         elif "Windows" in user_agent:
             tipo_disp = "Windows/PC"
-        else:
-            tipo_disp = "Desktop/Browser"
             
         dispositivo_amigavel = f"{tipo_disp} • {user_agent[:20]}..."
 
-        # Grava a sessão no SQL Server
+        # Grava a sessão
         conn.execute(text("""
             INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao)
             VALUES (:uid, :disp, :ip, 'Detetado Automaticamente')
         """), {
-            "uid": resultado.usuario_id,
+            "uid": resultado["usuario_id"],
             "disp": dispositivo_amigavel,
             "ip": ip_address
         })
-        conn.commit() # 💡 Muito importante para salvar o INSERT na base de dados!
+        conn.commit() 
 
-        # ==========================================
+        # --- GERAÇÃO DO TOKEN ---
+        if requisicao.remember:
+            expires_delta = timedelta(days=30)
+        else:
+            expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-        # Se chegar aqui, as credenciais estão certas. Geramos o Token.
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = jwt.encode(
-            {"sub": resultado.email, "exp": datetime.utcnow() + access_token_expires},
+            {"sub": resultado["email"], "exp": datetime.utcnow() + expires_delta},
             SECRET_KEY, 
             algorithm=ALGORITHM
         )
 
-        # Retorno esperado pelo teu Frontend (localStorage)
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "usuario_id": str(resultado.usuario_id),
-            "nome": resultado.nome,
-            "cargo": resultado.cargo,
-            "tipo": resultado.tipo
+            "usuario_id": resultado["usuario_id"],
+            "nome": resultado["nome"],
+            "cargo": resultado["cargo"],
+            "tipo": resultado["tipo"]
         }
-
 @app.post("/api/register")
 def registrar_usuario(requisicao: RegistroRequest):
     engine = get_engine()
