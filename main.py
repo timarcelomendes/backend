@@ -206,21 +206,21 @@ async def login(requisicao: LoginRequest, request: Request):
 
         # 💡 VALIDAÇÃO 3: Palavra-passe incorreta
         try:
-            # 🔧 CORREÇÃO: Acesso via [" "]
             senha_correta = bcrypt.checkpw(
                 requisicao.password.encode('utf-8'), 
                 resultado["senha_hash"].encode('utf-8')
             )
-            if not senha_correta:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED, 
-                    detail="A palavra-passe digitada está incorreta."
-                )
         except Exception as e:
             print(f"Erro Bcrypt: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                detail="Erro ao validar credenciais. Contacte o suporte."
+                detail="Erro interno ao verificar a encriptação. Contacte o suporte."
+            )
+
+        if not senha_correta:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="A palavra-passe digitada está incorreta."
             )
 
         # Captura os dados reais da máquina
@@ -269,6 +269,7 @@ async def login(requisicao: LoginRequest, request: Request):
             "cargo": resultado["cargo"],
             "tipo": resultado["tipo"]
         }
+    
 @app.post("/api/register")
 def registrar_usuario(requisicao: RegistroRequest):
     engine = get_engine()
