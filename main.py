@@ -179,9 +179,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.post("/api/login")
 async def login(requisicao: LoginRequest, request: Request):
-    
     engine = get_engine()
     with engine.connect() as conn:
+        # 1. Busca o utilizador (Mantendo todos os seus campos originais)
         query = text("""
             SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
             FROM dbo.nps_usuarios 
@@ -189,6 +189,7 @@ async def login(requisicao: LoginRequest, request: Request):
         """)
         resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
 
+        # 2. Validações de existência e status (Inativo/Pendente)
         if not resultado:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, 
@@ -202,6 +203,7 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A sua conta está inativa ou aguarda aprovação do administrador."
             )
 
+        # 3. Verificação de Password Resiliente
         try:
             senha_correta = bcrypt.checkpw(
                 requisicao.password.encode('utf-8'), 
@@ -211,7 +213,7 @@ async def login(requisicao: LoginRequest, request: Request):
             print(f"Erro Bcrypt: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                detail="Erro interno ao verificar a encriptação. Contacte o suporte."
+                detail="Erro na encriptação. Contacte o suporte técnico."
             )
 
         if not senha_correta:
@@ -220,59 +222,77 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A palavra-passe digitada está incorreta."
             )
 
+        # 4. Identificação do Dispositivo e IP
         user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
         ip_address = request.client.host if request.client else "IP Desconhecido"
         
         tipo_disp = "Desktop/Browser"
-        if "Mobile" in user_agent or "iPhone" in user_agent or "Android" in user_agent:
+        if any(x in user_agent for x in ["Mobile", "iPhone", "Android"]):
             tipo_disp = "Mobile"
         elif "Mac OS" in user_agent:
             tipo_disp = "Mac/Apple"
         elif "Windows" in user_agent:
             tipo_disp = "Windows/PC"
             
-        dispositivo_amigavel = f"{tipo_disp} • {user_agent[:20]}..."
+        dispositivo_amigavel = f"{tipo_disp} • {user_agent[:30]}..."
 
-        conn.execute(text("""
-            INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao)
-            VALUES (:uid, :disp, :ip, 'Detetado Automaticamente')
+        # 5. LÓGICA ANTI-DUPLICAÇÃO (UPSERT DE SESSÃO)
+        # Verifica se já existe uma sessão para este User + IP + Browser que não foi revogada
+        check_sessao = conn.execute(text("""
+            SELECT id FROM dbo.nps_sessoes_ativas 
+            WHERE usuario_id = :uid AND ip_address = :ip AND dispositivo = :disp AND revogado = 0
         """), {
             "uid": resultado["usuario_id"],
-            "disp": dispositivo_amigavel,
-            "ip": ip_address
-        })
+            "ip": ip_address,
+            "disp": dispositivo_amigavel
+        }).fetchone()
+
+        agora_utc = datetime.now(timezone.utc)
+
+        if check_sessao:
+            # Se já existe, apenas atualizamos o timestamp para não criar outra linha
+            conn.execute(text("""
+                UPDATE dbo.nps_sessoes_ativas 
+                SET criado_em = :agora 
+                WHERE id = :sid
+            """), {"agora": agora_utc, "sid": check_sessao.id})
+        else:
+            # Se é novo, inserimos
+            conn.execute(text("""
+                INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
+                VALUES (:uid, :disp, :ip, 'Detetado Automaticamente', :agora, 0)
+            """), {
+                "uid": resultado["usuario_id"],
+                "disp": dispositivo_amigavel,
+                "ip": ip_address,
+                "agora": agora_utc
+            })
         
+        # 6. Atualiza último acesso do utilizador
         conn.execute(text("""
             UPDATE dbo.nps_usuarios 
             SET ultimo_acesso = :agora
             WHERE usuario_id = :uid
         """), {
-            "agora": datetime.utcnow(),
+            "agora": agora_utc,
             "uid": resultado["usuario_id"]
         })
         
         conn.commit() 
 
-        if requisicao.remember:
-            expires_delta = timedelta(days=30)
-        else:
-            expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
-        agora_utc = datetime.now(timezone.utc)
-        agora = datetime.now(timezone.utc)
-        if requisicao.remember:
-            expires_delta = timedelta(days=30)
-        else:
-            expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
-        expire = agora + expires_delta
+        # 7. Geração do Token JWT (Com tempo corrigido em UTC)
+        expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = agora_utc + expires_delta
 
         to_encode = {
             "sub": resultado["email"],
-            "exp": expire
+            "exp": expire # jose valida o exp automaticamente se for datetime
         }
+        
+        # Usando a biblioteca jose conforme os seus imports
         access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+        # 8. Retorno Completo para a Sidebar e Storage do Vue
         return {
             "access_token": access_token,
             "token_type": "bearer",
