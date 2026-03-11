@@ -13,7 +13,7 @@ from collections import Counter
 import pandas as pd
 from passlib.context import CryptContext
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import bcrypt
 import requests
 import secrets
@@ -177,26 +177,22 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.post("/api/login")
 async def login(requisicao: LoginRequest, request: Request):
+    
     engine = get_engine()
     with engine.connect() as conn:
-        # 1. Procura o utilizador no SQL Server
         query = text("""
             SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
             FROM dbo.nps_usuarios 
             WHERE email = :email
         """)
-        # .mappings().first() devolve um dicionário (Mapping)
         resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
 
-        # 💡 VALIDAÇÃO 1: Utilizador não existe
         if not resultado:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, 
                 detail="Este e-mail não está registado na plataforma."
             )
 
-        # 💡 VALIDAÇÃO 2: Utilizador inativo ou pendente
-        # 🔧 CORREÇÃO: Acesso via [" "]
         ativo_val = str(resultado["ativo"]).strip().lower()
         if ativo_val not in ['1', 'true']:
             raise HTTPException(
@@ -204,7 +200,6 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A sua conta está inativa ou aguarda aprovação do administrador."
             )
 
-        # 💡 VALIDAÇÃO 3: Palavra-passe incorreta
         try:
             senha_correta = bcrypt.checkpw(
                 requisicao.password.encode('utf-8'), 
@@ -223,11 +218,9 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A palavra-passe digitada está incorreta."
             )
 
-        # Captura os dados reais da máquina
         user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
         ip_address = request.client.host if request.client else "IP Desconhecido"
         
-        # Lógica de formato de dispositivo (mantida)
         tipo_disp = "Desktop/Browser"
         if "Mobile" in user_agent or "iPhone" in user_agent or "Android" in user_agent:
             tipo_disp = "Mobile"
@@ -238,7 +231,6 @@ async def login(requisicao: LoginRequest, request: Request):
             
         dispositivo_amigavel = f"{tipo_disp} • {user_agent[:20]}..."
 
-        # Grava a sessão
         conn.execute(text("""
             INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao)
             VALUES (:uid, :disp, :ip, 'Detetado Automaticamente')
@@ -247,9 +239,18 @@ async def login(requisicao: LoginRequest, request: Request):
             "disp": dispositivo_amigavel,
             "ip": ip_address
         })
+        
+        conn.execute(text("""
+            UPDATE dbo.nps_usuarios 
+            SET ultimo_acesso = :agora
+            WHERE usuario_id = :uid
+        """), {
+            "agora": datetime.utcnow(),
+            "uid": resultado["usuario_id"]
+        })
+        
         conn.commit() 
 
-        # --- GERAÇÃO DO TOKEN ---
         if requisicao.remember:
             expires_delta = timedelta(days=30)
         else:
@@ -544,12 +545,27 @@ async def listar_operadores():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 💡 Adicionamos 'tipo' à consulta
-            query = text("SELECT usuario_id, nome, email, cargo, tipo, ativo FROM dbo.nps_usuarios ORDER BY nome ASC")
+            query = text("""
+                SELECT usuario_id, nome, email, cargo, tipo, ativo, ultimo_acesso 
+                FROM dbo.nps_usuarios 
+                ORDER BY nome ASC
+            """)
             result = conn.execute(query).mappings().all()
             
-            # Convertemos os resultados para dicionários
-            return [dict(r) for r in result]
+            lista_usuarios = []
+            for r in result:
+                usuario = dict(r)
+                
+                if usuario.get("ultimo_acesso"):
+                    data_utc = usuario["ultimo_acesso"].replace(tzinfo=timezone.utc)
+                    usuario["ultimo_acesso"] = data_utc.isoformat()
+                else:
+                    usuario["ultimo_acesso"] = None
+                    
+                lista_usuarios.append(usuario)
+                
+            return lista_usuarios
+            
     except Exception as e:
         print(f"Erro ao listar usuários: {e}")
         raise HTTPException(status_code=500, detail="Erro ao carregar lista de usuários.")
