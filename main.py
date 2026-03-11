@@ -12,7 +12,6 @@ import re
 from collections import Counter
 import pandas as pd
 from passlib.context import CryptContext
-import jwt
 from datetime import datetime, timedelta, timezone
 import bcrypt
 import requests
@@ -29,7 +28,9 @@ from pydantic import BaseModel
 from fastapi import HTTPException
 from sqlalchemy import text
 from passlib.context import CryptContext
-from jose import jwt, JWTError
+from jose import jwt, JWTError, ExpiredSignatureError
+
+
 
 app = FastAPI(
     title="NPS API - Gauge Stefanini",
@@ -154,7 +155,7 @@ if not SECRET_KEY:
     raise RuntimeError("ERRO CRÍTICO: JWT_SECRET_KEY não configurada nas variáveis de ambiente.")
 
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 480
+ACCESS_TOKEN_EXPIRE_MINUTES = 2
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
@@ -162,17 +163,18 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Não foi possível validar as credenciais",
+        detail="Sessão expirada. Por favor, faça login novamente.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        # SECRET_KEY e ALGORITHM devem ser os mesmos usados no login
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True})
         email: str = payload.get("sub")
         if email is None:
             raise credentials_exception
         return email
-    except jwt.PyJWTError:
+    except ExpiredSignatureError:
+        raise credentials_exception
+    except JWTError:
         raise credentials_exception
 
 @app.post("/api/login")
@@ -256,11 +258,20 @@ async def login(requisicao: LoginRequest, request: Request):
         else:
             expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-        access_token = jwt.encode(
-            {"sub": resultado["email"], "exp": datetime.utcnow() + expires_delta},
-            SECRET_KEY, 
-            algorithm=ALGORITHM
-        )
+        agora_utc = datetime.now(timezone.utc)
+        agora = datetime.now(timezone.utc)
+        if requisicao.remember:
+            expires_delta = timedelta(days=30)
+        else:
+            expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+        expire = agora + expires_delta
+
+        to_encode = {
+            "sub": resultado["email"],
+            "exp": expire
+        }
+        access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
         return {
             "access_token": access_token,
