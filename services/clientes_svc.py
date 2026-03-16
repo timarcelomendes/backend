@@ -84,18 +84,13 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.cliente_id, 
         c.nome, 
         c.email, 
-        '' AS telefone,      /* MOCK: Evita erro no banco, envia vazio para o Vue */
-        '' AS cargo,         /* MOCK: Evita erro no banco, envia vazio para o Vue */
+        c.telefone,          /* 👈 Agora lê o telefone REAL do banco */
+        c.cargo,             /* 👈 Agora lê o cargo REAL do banco */
         c.empresa, 
         c.perfil_decisor, 
         c.segmento,
         
-        -- 💡 CÁLCULO INTELIGENTE DO STATUS AQUI
-        CASE 
-            WHEN (SELECT COUNT(1) FROM dbo.nps_respostas r WHERE r.cliente_id = c.cliente_id) > 0 THEN 'Respondido'
-            WHEN c.ultimo_envio IS NOT NULL THEN 'Enviado'
-            ELSE 'Pendente'
-        END AS status_envio, 
+        c.status_envio,      /* 👈 FIM DO BUG! Agora lê o status exato que o n8n e o banco definem */
         
         c.ultimo_envio, 
         c.proximo_envio, 
@@ -107,18 +102,19 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
     {where_sql}
     ORDER BY c.updated_at DESC;
     """
+
     return read_df(sql, params)
 
-def insert_cliente(nome: str, email: str, empresa: str, perfil_decisor: str, segmento: str):
+def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str):
     cliente_id = make_cliente_id(email, empresa)
 
     sql = """
     INSERT INTO dbo.nps_clientes
-      (cliente_id, nome, email, empresa, perfil_decisor, segmento,
+      (cliente_id, nome, email, telefone, cargo, empresa, perfil_decisor, segmento,
        ativo, status_envio, ultimo_envio, proximo_envio, ultimo_erro,
        created_at, updated_at)
     VALUES
-      (:cliente_id, :nome, :email, :empresa, :perfil_decisor, :segmento,
+      (:cliente_id, :nome, :email, :telefone, :cargo, :empresa, :perfil_decisor, :segmento,
        1, 'Pendente', NULL, CAST(GETDATE() AS DATE), NULL,
        SYSUTCDATETIME(), SYSUTCDATETIME());
     """
@@ -131,6 +127,8 @@ def insert_cliente(nome: str, email: str, empresa: str, perfil_decisor: str, seg
                 "cliente_id": cliente_id,
                 "nome": (nome or "").strip(),
                 "email": (email or "").strip(),
+                "telefone": (telefone or "").strip() or None,
+                "cargo": (cargo or "").strip() or None,
                 "empresa": (empresa or "").strip(),
                 "perfil_decisor": perfil_decisor,
                 "segmento": (segmento or "").strip() or None,
@@ -139,15 +137,28 @@ def insert_cliente(nome: str, email: str, empresa: str, perfil_decisor: str, seg
 
     return cliente_id
 
-def update_cliente(cliente_id: str, nome: str, email: str, empresa: str, perfil_decisor: str, segmento: str):
-    sql = """
-    UPDATE dbo.nps_clientes SET
-      nome = NULLIF(LTRIM(RTRIM(:nome)), ''), email = NULLIF(LTRIM(RTRIM(:email)), ''),
-      empresa = NULLIF(LTRIM(RTRIM(:empresa)), ''), perfil_decisor = NULLIF(LTRIM(RTRIM(:perfil_decisor)), ''),
-      segmento = NULLIF(LTRIM(RTRIM(:segmento)), ''), updated_at = SYSUTCDATETIME()
-    WHERE cliente_id = :cliente_id;
-    """
-    exec_sql(sql, {"cliente_id": cliente_id, "nome": nome, "email": email, "empresa": empresa, "perfil_decisor": perfil_decisor, "segmento": segmento})
+def update_cliente(cliente_id, nome, email, telefone, empresa, perfil_decisor, segmento, cargo):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE dbo.nps_clientes
+            SET nome = :nome,
+                email = :email,
+                telefone = :telefone,
+                empresa = :empresa,
+                perfil_decisor = :perfil_decisor,
+                cargo = :cargo,
+                updated_at = GETDATE()
+            WHERE cliente_id = :id
+        """), {
+            "nome": nome, 
+            "email": email, 
+            "telefone": telefone or "", # Proteção contra valores nulos
+            "empresa": empresa or "", 
+            "perfil_decisor": perfil_decisor or "",
+            "cargo": cargo or "", 
+            "id": cliente_id
+        })
 
 def set_ativo(cliente_id: str, ativo: int):
     sql = "UPDATE dbo.nps_clientes SET ativo = :ativo, updated_at = SYSUTCDATETIME() WHERE cliente_id = :cliente_id;"

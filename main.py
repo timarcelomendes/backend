@@ -130,16 +130,20 @@ class EmpresaSchema(BaseModel):
 class ClienteCreate(BaseModel):
     nome: str
     email: str
-    empresa: str
-    perfil_decisor: str = "Decisor"
+    telefone: Optional[str] = ""
+    empresa: Optional[str] = ""
+    perfil_decisor: Optional[str] = ""
     segmento: Optional[str] = ""
+    cargo: str
 
 class ClienteUpdate(BaseModel):
     nome: str
     email: str
-    empresa: str
-    perfil_decisor: str
+    telefone: Optional[str] = ""
+    empresa: Optional[str] = ""
+    perfil_decisor: Optional[str] = ""
     segmento: Optional[str] = ""
+    cargo: str
 
 class StatusUpdate(BaseModel):
     ativo: bool
@@ -1149,6 +1153,43 @@ def update_perfil(perf_id: int, perf: BasicoSchema):
     with engine.begin() as conn:
         conn.execute(text("UPDATE dbo.nps_perfis SET nome=:n WHERE id=:id"), {"n": perf.nome, "id": perf_id})
     return {"status": "success"}
+
+# --- ROTAS DE CARGOS ---
+@app.get("/api/cadastros/cargos")
+def listar_cargos():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text("SELECT id, nome FROM dbo.nps_cargos ORDER BY nome")
+            res = conn.execute(sql).mappings().all()
+            return [dict(r) for r in res]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/cadastros/cargos")
+def save_cargo(cargo: BasicoSchema):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:n)"), {"n": cargo.nome})
+    return {"status": "success"}
+
+@app.put("/api/cadastros/cargos/{cargo_id}")
+def update_cargo(cargo_id: int, cargo: BasicoSchema):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE dbo.nps_cargos SET nome=:n WHERE id=:id"), {"n": cargo.nome, "id": cargo_id})
+    return {"status": "success"}
+
+@app.delete("/api/cadastros/cargos/{cargo_id}")
+def delete_cargo(cargo_id: int):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM dbo.nps_cargos WHERE id = :id"), {"id": cargo_id})
+            conn.commit()
+            return {"message": "Cargo removido"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     
 # ==========================================
 # 🚀 SALVAR NOVOS CADASTROS
@@ -1240,9 +1281,45 @@ def delete_perfil(perfil_id: int):
 # 👤 ROTAS: CLIENTES
 # ==========================================
 
+def auto_cadastrar_referencias(cargo: str, empresa: str, perfil_decisor: str):
+    engine = get_engine()
+    with engine.begin() as conn:
+        if cargo and cargo.strip():
+            conn.execute(text("""
+                IF NOT EXISTS (SELECT 1 FROM dbo.nps_cargos WHERE nome = :nome)
+                BEGIN
+                    INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)
+                END
+            """), {"nome": cargo.strip()})
+            
+        if empresa and empresa.strip():
+            conn.execute(text("""
+                IF NOT EXISTS (SELECT 1 FROM dbo.nps_empresas WHERE nome = :nome)
+                BEGIN
+                    INSERT INTO dbo.nps_empresas (nome, segmento, valor_contrato) VALUES (:nome, '', 0)
+                END
+            """), {"nome": empresa.strip()})
+            
+        if perfil_decisor and perfil_decisor.strip():
+            conn.execute(text("""
+                IF NOT EXISTS (SELECT 1 FROM dbo.nps_perfis WHERE nome = :nome)
+                BEGIN
+                    INSERT INTO dbo.nps_perfis (nome) VALUES (:nome)
+                END
+            """), {"nome": perfil_decisor.strip()})
+
 @app.get("/api/clientes")
-def list_clientes(q: str = "", ativo: str = "Ativos", perfil: str = "Todos", topn: int = 200):
+def list_clientes(
+    q: str = "", 
+    ativo: str = "Ativos", 
+    perfil: str = "Todos", 
+    topn: int = 200,
+    _t: str = None
+):
     try:
+        engine = get_engine()
+        engine.dispose() 
+        
         df = clientes_svc.load_clientes(q, ativo, perfil, topn)
         return df.fillna("").to_dict(orient="records")
     except Exception as e:
@@ -1299,9 +1376,13 @@ def delete_cliente_route(cliente_id: str, delete_respostas: bool = True):
 @app.post("/api/clientes")
 def create_cliente_route(payload: ClienteCreate):
     try:
+        # 1. Aprende instantaneamente os valores novos que o utilizador digitou
+        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor)
+        
+        # 2. Guarda a pessoa
         novo_id = clientes_svc.insert_cliente(
-            payload.nome, payload.email, payload.empresa, 
-            payload.perfil_decisor, payload.segmento
+            payload.nome, payload.email, payload.telefone, 
+            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo
         )
         return {"status": "success", "cliente_id": novo_id, "message": "Cliente cadastrado com sucesso!"}
     except Exception as e:
@@ -1312,15 +1393,18 @@ def create_cliente_route(payload: ClienteCreate):
 @app.put("/api/clientes/{cliente_id}")
 def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     try:
+        # 1. Aprende instantaneamente os valores novos que o utilizador digitou
+        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor)
+        
+        # 2. Atualiza a pessoa
         clientes_svc.update_cliente(
-            cliente_id, payload.nome, payload.email, 
-            payload.empresa, payload.perfil_decisor, payload.segmento
+            cliente_id, payload.nome, payload.email, payload.telefone, 
+            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo 
         )
         return {"status": "success", "message": "Cliente atualizado."}
     except Exception as e:
         if "2627" in str(e) or "2601" in str(e):
             raise HTTPException(status_code=400, detail="Já existe outro cliente utilizando este mesmo e-mail.")
-            
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/audiencia/plano-acao")
