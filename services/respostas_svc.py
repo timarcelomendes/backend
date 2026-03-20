@@ -32,21 +32,27 @@ def load_respostas(q: str, empresa: str, categoria: str, perfil: str, incluir_ex
         where.append("c.perfil_decisor = :perf")
         params["perf"] = perfil
 
-    # 💡 LÓGICA DE ARQUIVAMENTO
     if not incluir_excluidas:
         where.append("r.excluido = 0")
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    # 💡 O SEGREDO ESTÁ AQUI: Nomes de colunas 100% únicos para o Pandas não dar erro
     sql = f"""
+    WITH BaseHistorico AS (
+        SELECT 
+            *,
+            LAG(nota) OVER (PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) ASC, resposta_id ASC) as nota_anterior
+        FROM dbo.nps_respostas
+        {'WHERE excluido = 0' if not incluir_excluidas else ''}
+    )
     SELECT TOP ({int(topn)})
         r.resposta_id, 
-        r.cliente_id AS resposta_cliente_id,  -- Renomeado para não chocar com o cliente_id da tabela clientes
+        r.cliente_id AS resposta_cliente_id,
         c.nome AS cliente_nome, 
         c.empresa, 
         c.perfil_decisor AS perfil_cliente,
         r.nota, 
+        r.nota_anterior,
         r.motivo, 
         r.categoria, 
         r.canal, 
@@ -55,14 +61,20 @@ def load_respostas(q: str, empresa: str, categoria: str, perfil: str, incluir_ex
         r.jira_issue_url,
         r.created_at,
         r.excluido
-    FROM dbo.nps_respostas r
+    FROM BaseHistorico r
     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
     {where_sql}
-    ORDER BY r.created_at DESC;
+    ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.resposta_id DESC;
     """
     
-    # Executa e converte para Pandas
-    return read_df(sql, params)
+    df = read_df(sql, params)
+    
+    # 🟢 CORREÇÃO 2: Força a nota anterior a ser uma String limpa ('8' em vez de 8.0 ou NaN)
+    # Isto garante que o v-if do Vue.js funciona na perfeição!
+    if 'nota_anterior' in df.columns:
+        df['nota_anterior'] = df['nota_anterior'].apply(lambda x: str(int(x)) if pd.notnull(x) else "")
+        
+    return df
 
 def update_resposta(resposta_id: str, nota: int, categoria: str, motivo: str, canal: str, expectativas: str, o_que_faltava: str):
     sql = """
@@ -78,7 +90,7 @@ def update_resposta(resposta_id: str, nota: int, categoria: str, motivo: str, ca
     })
 
 def soft_delete(resposta_id: str):
-    exec_sql("UPDATE dbo.nps_respostas SET deleted_at = SYSUTCDATETIME() WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
+    exec_sql("UPDATE dbo.nps_respostas SET excluido = 1 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
 def restore(resposta_id: str):
-    exec_sql("UPDATE dbo.nps_respostas SET deleted_at = NULL WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
+    exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})

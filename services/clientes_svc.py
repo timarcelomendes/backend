@@ -79,19 +79,19 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+    # 🟢 LÊ O GESTOR DA TABELA DE EMPRESAS (e.gestor)
     sql = f"""
     SELECT TOP ({int(topn)})
         c.cliente_id, 
         c.nome, 
         c.email, 
-        c.telefone,          /* 👈 Agora lê o telefone REAL do banco */
-        c.cargo,             /* 👈 Agora lê o cargo REAL do banco */
+        c.telefone,          
+        c.cargo,             
+        e.gestor,            /* 👈 Gestor atrelado à Conta */
         c.empresa, 
         c.perfil_decisor, 
         c.segmento,
-        
-        c.status_envio,      /* 👈 FIM DO BUG! Agora lê o status exato que o n8n e o banco definem */
-        
+        c.status_envio,      
         c.ultimo_envio, 
         c.proximo_envio, 
         c.ativo, 
@@ -99,6 +99,7 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         (SELECT COUNT(1) FROM dbo.nps_respostas r WHERE r.cliente_id = c.cliente_id) AS respostas_cliente,
         (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa = c.empresa) AS respostas_empresa
     FROM dbo.nps_clientes c
+    LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
     {where_sql}
     ORDER BY c.updated_at DESC;
     """
@@ -153,7 +154,7 @@ def update_cliente(cliente_id, nome, email, telefone, empresa, perfil_decisor, s
         """), {
             "nome": nome, 
             "email": email, 
-            "telefone": telefone or "", # Proteção contra valores nulos
+            "telefone": telefone or "", 
             "empresa": empresa or "", 
             "perfil_decisor": perfil_decisor or "",
             "cargo": cargo or "", 
@@ -178,7 +179,7 @@ def forcar_envio_db(cliente_id: str):
     SET
       ativo = 1,
       status_envio = 'Pendente',
-      ultimo_envio = NULL,  -- força reenviar hoje burlando a trava do n8n
+      ultimo_envio = NULL, 
       proximo_envio = CAST(GETDATE() AS DATE),
       ultimo_erro = NULL,
       updated_at = SYSUTCDATETIME()

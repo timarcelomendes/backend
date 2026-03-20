@@ -126,6 +126,7 @@ class EmpresaSchema(BaseModel):
     nome: str
     segmento: Optional[str] = ""
     valor_contrato: float = 0.0
+    gestor: Optional[str] = ""
 
 class ClienteCreate(BaseModel):
     nome: str
@@ -135,6 +136,7 @@ class ClienteCreate(BaseModel):
     perfil_decisor: Optional[str] = ""
     segmento: Optional[str] = ""
     cargo: str
+    gestor: Optional[str] = ""
 
 class ClienteUpdate(BaseModel):
     nome: str
@@ -144,6 +146,7 @@ class ClienteUpdate(BaseModel):
     perfil_decisor: Optional[str] = ""
     segmento: Optional[str] = ""
     cargo: str
+    gestor: Optional[str] = ""
 
 class StatusUpdate(BaseModel):
     ativo: bool
@@ -151,6 +154,16 @@ class StatusUpdate(BaseModel):
 class ConfigItem(BaseModel):
     chave: str
     valor: str
+
+class GestorSchema(BaseModel):
+    nome: str
+    papel: Optional[str] = ""
+    email: Optional[str] = ""
+
+class AlertaGestorRequest(BaseModel):
+    empresa: str
+    gestor: str
+    nps: int
 
 # Configurações de Segurança e Autenticação
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
@@ -185,7 +198,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 async def login(requisicao: LoginRequest, request: Request):
     engine = get_engine()
     with engine.connect() as conn:
-        # 1. Busca o utilizador (Mantendo todos os seus campos originais)
         query = text("""
             SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
             FROM dbo.nps_usuarios 
@@ -193,7 +205,6 @@ async def login(requisicao: LoginRequest, request: Request):
         """)
         resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
 
-        # 2. Validações de existência e status (Inativo/Pendente)
         if not resultado:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, 
@@ -207,7 +218,6 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A sua conta está inativa ou aguarda aprovação do administrador."
             )
 
-        # 3. Verificação de Password Resiliente
         try:
             senha_correta = bcrypt.checkpw(
                 requisicao.password.encode('utf-8'), 
@@ -226,7 +236,6 @@ async def login(requisicao: LoginRequest, request: Request):
                 detail="A palavra-passe digitada está incorreta."
             )
 
-        # 4. Identificação do Dispositivo e IP
         user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
         ip_address = request.client.host if request.client else "IP Desconhecido"
         
@@ -240,8 +249,6 @@ async def login(requisicao: LoginRequest, request: Request):
             
         dispositivo_amigavel = f"{tipo_disp} • {user_agent[:30]}..."
 
-        # 5. LÓGICA ANTI-DUPLICAÇÃO (UPSERT DE SESSÃO)
-        # Verifica se já existe uma sessão para este User + IP + Browser que não foi revogada
         check_sessao = conn.execute(text("""
             SELECT id FROM dbo.nps_sessoes_ativas 
             WHERE usuario_id = :uid AND ip_address = :ip AND dispositivo = :disp AND revogado = 0
@@ -254,14 +261,12 @@ async def login(requisicao: LoginRequest, request: Request):
         agora_utc = datetime.now(timezone.utc)
 
         if check_sessao:
-            # Se já existe, apenas atualizamos o timestamp para não criar outra linha
             conn.execute(text("""
                 UPDATE dbo.nps_sessoes_ativas 
                 SET criado_em = :agora 
                 WHERE id = :sid
             """), {"agora": agora_utc, "sid": check_sessao.id})
         else:
-            # Se é novo, inserimos
             conn.execute(text("""
                 INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
                 VALUES (:uid, :disp, :ip, 'Detetado Automaticamente', :agora, 0)
@@ -282,21 +287,24 @@ async def login(requisicao: LoginRequest, request: Request):
             "uid": resultado["usuario_id"]
         })
         
+        resultado_tempo = conn.execute(text(
+            "SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'"
+        )).scalar()
+        
+        tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
+
         conn.commit() 
 
-        # 7. Geração do Token JWT (Com tempo corrigido em UTC)
-        expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=tempo_minutos)
         expire = agora_utc + expires_delta
 
         to_encode = {
             "sub": resultado["email"],
-            "exp": expire # jose valida o exp automaticamente se for datetime
+            "exp": expire
         }
         
-        # Usando a biblioteca jose conforme os seus imports
         access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-        # 8. Retorno Completo para a Sidebar e Storage do Vue
         return {
             "access_token": access_token,
             "token_type": "bearer",
@@ -485,7 +493,6 @@ async def get_magic_ai_insights():
             ai_model = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
             ai_temp = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'ai_temperature'")).scalar() or "0.4"
             
-            # Validação de segurança: Se a chave estiver vazia, avisa o Frontend
             if not api_key or api_key.strip() == "":
                 return {
                     "status": "success", 
@@ -537,7 +544,82 @@ async def get_magic_ai_insights():
     except Exception as e:
         print(f"❌ ERRO IA: {str(e)}")
         raise HTTPException(status_code=500, detail="Falha ao gerar insights. Verifique a API Key.")
+
+def enviar_email_alerta_gestor(empresa: str, gestor_nome: str, gestor_email: str, nps: int):
+    engine = get_engine()
+    with engine.connect() as conn:
+        cfg = conn.execute(text("SELECT TOP 1 tenant_id, client_id, client_secret, email_remetente, refresh_token FROM dbo.nps_configuracoes_email")).fetchone()
+        if not cfg or not cfg.refresh_token:
+            raise Exception("O sistema de e-mail não está autenticado. Vá às Configurações e conecte a conta Microsoft.")
+        cfg = dict(cfg._mapping)
+
+    # 1. Obter um Access Token NOVO usando o seu Refresh Token (o método que funciona)
+    token_url = f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/token"
+    token_data = {
+        'client_id': cfg['client_id'],
+        'client_secret': cfg['client_secret'],
+        'refresh_token': cfg['refresh_token'],
+        'grant_type': 'refresh_token',
+        'scope': 'offline_access mail.send'
+    }
     
+    r_token = requests.post(token_url, data=token_data)
+    if r_token.status_code != 200:
+        raise Exception(f"Falha ao renovar sessão Microsoft: {r_token.text}")
+    
+    token_json = r_token.json()
+    access_token = token_json.get("access_token")
+    
+    # Opcional: Atualizar o refresh_token se a Microsoft enviou um novo
+    if "refresh_token" in token_json:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE dbo.nps_configuracoes_email SET refresh_token = :rt, atualizado_em = GETDATE()"), {"rt": token_json["refresh_token"]})
+
+    # 2. Template do E-mail
+    corpo_html = f"""
+    <div style="font-family: sans-serif; max-width: 600px; border: 1px solid #eee; border-radius: 10px; overflow: hidden;">
+        <div style="background: #f43f5e; color: white; padding: 20px; text-align: center;">
+            <h2 style="margin: 0;">🚨 ALERTA DE RISCO</h2>
+        </div>
+        <div style="padding: 20px; color: #333;">
+            <p>Olá <strong>{gestor_nome}</strong>,</p>
+            <p>O cliente <strong>{empresa}</strong> registou um NPS crítico de <strong>{nps} pts</strong>.</p>
+            <p style="color: #be123c; font-weight: bold;">Ação de retenção aconselhada nas próximas 24h.</p>
+        </div>
+    </div>
+    """
+
+    # 3. Enviar o e-mail usando o token renovado
+    send_url = f"https://graph.microsoft.com/v1.0/users/{cfg['email_remetente']}/sendMail"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    mail_payload = {
+        "message": {
+            "subject": f"Ação Necessária: {empresa} (NPS {nps})",
+            "body": {"contentType": "HTML", "content": corpo_html},
+            "toRecipients": [{"emailAddress": {"address": gestor_email}}]
+        }
+    }
+    
+    r_send = requests.post(send_url, headers=headers, json=mail_payload)
+    if r_send.status_code not in [200, 202]:
+        raise Exception(f"A Microsoft recusou o envio: {r_send.text}")
+
+    return True
+
+@app.post("/api/dashboard/acionar-gestor")
+def acionar_gestor_endpoint(req: AlertaGestorRequest):
+    engine = get_engine()
+    with engine.connect() as conn:
+        gestor_db = conn.execute(text("SELECT email FROM dbo.nps_gestores WHERE nome = :nome"), {"nome": req.gestor}).fetchone()
+        if not gestor_db or not gestor_db.email:
+            raise HTTPException(status_code=400, detail="Gestor sem e-mail configurado.")
+            
+    try:
+        enviar_email_alerta_gestor(req.empresa, req.gestor, gestor_db.email, req.nps)
+        return {"status": "success", "message": f"Alerta enviado com sucesso para {gestor_db.email}!"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # ==========================================
 # 👥 ROTAS: GESTÃO DE OPERADORES (USUÁRIOS)
 # ==========================================
@@ -674,11 +756,9 @@ def get_dashboard_kpis(
                     SUM(CASE WHEN r.nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) as neutros,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores,
                     
-                    SUM(CASE WHEN c.perfil_decisor = 'Decisor' AND r.nota >= 9 THEN 1 ELSE 0 END) as decisor_promotores,
-                    SUM(CASE WHEN c.perfil_decisor = 'Decisor' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
-                    SUM(CASE WHEN c.perfil_decisor = 'Decisor' THEN 1 ELSE 0 END) as decisor_total,
-                    
-                    SUM(CASE WHEN r.nota <= 6 AND r.jira_issue_url IS NOT NULL AND LTRIM(RTRIM(r.jira_issue_url)) <> '' THEN 1 ELSE 0 END) as detratores_com_jira
+                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' AND r.nota >= 9 THEN 1 ELSE 0 END) as decisor_promotores,
+                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
+                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' THEN 1 ELSE 0 END) as decisor_total
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                 {condicao_filtro};
@@ -701,11 +781,6 @@ def get_dashboard_kpis(
             nps_decisor = 0
             if dec_total > 0:
                 nps_decisor = round(((resumo['decisor_promotores'] - resumo['decisor_detratores']) / dec_total) * 100)
-
-            # Taxa de Ação Jira
-            taxa_jira = 0
-            if detratores > 0:
-                taxa_jira = round(((resumo['detratores_com_jira'] or 0) / detratores) * 100)
 
             # --- 5. CÁLCULO REVENUE AT RISK (Financeiro) ---
             filtro_sub = condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""
@@ -750,6 +825,77 @@ def get_dashboard_kpis(
                 texto = str(f.get("comentario") or "").lower()
                 f["tags"] = [tag for tag, keys in regras_tags.items() if any(k in texto for k in keys)]
                 feedbacks_processados.append(f)
+
+            condicao_resgate = condicao_filtro.replace("r.", "atual.")
+            if condicao_resgate:
+                condicao_resgate = condicao_resgate.replace("WHERE", "AND") 
+                
+            query_resgates = text(f"""
+                WITH Historico AS (
+                    SELECT cliente_id, nota, data_resposta, created_at,
+                           -- 🟢 CORREÇÃO: Desempate por resposta_id garante que a R1 e R2 são sempre corretas
+                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
+                    FROM dbo.nps_respostas
+                    WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
+                )
+                SELECT COUNT(*) 
+                FROM Historico atual
+                JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
+                {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
+                WHERE atual.rn = 1 
+                  AND anterior.nota <= 8  
+                  AND atual.nota >= 9     
+                  {condicao_resgate}      
+            """)
+            
+            total_resgatados = conn.execute(query_resgates, parametros).scalar() or 0
+
+            filtros_sql_ant = []
+            params_ant = {}
+            
+            if empresa:
+                if empresa == "Não Identificado":
+                    filtros_sql_ant.append("c.empresa IS NULL")
+                else:
+                    filtros_sql_ant.append("c.empresa = :empresa")
+                    params_ant["empresa"] = empresa
+                    
+            if data_inicio and data_fim:
+                # Se filtrou data, compara com o período equivalente anterior (ex: 7 dias vs 7 dias anteriores)
+                dt_ini = datetime.strptime(data_inicio, "%Y-%m-%d")
+                dt_fim = datetime.strptime(data_fim, "%Y-%m-%d")
+                dias = (dt_fim - dt_ini).days + 1
+                ant_ini = dt_ini - timedelta(days=dias)
+                ant_fim = dt_ini - timedelta(seconds=1)
+                
+                filtros_sql_ant.append("COALESCE(r.data_resposta, r.created_at) >= :ant_ini")
+                filtros_sql_ant.append("COALESCE(r.data_resposta, r.created_at) <= :ant_fim")
+                params_ant["ant_ini"] = ant_ini.strftime("%Y-%m-%d 00:00:00")
+                params_ant["ant_fim"] = ant_fim.strftime("%Y-%m-%d 23:59:59")
+            else:
+                # Se for "Todo o Tempo", a variação é o Score atual vs Score de há 30 dias atrás
+                ant_fim = datetime.now(timezone.utc) - timedelta(days=30)
+                filtros_sql_ant.append("COALESCE(r.data_resposta, r.created_at) <= :ant_fim")
+                params_ant["ant_fim"] = ant_fim.strftime("%Y-%m-%d 23:59:59")
+
+            condicao_ant = " WHERE " + " AND ".join(filtros_sql_ant) if filtros_sql_ant else ""
+            
+            sql_nps_ant = text(f"""
+                SELECT 
+                    COUNT(r.resposta_id) as total,
+                    SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as prom,
+                    SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detr
+                FROM dbo.nps_respostas r
+                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                {condicao_ant};
+            """)
+            
+            res_ant = conn.execute(sql_nps_ant, params_ant).mappings().first()
+            nps_anterior = 0
+            if res_ant and res_ant['total'] > 0:
+                nps_anterior = round(((res_ant['prom'] - res_ant['detr']) / res_ant['total']) * 100)
+                
+            variacao_nps = nps_score - nps_anterior
             
         return {
             "status": "success",
@@ -760,24 +906,28 @@ def get_dashboard_kpis(
                 "neutros": neutros,
                 "detratores": detratores,
                 "nps_decisor": nps_decisor, 
-                "taxa_jira": taxa_jira,
+                "clientes_resgatados": total_resgatados,
+                "variacao_nps": variacao_nps, # 👈 AQUI ESTÁ A NOSSA NOVA VARIÁVEL!
                 "revenue_at_risk": float(risco_real),
-                "termos_frequentes": termos_frequentes
+                "termos_frequentes": termos_frequentes,
+                "total_decisores": dec_total 
             },
             "feedbacks": feedbacks_processados
         }
+    
     except Exception as e:
+        import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 @app.get("/api/dashboard/detalhes")
 def get_dashboard_detalhes(
     empresa: Optional[str] = Query(None),
-    data_inicio: Optional[str] = Query(None), # 🟢 RECEBE A DATA
-    data_fim: Optional[str] = Query(None)     # 🟢 RECEBE A DATA
+    data_inicio: Optional[str] = Query(None), 
+    data_fim: Optional[str] = Query(None)
 ):
     try:
-        from sqlalchemy import text # Garante a importação
+        from sqlalchemy import text
         engine = get_engine()
         with engine.connect() as conn:
             filtros_sql_c = []
@@ -813,6 +963,7 @@ def get_dashboard_detalhes(
             sql_ranking = text(f"""
                 SELECT 
                     {coluna_nome} as nome,
+                    MAX(e.gestor) as gestor, -- 👈 Agora lê de 'e' (empresas) e não de 'c'
                     COUNT(r.resposta_id) as total,
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
@@ -820,6 +971,7 @@ def get_dashboard_detalhes(
                     ) as nps
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome -- 👈 JOIN Necessário
                 {str_filtro_c}
                 GROUP BY {coluna_nome}
                 ORDER BY nps DESC;
@@ -1103,30 +1255,55 @@ def update_perfil(perf_id: int, perf: BasicoSchema):
     return {"status": "success"}
 
 # --- ROTAS DE SEGMENTOS ---
-@app.get("/api/cadastros/segmentos")
-def listar_segmentos():
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            sql = text("SELECT id, nome FROM dbo.nps_segmentos ORDER BY nome")
-            res = conn.execute(sql).mappings().all()
-            return [dict(r) for r in res]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# --- FÁBRICA DE ROTAS COM EFEITO CASCATA ---
+def crud_factory(route_path, table_name, schema=BasicoSchema):
+    @app.get(route_path)
+    def listar():
+        with get_engine().connect() as conn: 
+            return [dict(r) for r in conn.execute(text(f"SELECT * FROM {table_name} ORDER BY nome")).mappings().all()]
+            
+    @app.post(route_path)
+    def salvar(item: schema): # type: ignore  
+        with get_engine().begin() as conn:
+            if table_name == 'dbo.nps_gestores': 
+                conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email) VALUES (:n, :p, :e)"), {"n": item.nome, "p": getattr(item, 'papel', ''), "e": getattr(item, 'email', '')})
+            else: 
+                conn.execute(text(f"INSERT INTO {table_name} (nome) VALUES (:n)"), {"n": item.nome})
+        return {"status": "success"}
+        
+    @app.put(route_path + "/{item_id}")
+    def atualizar(item_id: int, item: schema): # type: ignore  
+        with get_engine().begin() as conn:
+            nome_antigo = conn.execute(text(f"SELECT nome FROM {table_name} WHERE id=:id"), {"id": item_id}).scalar()
+            
+            if table_name == 'dbo.nps_gestores': 
+                conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e WHERE id=:id"), {"n": item.nome, "p": getattr(item, 'papel', ''), "e": getattr(item, 'email', ''), "id": item_id})
+            else: 
+                conn.execute(text(f"UPDATE {table_name} SET nome=:n WHERE id=:id"), {"n": item.nome, "id": item_id})
+            
+            # 🟢 EFEITO CASCATA
+            if nome_antigo and str(nome_antigo) != str(item.nome):
+                if table_name == 'dbo.nps_segmentos':
+                    conn.execute(text("UPDATE dbo.nps_empresas SET segmento=:novo WHERE segmento=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'dbo.nps_perfis':
+                    conn.execute(text("UPDATE dbo.nps_clientes SET perfil_decisor=:novo WHERE perfil_decisor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'dbo.nps_cargos':
+                    conn.execute(text("UPDATE dbo.nps_clientes SET cargo=:novo WHERE cargo=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'dbo.nps_gestores':
+                    conn.execute(text("UPDATE dbo.nps_empresas SET gestor=:novo WHERE gestor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
 
-@app.post("/api/cadastros/segmentos")
-def save_segmento(seg: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:n)"), {"n": seg.nome})
-    return {"status": "success"}
+        return {"status": "success"}
+        
+    @app.delete(route_path + "/{item_id}")
+    def deletar(item_id: int):
+        with get_engine().begin() as conn: conn.execute(text(f"DELETE FROM {table_name} WHERE id = :id"), {"id": item_id})
+        return {"message": "Removido"}
 
-@app.put("/api/cadastros/segmentos/{seg_id}")
-def update_segmento(seg_id: int, seg: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_segmentos SET nome=:n WHERE id=:id"), {"n": seg.nome, "id": seg_id})
-    return {"status": "success"}
+# Estas 4 linhas substituem dezenas de rotas antigas e ativam todos os menus!
+crud_factory("/api/cadastros/segmentos", "dbo.nps_segmentos")
+crud_factory("/api/cadastros/perfis", "dbo.nps_perfis")
+crud_factory("/api/cadastros/cargos", "dbo.nps_cargos")
+crud_factory("/api/cadastros/gestores", "dbo.nps_gestores", GestorSchema)
 
 # --- ROTAS DE PERFIS ---
 @app.get("/api/cadastros/perfis")
@@ -1191,6 +1368,44 @@ def delete_cargo(cargo_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+# --- ROTAS DE GESTORES DE CONTA ---
+@app.get("/api/cadastros/gestores")
+def listar_gestores():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 🟢 Agora lê o papel e o email
+            return [dict(r) for r in conn.execute(text("SELECT id, nome, papel, email FROM dbo.nps_gestores ORDER BY nome")).mappings().all()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/cadastros/gestores")
+def save_gestor(gest: GestorSchema):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO dbo.nps_gestores (nome, papel, email) VALUES (:n, :p, :e)"), 
+                     {"n": gest.nome, "p": gest.papel, "e": gest.email})
+    return {"status": "success"}
+
+@app.put("/api/cadastros/gestores/{gestor_id}")
+def update_gestor(gestor_id: int, gest: GestorSchema):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE dbo.nps_gestores SET nome=:n, papel=:p, email=:e WHERE id=:id"), 
+                     {"n": gest.nome, "p": gest.papel, "e": gest.email, "id": gestor_id})
+    return {"status": "success"}
+
+@app.delete("/api/cadastros/gestores/{gestor_id}")
+def delete_gestor(gestor_id: int):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM dbo.nps_gestores WHERE id = :id"), {"id": gestor_id})
+            conn.commit()
+            return {"message": "Gestor removido"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 # ==========================================
 # 🚀 SALVAR NOVOS CADASTROS
 # ==========================================
@@ -1231,14 +1446,21 @@ def save_empresa(emp: EmpresaSchema):
 
 @app.put("/api/cadastros/empresas/{empresa_id}")
 def update_empresa(empresa_id: int, emp: EmpresaSchema):
-    try:
-        engine = get_engine()
-        with engine.begin() as conn:
-            sql = text("UPDATE dbo.nps_empresas SET nome=:n, segmento=:s, valor_contrato=:v WHERE id=:id")
-            conn.execute(sql, {"n": emp.nome, "s": emp.segmento, "v": emp.valor_contrato, "id": empresa_id})
-        return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    engine = get_engine()
+    with engine.begin() as conn: 
+        # Guarda o nome antigo
+        nome_antigo = conn.execute(text("SELECT nome FROM dbo.nps_empresas WHERE id=:id"), {"id": empresa_id}).scalar()
+        
+        # Atualiza a empresa
+        conn.execute(text("UPDATE dbo.nps_empresas SET nome=:n, segmento=:s, valor_contrato=:v, gestor=:g WHERE id=:id"), 
+                     {"n": emp.nome, "s": emp.segmento, "v": emp.valor_contrato, "g": emp.gestor, "id": empresa_id})
+        
+        # Atualiza as pessoas se a empresa mudou de nome
+        if nome_antigo and str(nome_antigo) != str(emp.nome):
+            conn.execute(text("UPDATE dbo.nps_clientes SET empresa=:novo WHERE empresa=:antigo"), 
+                         {"novo": emp.nome, "antigo": nome_antigo})
+            
+    return {"status": "success"}
         
 # ==========================================
 # 🗑️ EXCLUIR CADASTROS (DELETE)
@@ -1281,32 +1503,17 @@ def delete_perfil(perfil_id: int):
 # 👤 ROTAS: CLIENTES
 # ==========================================
 
-def auto_cadastrar_referencias(cargo: str, empresa: str, perfil_decisor: str):
+def auto_cadastrar_referencias(cargo: str, empresa: str, perfil_decisor: str, gestor: str = None):
     engine = get_engine()
     with engine.begin() as conn:
         if cargo and cargo.strip():
-            conn.execute(text("""
-                IF NOT EXISTS (SELECT 1 FROM dbo.nps_cargos WHERE nome = :nome)
-                BEGIN
-                    INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)
-                END
-            """), {"nome": cargo.strip()})
-            
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_cargos WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_cargos (nome) VALUES (:nome) END"), {"nome": cargo.strip()})
         if empresa and empresa.strip():
-            conn.execute(text("""
-                IF NOT EXISTS (SELECT 1 FROM dbo.nps_empresas WHERE nome = :nome)
-                BEGIN
-                    INSERT INTO dbo.nps_empresas (nome, segmento, valor_contrato) VALUES (:nome, '', 0)
-                END
-            """), {"nome": empresa.strip()})
-            
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_empresas WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_empresas (nome, segmento, valor_contrato) VALUES (:nome, '', 0) END"), {"nome": empresa.strip()})
         if perfil_decisor and perfil_decisor.strip():
-            conn.execute(text("""
-                IF NOT EXISTS (SELECT 1 FROM dbo.nps_perfis WHERE nome = :nome)
-                BEGIN
-                    INSERT INTO dbo.nps_perfis (nome) VALUES (:nome)
-                END
-            """), {"nome": perfil_decisor.strip()})
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_perfis WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_perfis (nome) VALUES (:nome) END"), {"nome": perfil_decisor.strip()})
+        if gestor and gestor.strip():
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_gestores WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_gestores (nome, papel, email) VALUES (:nome, '', '') END"), {"nome": gestor.strip()})
 
 @app.get("/api/clientes")
 def list_clientes(
@@ -1314,7 +1521,8 @@ def list_clientes(
     ativo: str = "Ativos", 
     perfil: str = "Todos", 
     topn: int = 200,
-    _t: str = None
+    _t: str = None,
+    usuario_email: str = Depends(get_current_user)
 ):
     try:
         engine = get_engine()
@@ -1376,35 +1584,29 @@ def delete_cliente_route(cliente_id: str, delete_respostas: bool = True):
 @app.post("/api/clientes")
 def create_cliente_route(payload: ClienteCreate):
     try:
-        # 1. Aprende instantaneamente os valores novos que o utilizador digitou
-        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor)
-        
-        # 2. Guarda a pessoa
+        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor, payload.gestor)
         novo_id = clientes_svc.insert_cliente(
             payload.nome, payload.email, payload.telefone, 
-            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo
+            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo, payload.gestor
         )
-        return {"status": "success", "cliente_id": novo_id, "message": "Cliente cadastrado com sucesso!"}
+        return {"status": "success", "cliente_id": novo_id, "message": "Cliente cadastrado!"}
     except Exception as e:
         if "2627" in str(e) or "2601" in str(e):
-            raise HTTPException(status_code=400, detail="Já existe um cliente com este e-mail e empresa.")
+            raise HTTPException(status_code=400, detail="Já existe cliente com este e-mail.")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/clientes/{cliente_id}")
 def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     try:
-        # 1. Aprende instantaneamente os valores novos que o utilizador digitou
-        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor)
-        
-        # 2. Atualiza a pessoa
+        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor, payload.gestor)
         clientes_svc.update_cliente(
             cliente_id, payload.nome, payload.email, payload.telefone, 
-            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo 
+            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo, payload.gestor 
         )
         return {"status": "success", "message": "Cliente atualizado."}
     except Exception as e:
         if "2627" in str(e) or "2601" in str(e):
-            raise HTTPException(status_code=400, detail="Já existe outro cliente utilizando este mesmo e-mail.")
+            raise HTTPException(status_code=400, detail="Já existe outro cliente com este e-mail.")
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/audiencia/plano-acao")
@@ -1633,6 +1835,90 @@ async def confirmar_importacao_final(payload: dict):
         import traceback
         print(f"🔥 Erro na confirmação: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/importar/respostas")
+async def confirmar_importacao_respostas(payload: dict):
+    try:
+        dados_respostas = payload.get("dados", [])
+        
+        if not dados_respostas:
+            raise HTTPException(status_code=400, detail="Nenhum dado de resposta enviado.")
+        
+        engine = get_engine()
+        inserted_count = 0
+        ignored_count = 0
+
+        with engine.begin() as conn: 
+            for r in dados_respostas:
+                email = str(r.get("email_cliente", "")).strip().lower()
+                nota_str = str(r.get("nota", "")).strip()
+                
+                if not email or "@" not in email or nota_str == "":
+                    ignored_count += 1
+                    continue
+                
+                try:
+                    nota = int(nota_str)
+                except ValueError:
+                    ignored_count += 1
+                    continue
+
+                if nota >= 9:
+                    categoria_nps = "Promotor"
+                elif nota >= 7:
+                    categoria_nps = "Neutro"
+                else:
+                    categoria_nps = "Detrator"
+                
+                check_query = text("SELECT cliente_id FROM dbo.nps_clientes WHERE email = :email")
+                cliente_existente = conn.execute(check_query, {"email": email}).fetchone()
+
+                if not cliente_existente:
+                    ignored_count += 1 
+                    continue
+                
+                cliente_id = cliente_existente.cliente_id
+                resposta_id = "R" + secrets.token_hex(8)
+                
+                insert_sql = text("""
+                    INSERT INTO dbo.nps_respostas (
+                        resposta_id, cliente_id, nota, motivo, categoria, 
+                        canal, excluido, data_resposta, created_at
+                    )
+                    VALUES (
+                        :rid, :cid, :nota, :motivo, :categoria, 
+                        'Importacao_Manual', 0, :dt_resp, SYSUTCDATETIME()
+                    )
+                """)
+                
+                dt_resposta = r.get("data_resposta")
+                if not dt_resposta or str(dt_resposta).strip() == "":
+                    dt_resposta = None
+                
+                conn.execute(insert_sql, {
+                    "rid": resposta_id,
+                    "cid": cliente_id,
+                    "nota": nota,
+                    "motivo": str(r.get("motivo", "")).strip(),
+                    "categoria": categoria_nps, # 👈 Agora envia Promotor, Neutro ou Detrator!
+                    "dt_resp": dt_resposta
+                })
+                inserted_count += 1
+
+        return {
+            "status": "success", 
+            "resultado": {
+                "inserted": inserted_count, 
+                "updated": 0,
+                "ignored": ignored_count,
+                "total": inserted_count + ignored_count
+            }
+        }
+    
+    except Exception as e:
+        import traceback
+        print(f"🔥 Erro na importação de respostas: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # 🔂 ROTAS: STATUS DE CONEXÃO
@@ -1806,10 +2092,8 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
 @app.post("/api/config/email/teste")
 async def testar_envio_email(usuario_email: str = Depends(get_current_user)):
     try:
-        # Importamos a função de recuperação apenas para testar o motor de envio
         from services.email_svc import enviar_email_teste
         
-        # O link aqui é apenas ilustrativo para o teste
         link_teste = "http://localhost:5173/configuracoes"
         
         ok = enviar_email_teste(usuario_email)
@@ -1856,3 +2140,49 @@ async def encerrar_sessao(sessao_id: int):
             return {"detail": "Sessão encerrada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 🔒 ROTAS DE CONFIGURAÇÃO DE SEGURANÇA
+# ==========================================
+
+class SegurancaConfig(BaseModel):
+    tempo_minutos: int
+
+@app.get("/api/config/seguranca")
+def obter_configuracoes_seguranca(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Vai buscar o tempo atual ao banco de dados
+            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")
+            resultado = conn.execute(query).scalar()
+            
+            # Se não encontrar ou houver erro, assume 60 minutos por segurança
+            tempo = int(resultado) if resultado and str(resultado).isdigit() else 60
+            
+            return {"tempo_minutos": tempo}
+            
+    except Exception as e:
+        print(f"Erro ao obter configuração de segurança: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao carregar configurações de segurança.")
+
+@app.put("/api/config/seguranca")
+def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        # Usamos engine.begin() para que o commit seja automático no final do bloco
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE dbo.nps_configuracoes 
+                    SET valor = :valor, updated_at = SYSUTCDATETIME() 
+                    WHERE chave = 'sessao_expiracao_minutos'
+                """),
+                {"valor": str(payload.tempo_minutos)}
+            )
+            
+        return {"status": "success", "message": "Tempo de sessão atualizado com sucesso!"}
+        
+    except Exception as e:
+        print(f"Erro ao salvar configuração de segurança: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao guardar configurações de segurança.")
