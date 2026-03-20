@@ -31,7 +31,6 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError, ExpiredSignatureError
 
 
-
 app = FastAPI(
     title="NPS API - Gauge Stefanini",
     description="API centralizada para gestão de NPS, Clientes e Respostas",
@@ -2170,7 +2169,6 @@ def obter_configuracoes_seguranca(usuario_email: str = Depends(get_current_user)
 def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
-        # Usamos engine.begin() para que o commit seja automático no final do bloco
         with engine.begin() as conn:
             conn.execute(
                 text("""
@@ -2186,3 +2184,175 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
     except Exception as e:
         print(f"Erro ao salvar configuração de segurança: {e}")
         raise HTTPException(status_code=500, detail="Erro ao guardar configurações de segurança.")
+    
+# ==========================================
+# 📊 MOTOR DE RELATÓRIOS (REPORTS ENGINE)
+# ==========================================
+
+@app.get("/api/reports/nps-mensal")
+async def get_nps_mensal_real(periodo: str = Query("Últimos 6 Meses")):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            
+            # Filtro dinâmico de datas (Se os seus dados fake forem muito velhos, 
+            # pode mudar temporariamente estes números de -3 e -6 para -60 para ver dados de 5 anos atrás!)
+            filtro_data = ""
+            if periodo == "Últimos 3 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
+            elif periodo == "Últimos 6 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
+            elif periodo == "Este Ano":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -12, GETDATE())"
+            elif periodo == "Comparativo Trimestral":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -24, GETDATE())" # Traz 2 anos
+
+            sql = text(f"""
+                SELECT 
+                    LEFT(CAST(COALESCE(data_resposta, created_at) AS VARCHAR(10)), 7) as mes_ano,
+                    COUNT(resposta_id) as total,
+                    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) as promotores,
+                    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) as detratores
+                FROM dbo.nps_respostas
+                WHERE excluido = 0
+                {filtro_data}
+                GROUP BY LEFT(CAST(COALESCE(data_resposta, created_at) AS VARCHAR(10)), 7)
+                ORDER BY mes_ano ASC
+            """)
+            
+            resultados = conn.execute(sql).mappings().all()
+            
+            labels = []
+            valores = []
+            meses_pt = {'01':'Jan', '02':'Fev', '03':'Mar', '04':'Abr', '05':'Mai', '06':'Jun', 
+                        '07':'Jul', '08':'Ago', '09':'Set', '10':'Out', '11':'Nov', '12':'Dez'}
+
+            for r in resultados:
+                ano, mes_num = r['mes_ano'].split('-')
+                labels.append(f"{meses_pt.get(mes_num, mes_num)}/{ano[2:]}")
+                
+                if r['total'] > 0:
+                    nps = ((r['promotores'] - r['detratores']) / r['total']) * 100
+                    valores.append(round(nps))
+                else:
+                    valores.append(0)
+
+            return {"labels": labels, "data": valores}
+            
+    except Exception as e:
+        print(f"❌ Erro ao buscar NPS Mensal: {e}")
+        return {"labels": [], "data": []}
+
+@app.get("/api/reports/impacto-categorias")
+async def get_impacto_categorias_real(periodo: str = Query("Últimos 6 Meses")):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            
+            # Mesmo filtro de datas aplicado às categorias
+            filtro_data = ""
+            if periodo == "Últimos 3 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
+            elif periodo == "Últimos 6 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
+
+            sql = text(f"""
+                SELECT 
+                    categoria,
+                    AVG(CAST(nota AS FLOAT)) as media,
+                    COUNT(resposta_id) as volume
+                FROM dbo.nps_respostas
+                WHERE categoria IS NOT NULL AND categoria <> '' AND excluido = 0
+                {filtro_data}
+                GROUP BY categoria
+                ORDER BY media DESC
+            """)
+            
+            resultados = conn.execute(sql).mappings().all()
+            
+            categorias = []
+            for r in resultados:
+                nps_estimado = round((r['media'] * 10) - 50) 
+                categorias.append({
+                    "nome": r['categoria'],
+                    "nps": nps_estimado,
+                    "percentual": round(r['media'] * 10),
+                    "insight": f"Análise baseada em {r['volume']} feedbacks."
+                })
+                
+            # SE NÃO HOUVER CATEGORIAS AINDA, INSERE UMA DE EXEMPLO PARA O ECRÃ NÃO FICAR VAZIO
+            if not categorias:
+                categorias.append({
+                    "nome": "Sem Categoria (Pendentes IA)",
+                    "nps": 50,
+                    "percentual": 50,
+                    "insight": "Os seus dados fake ainda não têm categorias preenchidas."
+                })
+                
+            return categorias
+            
+    except Exception as e:
+        print(f"❌ Erro ao buscar Categorias: {e}")
+        return []
+
+@app.get("/api/reports/resumo-ia")
+async def get_resumo_ia_reports(periodo: str = Query("Últimos 6 Meses")):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
+            ai_model = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
+            
+            if not api_key or str(api_key).strip() == "":
+                return {"texto": "Gauge AI indisponível. API Key não configurada.", "foco": "SISTEMA", "prioridade": "BAIXA"}
+
+            filtro_data = ""
+            if periodo == "Últimos 3 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
+            elif periodo == "Últimos 6 Meses":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
+            elif periodo == "Este Ano":
+                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -12, GETDATE())"
+
+            sql_dados = text(f"""
+                SELECT 
+                    COUNT(*) as total_respostas,
+                    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) as promotores,
+                    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) as detratores
+                FROM dbo.nps_respostas WHERE excluido = 0 {filtro_data}
+            """)
+            resumo_dados = conn.execute(sql_dados).mappings().first()
+
+        import openai
+        client = openai.OpenAI(api_key=str(api_key).strip())
+        
+        # PROMPT MELHORADO: Mais estratégico, focado em CX e Retenção
+        prompt = f"""
+        Atue como a 'Gauge AI', um Cientista de Dados Sênior e Consultor Executivo especialista em Customer Experience (CX).
+        Dados do período ({periodo}): {resumo_dados['total_respostas'] or 0} respostas. Promotores: {resumo_dados['promotores'] or 0}. Detratores: {resumo_dados['detratores'] or 0}.
+        
+        Sua missão é dar um insight executivo direto ao ponto para a Diretoria. Não repita os números. Identifique a tendência, o provável motivo (invente uma hipótese realista se necessário, como "tempo de resposta" ou "qualidade do onboarding") e o que deve ser feito para evitar o Churn (cancelamento).
+        
+        Responda estritamente em JSON:
+        - "texto": (Máx 45 palavras) Insight analítico profundo, recomendação estratégica e correlação de risco.
+        - "foco": (1 palavra) Ex: CHURN, PRODUTO, ATENDIMENTO, ONBOARDING, PREÇO.
+        - "prioridade": (1 palavra) BAIXA, MÉDIA, ALTA, CRÍTICA.
+        """
+
+        response = client.chat.completions.create(
+            model=str(ai_model).strip(),
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0.7, 
+            response_format={ "type": "json_object" }
+        )
+        
+        import json
+        return json.loads(response.choices[0].message.content)
+
+    except Exception as e:
+        print(f"❌ Erro na Gauge AI: {e}")
+        return {
+            "texto": "Não foi possível gerar a análise executiva neste momento.",
+            "foco": "SISTEMA",
+            "prioridade": "MÉDIA"
+        }
