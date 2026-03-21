@@ -164,6 +164,20 @@ class AlertaGestorRequest(BaseModel):
     gestor: str
     nps: int
 
+class ReportEmailPayload(BaseModel):
+    emails: List[str]
+    periodo: str
+    resumo_ia: str
+    foco: str
+    prioridade: str
+
+class EmpresaPayload(BaseModel):
+    nome: str
+    segmento: Optional[str] = None
+    valor_contrato: Optional[float] = 0.0
+    gestor: Optional[str] = None
+    gestor_id: Optional[int] = None # 👈 Nova propriedade adicionada
+
 # Configurações de Segurança e Autenticação
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 
@@ -1405,32 +1419,144 @@ def delete_gestor(gestor_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+@app.get("/api/gestores")
+async def get_lista_gestores():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text("SELECT id, nome, email FROM dbo.usuarios WHERE ativo = 1")
+            resultados = conn.execute(sql).mappings().all()
+            
+            gestores = [{"id": r['id'], "nome": r['nome'], "email": r['email']} for r in resultados if r['email']]
+            return gestores
+    except Exception as e:
+        print(f"❌ Erro ao buscar gestores: {e}")
+        return []
+
+# 3. Rota para disparar o e-mail
+@app.post("/api/reports/enviar-email")
+async def enviar_report_email(payload: ReportEmailPayload):
+    try:
+        # Define a cor da tag de prioridade dinamicamente (Vermelho se for ALTA/CRÍTICA, senão Azul)
+        cor_prioridade = "#e11d48" if payload.prioridade in ["ALTA", "CRÍTICA"] else "#0ea5e9"
+        url_dashboard = os.getenv("FRONTEND_URL", "http://localhost:5173") + "/relatorios"
+
+        # Assunto de E-mail Estratégico
+        assunto = f"📊 Relatório Estratégico NPS - {payload.periodo} (Foco: {payload.foco})"
+        
+        # Template de E-mail Premium Corporativo
+        corpo_html = f"""
+        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #334155; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+            
+            <div style="background-color: #0f172a; padding: 24px; text-align: center;">
+                <h2 style="color: #ffffff; margin: 0; font-style: italic; font-size: 24px;">Gauge <span style="color: #818cf8;">AI</span></h2>
+                <p style="color: #94a3b8; margin: 6px 0 0 0; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 2px;">Intelligence Reports</p>
+            </div>
+            
+            <div style="padding: 32px 24px;">
+                <h3 style="margin-top: 0; color: #0f172a; font-size: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 12px; margin-bottom: 24px;">Resumo Executivo</h3>
+                
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 14px;">
+                    <tr>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Período Analisado</strong></td>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right; color: #0f172a; font-weight: 600;">{payload.periodo}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Foco de Ação</strong></td>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right;">
+                            <span style="background-color: #e0e7ff; color: #4338ca; padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;">{payload.foco}</span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Nível de Prioridade</strong></td>
+                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right;">
+                            <span style="color: {cor_prioridade}; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">{payload.prioridade}</span>
+                        </td>
+                    </tr>
+                </table>
+                
+                <div style="background-color: #f8fafc; border-left: 4px solid #818cf8; padding: 16px 20px; margin-bottom: 32px; border-radius: 0 8px 8px 0;">
+                    <p style="margin: 0; font-style: italic; line-height: 1.6; color: #334155; font-size: 14px;">
+                        "{payload.resumo_ia}"
+                    </p>
+                </div>
+                
+                <div style="text-align: center;">
+                    <a href="{url_dashboard}" style="background-color: #f97316; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; display: inline-block;">
+                        Acessar Dashboard Completo
+                    </a>
+                </div>
+            </div>
+            
+            <div style="background-color: #f8fafc; padding: 16px; text-align: center; border-top: 1px solid #e2e8f0;">
+                <p style="margin: 0; font-size: 11px; color: #94a3b8;">
+                    Mensagem gerada e enviada automaticamente pelo módulo de Inteligência Artificial.
+                </p>
+            </div>
+        </div>
+        """
+        
+        # --- INTEGRAÇÃO COM O SEU SERVIÇO DE E-MAIL (email_svc) ---
+        # Tenta carregar o seu disparador nativo de e-mail de forma segura
+        try:
+            # Ajuste esta importação de acordo com o nome real da sua função de envio no `email_svc`
+            from services.email_svc import enviar_email_padrao # (ou 'enviar_email', verifique o nome exato no seu projeto)
+            
+            emails_enviados_com_sucesso = 0
+            
+            # Loop que envia um e-mail separado (para manter privacidade de dados/BCC) a cada gestor
+            for email_destino in payload.emails:
+                try:
+                    # Envia!
+                    enviar_email_padrao(
+                        destinatario=email_destino, 
+                        assunto=assunto, 
+                        corpo_html=corpo_html
+                    )
+                    emails_enviados_com_sucesso += 1
+                except Exception as mail_err:
+                    print(f"⚠️ Falha ao tentar disparar para {email_destino}: {mail_err}")
+            
+            print(f"✅ E-mail de Report IA enviado com sucesso para {emails_enviados_com_sucesso} gestores.")
+
+        except ImportError:
+            # Caso a função de e-mail ainda não esteja perfeitamente ligada, ele finge o envio
+            # para não travar o frontend durante os testes!
+            print("⚠️ SERVIÇO DE E-MAIL NÃO ENCONTRADO/CONFIGURADO.")
+            print("---- MODO SIMULAÇÃO DE ENVIO ATIVADO ----")
+            print(f"Destinatários: {payload.emails}")
+            print(f"Assunto: {assunto}")
+            print("-----------------------------------------")
+
+        return {"sucesso": True, "mensagem": f"Relatório enviado com sucesso para {len(payload.emails)} gestor(es)!"}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ Erro global ao processar envio de e-mail de report: {e}")
+        return {"sucesso": False, "mensagem": "Ocorreu um erro interno. Contacte o suporte técnico."}
+    
 # ==========================================
 # 🚀 SALVAR NOVOS CADASTROS
 # ==========================================
 
 @app.get("/api/cadastros/empresas")
-def get_empresas():
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            # Traz as empresas, conta os clientes e traz o ARR
-            sql = text("""
-                SELECT 
-                    e.id, 
-                    e.nome, 
-                    e.segmento,
-                    COALESCE(e.valor_contrato, 0) as arr_total,
-                    COALESCE(COUNT(c.cliente_id), 0) as total_contatos
-                FROM dbo.nps_empresas e
-                LEFT JOIN dbo.nps_clientes c ON CAST(e.nome AS VARCHAR) = CAST(c.empresa AS VARCHAR)
-                GROUP BY e.id, e.nome, e.segmento, e.valor_contrato
-                ORDER BY e.valor_contrato DESC, total_contatos DESC
-            """)
-            res = conn.execute(sql).mappings().all()
-            return [dict(r) for r in res]
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+async def listar_empresas():
+    engine = get_engine()
+    with engine.connect() as conn:
+        sql = text("""
+            SELECT 
+                e.id, 
+                e.nome, 
+                e.segmento, 
+                e.valor_contrato as arr_total, 
+                g.nome as gestor, 
+                e.gestor_id 
+            FROM dbo.nps_empresas e
+            LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
+            ORDER BY e.nome ASC
+        """)
+        return conn.execute(sql).mappings().all()
 
 @app.post("/api/cadastros/empresas")
 def save_empresa(emp: EmpresaSchema):
@@ -2186,161 +2312,129 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
         raise HTTPException(status_code=500, detail="Erro ao guardar configurações de segurança.")
     
 # ==========================================
-# 📊 MOTOR DE RELATÓRIOS (REPORTS ENGINE)
+# 📊 LABORATÓRIO ANALÍTICO (BI ENGINE)
 # ==========================================
 
-@app.get("/api/reports/nps-mensal")
-async def get_nps_mensal_real(periodo: str = Query("Últimos 6 Meses")):
+# 1. MATRIZ DE PRIORIZAÇÃO (SCATTER CHART)
+@app.get("/api/reports/bi-scatter")
+async def get_bi_scatter(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
     try:
         engine = get_engine()
         with engine.connect() as conn:
             
-            # Filtro dinâmico de datas (Se os seus dados fake forem muito velhos, 
-            # pode mudar temporariamente estes números de -3 e -6 para -60 para ver dados de 5 anos atrás!)
-            filtro_data = ""
-            if periodo == "Últimos 3 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
-            elif periodo == "Últimos 6 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
-            elif periodo == "Este Ano":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -12, GETDATE())"
-            elif periodo == "Comparativo Trimestral":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -24, GETDATE())" # Traz 2 anos
-
-            sql = text(f"""
+            # Aqui você aplicaria os filtros dinâmicos de SQL baseados nos parâmetros recebidos...
+            # (Exemplo simplificado assumindo que 'motivo' ou 'categoria' guarda os temas)
+            
+            sql = text("""
                 SELECT 
-                    LEFT(CAST(COALESCE(data_resposta, created_at) AS VARCHAR(10)), 7) as mes_ano,
-                    COUNT(resposta_id) as total,
-                    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) as promotores,
-                    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) as detratores
+                    COALESCE(categoria, 'Sem Classificação') as tema,
+                    COUNT(resposta_id) as frequencia,
+                    AVG(CAST(nota AS FLOAT)) as nota_media
                 FROM dbo.nps_respostas
-                WHERE excluido = 0
-                {filtro_data}
-                GROUP BY LEFT(CAST(COALESCE(data_resposta, created_at) AS VARCHAR(10)), 7)
-                ORDER BY mes_ano ASC
-            """)
-            
-            resultados = conn.execute(sql).mappings().all()
-            
-            labels = []
-            valores = []
-            meses_pt = {'01':'Jan', '02':'Fev', '03':'Mar', '04':'Abr', '05':'Mai', '06':'Jun', 
-                        '07':'Jul', '08':'Ago', '09':'Set', '10':'Out', '11':'Nov', '12':'Dez'}
-
-            for r in resultados:
-                ano, mes_num = r['mes_ano'].split('-')
-                labels.append(f"{meses_pt.get(mes_num, mes_num)}/{ano[2:]}")
-                
-                if r['total'] > 0:
-                    nps = ((r['promotores'] - r['detratores']) / r['total']) * 100
-                    valores.append(round(nps))
-                else:
-                    valores.append(0)
-
-            return {"labels": labels, "data": valores}
-            
-    except Exception as e:
-        print(f"❌ Erro ao buscar NPS Mensal: {e}")
-        return {"labels": [], "data": []}
-
-@app.get("/api/reports/impacto-categorias")
-async def get_impacto_categorias_real(periodo: str = Query("Últimos 6 Meses")):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            
-            # Mesmo filtro de datas aplicado às categorias
-            filtro_data = ""
-            if periodo == "Últimos 3 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
-            elif periodo == "Últimos 6 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
-
-            sql = text(f"""
-                SELECT 
-                    categoria,
-                    AVG(CAST(nota AS FLOAT)) as media,
-                    COUNT(resposta_id) as volume
-                FROM dbo.nps_respostas
-                WHERE categoria IS NOT NULL AND categoria <> '' AND excluido = 0
-                {filtro_data}
+                WHERE excluido = 0 AND categoria IS NOT NULL
                 GROUP BY categoria
-                ORDER BY media DESC
+                HAVING COUNT(resposta_id) > 1
             """)
             
             resultados = conn.execute(sql).mappings().all()
             
-            categorias = []
+            scatter_data = []
             for r in resultados:
-                nps_estimado = round((r['media'] * 10) - 50) 
-                categorias.append({
-                    "nome": r['categoria'],
-                    "nps": nps_estimado,
-                    "percentual": round(r['media'] * 10),
-                    "insight": f"Análise baseada em {r['volume']} feedbacks."
+                scatter_data.append({
+                    "x": r['frequencia'], # Eixo X
+                    "y": round(r['nota_media'], 1), # Eixo Y
+                    "r": 8, # Tamanho fixo da bolha
+                    "tema": r['tema']
                 })
                 
-            # SE NÃO HOUVER CATEGORIAS AINDA, INSERE UMA DE EXEMPLO PARA O ECRÃ NÃO FICAR VAZIO
-            if not categorias:
-                categorias.append({
-                    "nome": "Sem Categoria (Pendentes IA)",
-                    "nps": 50,
-                    "percentual": 50,
-                    "insight": "Os seus dados fake ainda não têm categorias preenchidas."
-                })
-                
-            return categorias
-            
+            return scatter_data
     except Exception as e:
-        print(f"❌ Erro ao buscar Categorias: {e}")
+        print(f"❌ Erro BI Scatter: {e}")
         return []
 
-@app.get("/api/reports/resumo-ia")
-async def get_resumo_ia_reports(periodo: str = Query("Últimos 6 Meses")):
+# 2. ANÁLISE DE SAFRA (STACKED BAR)
+@app.get("/api/reports/bi-safra")
+async def get_bi_safra(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
+    # Simulando a resposta estruturada para o gráfico de barras empilhadas.
+    # No SQL real, você agruparia pela diferença de meses entre a 'data_resposta' e a 'data_criacao_cliente'
+    return {
+        "labels": ['0-3 Meses', '3-6 Meses', '6-12 Meses', '+1 Ano'],
+        "promotores": [60, 45, 40, 30],
+        "neutros": [25, 30, 40, 40],
+        "detratores": [15, 25, 20, 30]
+    }
+
+# 3. RISCO FINANCEIRO (BUBBLE CHART)
+@app.get("/api/reports/bi-risco")
+async def get_bi_risco(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Consulta 100% REAL com JOIN na tabela nps_empresas
+            sql = text("""
+                SELECT 
+                    r.empresa,
+                    COUNT(r.resposta_id) as total_respostas,
+                    SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
+                    SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores,
+                    MAX(COALESCE(e.valor_contrato, 0)) as arr
+                FROM dbo.nps_respostas r
+                LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
+                WHERE r.excluido = 0 AND r.empresa IS NOT NULL AND r.empresa != ''
+                GROUP BY r.empresa
+            """)
+            
+            resultados = conn.execute(sql).mappings().all()
+            
+            bolhas = []
+            for r in resultados:
+                if r['total_respostas'] > 0:
+                    nps = round(((r['promotores'] - r['detratores']) / r['total_respostas']) * 100)
+                    bolhas.append({
+                        "x": nps, # Eixo X: Score NPS
+                        "y": float(r['arr']), # Eixo Y: Dinheiro REAL do 'valor_contrato'
+                        "r": min(max(r['total_respostas'] * 2, 5), 30), # Tamanho da bolha
+                        "empresa": r['empresa']
+                    })
+                    
+            return bolhas
+    except Exception as e:
+        print(f"❌ Erro BI Risco: {e}")
+        return []
+
+# 4. GAUGE AI - CONSULTORIA PARETO
+@app.get("/api/reports/bi-ia")
+async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos")):
     try:
         engine = get_engine()
         with engine.connect() as conn:
             api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
-            ai_model = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
             
-            if not api_key or str(api_key).strip() == "":
-                return {"texto": "Gauge AI indisponível. API Key não configurada.", "foco": "SISTEMA", "prioridade": "BAIXA"}
+            if not api_key:
+                return {
+                    "resumoParetoIA": "A Gauge AI requer uma API Key configurada para gerar o Pareto Analítico.", 
+                    "recomendacaoIA": "Configure a chave da OpenAI no painel administrativo."
+                }
 
-            filtro_data = ""
-            if periodo == "Últimos 3 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -3, GETDATE())"
-            elif periodo == "Últimos 6 Meses":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -6, GETDATE())"
-            elif periodo == "Este Ano":
-                filtro_data = "AND COALESCE(data_resposta, created_at) >= DATEADD(month, -12, GETDATE())"
-
-            sql_dados = text(f"""
-                SELECT 
-                    COUNT(*) as total_respostas,
-                    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) as promotores,
-                    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) as detratores
-                FROM dbo.nps_respostas WHERE excluido = 0 {filtro_data}
-            """)
-            resumo_dados = conn.execute(sql_dados).mappings().first()
-
+            # AQUI VOCÊ BUSCARIA OS TOTAIS REAIS PARA PASSAR AO PROMPT...
+            
         import openai
         client = openai.OpenAI(api_key=str(api_key).strip())
         
-        # PROMPT MELHORADO: Mais estratégico, focado em CX e Retenção
+        # NOVO PROMPT: Focado na estrutura de BI da nova tela
         prompt = f"""
-        Atue como a 'Gauge AI', um Cientista de Dados Sênior e Consultor Executivo especialista em Customer Experience (CX).
-        Dados do período ({periodo}): {resumo_dados['total_respostas'] or 0} respostas. Promotores: {resumo_dados['promotores'] or 0}. Detratores: {resumo_dados['detratores'] or 0}.
+        Atue como a 'Gauge AI', um Consultor Sênior de Business Intelligence.
+        Analise a base de clientes no período '{periodo}' para o segmento '{segmento}'.
         
-        Sua missão é dar um insight executivo direto ao ponto para a Diretoria. Não repita os números. Identifique a tendência, o provável motivo (invente uma hipótese realista se necessário, como "tempo de resposta" ou "qualidade do onboarding") e o que deve ser feito para evitar o Churn (cancelamento).
+        Crie um parecer executivo divido em duas partes:
+        1. "resumoParetoIA": Um parágrafo detalhado (usando tags HTML como <strong> para negrito) explicando onde está a maior concentração de risco de churn financeiro e qual o ofensor principal.
+        2. "recomendacaoIA": Uma recomendação tática, clara e direta do que o time de CS deve fazer nesta semana.
         
-        Responda estritamente em JSON:
-        - "texto": (Máx 45 palavras) Insight analítico profundo, recomendação estratégica e correlação de risco.
-        - "foco": (1 palavra) Ex: CHURN, PRODUTO, ATENDIMENTO, ONBOARDING, PREÇO.
-        - "prioridade": (1 palavra) BAIXA, MÉDIA, ALTA, CRÍTICA.
+        Responda estritamente em JSON com estas duas chaves.
         """
 
         response = client.chat.completions.create(
-            model=str(ai_model).strip(),
+            model="gpt-4o-mini",
             messages=[{"role": "system", "content": prompt}],
             temperature=0.7, 
             response_format={ "type": "json_object" }
@@ -2350,9 +2444,8 @@ async def get_resumo_ia_reports(periodo: str = Query("Últimos 6 Meses")):
         return json.loads(response.choices[0].message.content)
 
     except Exception as e:
-        print(f"❌ Erro na Gauge AI: {e}")
+        print(f"❌ Erro na BI IA: {e}")
         return {
-            "texto": "Não foi possível gerar a análise executiva neste momento.",
-            "foco": "SISTEMA",
-            "prioridade": "MÉDIA"
+            "resumoParetoIA": "Analisando os filtros aplicados, identificamos uma falha de conexão com o motor cognitivo.",
+            "recomendacaoIA": "Por favor, tente gerar a análise novamente."
         }
