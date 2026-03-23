@@ -1723,15 +1723,13 @@ def create_cliente_route(payload: ClienteCreate):
 @app.put("/api/clientes/{cliente_id}")
 def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     try:
-        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor, payload.gestor)
         clientes_svc.update_cliente(
             cliente_id, payload.nome, payload.email, payload.telefone, 
-            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo, payload.gestor 
+            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo
         )
         return {"status": "success", "message": "Cliente atualizado."}
     except Exception as e:
-        if "2627" in str(e) or "2601" in str(e):
-            raise HTTPException(status_code=400, detail="Já existe outro cliente com este e-mail.")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/audiencia/plano-acao")
@@ -2310,7 +2308,48 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
     except Exception as e:
         print(f"Erro ao salvar configuração de segurança: {e}")
         raise HTTPException(status_code=500, detail="Erro ao guardar configurações de segurança.")
-    
+
+# ==========================================
+# 🛠️ FUNÇÃO AUXILIAR: MONTADOR DE FILTROS SQL
+# ==========================================
+def build_bi_filters(periodo: str, segmento: str, arr: str, safra: str):
+    where_clauses = ["r.excluido = 0"]
+    params = {}
+
+    # 1. PERÍODO (Baseado na data da resposta)
+    if periodo == "Últimos 3 Meses":
+        where_clauses.append("r.data_resposta >= DATEADD(month, -3, GETDATE())")
+    elif periodo == "Últimos 6 Meses":
+        where_clauses.append("r.data_resposta >= DATEADD(month, -6, GETDATE())")
+    elif periodo == "Este Ano":
+        where_clauses.append("YEAR(r.data_resposta) = YEAR(GETDATE())")
+
+    # 2. SEGMENTO
+    if segmento != "Todos":
+        where_clauses.append("e.segmento = :segmento")
+        params["segmento"] = segmento
+
+    # 3. ARR (Receita)
+    if arr == "> € 100k":
+        where_clauses.append("e.valor_contrato > 100000")
+    elif arr == "€ 50k - € 100k":
+        where_clauses.append("e.valor_contrato BETWEEN 50000 AND 100000")
+    elif arr == "< € 50k":
+        where_clauses.append("e.valor_contrato < 50000")
+
+    # 4. SAFRA / TEMPO DE CASA (Assumindo que a empresa tem coluna 'created_at')
+    # Se a sua coluna se chamar 'data_criacao', altere abaixo:
+    if safra == "0-3 Meses (Onboarding)":
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) <= 3")
+    elif safra == "3-12 Meses":
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) > 3 AND DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) <= 12")
+    elif safra == "+1 Ano":
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) > 12")
+
+    where_sql = " AND ".join(where_clauses)
+    return where_sql, params
+
+
 # ==========================================
 # 📊 LABORATÓRIO ANALÍTICO (BI ENGINE)
 # ==========================================
@@ -2319,82 +2358,119 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
 @app.get("/api/reports/bi-scatter")
 async def get_bi_scatter(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
     try:
+        where_sql, params = build_bi_filters(periodo, segmento, arr, safra)
+        
         engine = get_engine()
         with engine.connect() as conn:
-            
-            # Aqui você aplicaria os filtros dinâmicos de SQL baseados nos parâmetros recebidos...
-            # (Exemplo simplificado assumindo que 'motivo' ou 'categoria' guarda os temas)
-            
-            sql = text("""
+            # Fazemos o JOIN com a empresa para que os filtros de segmento e ARR funcionem
+            sql = text(f"""
                 SELECT 
-                    COALESCE(categoria, 'Sem Classificação') as tema,
-                    COUNT(resposta_id) as frequencia,
-                    AVG(CAST(nota AS FLOAT)) as nota_media
-                FROM dbo.nps_respostas
-                WHERE excluido = 0 AND categoria IS NOT NULL
-                GROUP BY categoria
-                HAVING COUNT(resposta_id) > 1
+                    COALESCE(r.categoria, 'Sem Classificação') as tema,
+                    COUNT(r.resposta_id) as frequencia,
+                    AVG(CAST(r.nota AS FLOAT)) as nota_media
+                FROM dbo.nps_respostas r
+                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                WHERE {where_sql} AND r.categoria IS NOT NULL
+                GROUP BY r.categoria
+                HAVING COUNT(r.resposta_id) > 1
             """)
             
-            resultados = conn.execute(sql).mappings().all()
+            resultados = conn.execute(sql, params).mappings().all()
             
-            scatter_data = []
-            for r in resultados:
-                scatter_data.append({
-                    "x": r['frequencia'], # Eixo X
-                    "y": round(r['nota_media'], 1), # Eixo Y
-                    "r": 8, # Tamanho fixo da bolha
-                    "tema": r['tema']
-                })
-                
+            scatter_data = [{"x": r['frequencia'], "y": round(r['nota_media'], 1), "r": 8, "tema": r['tema']} for r in resultados]
             return scatter_data
     except Exception as e:
         print(f"❌ Erro BI Scatter: {e}")
         return []
 
-# 2. ANÁLISE DE SAFRA (STACKED BAR)
+# 2. ANÁLISE DE SAFRA (STACKED BAR) - AGORA COM DADOS REAIS
 @app.get("/api/reports/bi-safra")
 async def get_bi_safra(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
-    # Simulando a resposta estruturada para o gráfico de barras empilhadas.
-    # No SQL real, você agruparia pela diferença de meses entre a 'data_resposta' e a 'data_criacao_cliente'
-    return {
-        "labels": ['0-3 Meses', '3-6 Meses', '6-12 Meses', '+1 Ano'],
-        "promotores": [60, 45, 40, 30],
-        "neutros": [25, 30, 40, 40],
-        "detratores": [15, 25, 20, 30]
-    }
+    try:
+        where_sql, params = build_bi_filters(periodo, segmento, arr, safra)
+        
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text(f"""
+                SELECT 
+                    CASE 
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 3 THEN '0-3 Meses'
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 6 THEN '3-6 Meses'
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 12 THEN '6-12 Meses'
+                        ELSE '+1 Ano'
+                    END as safra_grupo,
+                    SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
+                    SUM(CASE WHEN r.nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) as neutros,
+                    SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
+                FROM dbo.nps_respostas r
+                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                WHERE {where_sql}
+                GROUP BY 
+                    CASE 
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 3 THEN '0-3 Meses'
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 6 THEN '3-6 Meses'
+                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 12 THEN '6-12 Meses'
+                        ELSE '+1 Ano'
+                    END
+            """)
+            
+            resultados = conn.execute(sql, params).mappings().all()
+            
+            # Estrutura base de retorno
+            data = {
+                "labels": ['0-3 Meses', '3-6 Meses', '6-12 Meses', '+1 Ano'],
+                "promotores": [0, 0, 0, 0],
+                "neutros": [0, 0, 0, 0],
+                "detratores": [0, 0, 0, 0]
+            }
+            
+            # Preenche o json com os totais reais do banco
+            for r in resultados:
+                if r['safra_grupo'] in data['labels']:
+                    idx = data['labels'].index(r['safra_grupo'])
+                    data['promotores'][idx] = r['promotores']
+                    data['neutros'][idx] = r['neutros']
+                    data['detratores'][idx] = r['detratores']
+                    
+            return data
+    except Exception as e:
+        print(f"❌ Erro BI Safra: {e}")
+        return {"labels": [], "promotores": [], "neutros": [], "detratores": []}
 
 # 3. RISCO FINANCEIRO (BUBBLE CHART)
 @app.get("/api/reports/bi-risco")
 async def get_bi_risco(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
     try:
+        where_sql, params = build_bi_filters(periodo, segmento, arr, safra)
+        
         engine = get_engine()
         with engine.connect() as conn:
-            # Consulta 100% REAL com JOIN na tabela nps_empresas
-            sql = text("""
+            sql = text(f"""
                 SELECT 
-                    r.empresa,
+                    e.id as empresa_id,
+                    e.nome as nome_empresa,
                     COUNT(r.resposta_id) as total_respostas,
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores,
                     MAX(COALESCE(e.valor_contrato, 0)) as arr
                 FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
-                WHERE r.excluido = 0 AND r.empresa IS NOT NULL AND r.empresa != ''
-                GROUP BY r.empresa
+                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                WHERE {where_sql}
+                GROUP BY e.id, e.nome
             """)
             
-            resultados = conn.execute(sql).mappings().all()
+            resultados = conn.execute(sql, params).mappings().all()
             
             bolhas = []
             for r in resultados:
                 if r['total_respostas'] > 0:
                     nps = round(((r['promotores'] - r['detratores']) / r['total_respostas']) * 100)
                     bolhas.append({
-                        "x": nps, # Eixo X: Score NPS
-                        "y": float(r['arr']), # Eixo Y: Dinheiro REAL do 'valor_contrato'
-                        "r": min(max(r['total_respostas'] * 2, 5), 30), # Tamanho da bolha
-                        "empresa": r['empresa']
+                        "id": r['empresa_id'], 
+                        "x": nps, 
+                        "y": float(r['arr']), 
+                        "r": min(max(r['total_respostas'] * 2, 5), 30), 
+                        "empresa": r['nome_empresa']
                     })
                     
             return bolhas
@@ -2404,8 +2480,10 @@ async def get_bi_risco(periodo: str = Query("Últimos 6 Meses"), segmento: str =
 
 # 4. GAUGE AI - CONSULTORIA PARETO
 @app.get("/api/reports/bi-ia")
-async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos")):
+async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
     try:
+        where_sql, params = build_bi_filters(periodo, segmento, arr, safra)
+        
         engine = get_engine()
         with engine.connect() as conn:
             api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
@@ -2416,21 +2494,46 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
                     "recomendacaoIA": "Configure a chave da OpenAI no painel administrativo."
                 }
 
-            # AQUI VOCÊ BUSCARIA OS TOTAIS REAIS PARA PASSAR AO PROMPT...
+            # 👉 BUSCAMOS O CONTEXTO REAL PARA ALIMENTAR A IA
+            sql_contexto = text(f"""
+                SELECT 
+                    COUNT(r.resposta_id) as total_respostas,
+                    SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as total_detratores,
+                    SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as total_promotores
+                FROM dbo.nps_respostas r
+                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                WHERE {where_sql}
+            """)
+            dados = conn.execute(sql_contexto, params).mappings().first()
             
-        import openai
+        # Proteção contra bases vazias
+        if not dados or dados['total_respostas'] == 0:
+            return {
+                "resumoParetoIA": f"Não foram encontradas respostas no período de <strong>{periodo}</strong> para os filtros selecionados.",
+                "recomendacaoIA": "Experimente alargar o seu intervalo de pesquisa ou remover alguns filtros."
+            }
+
         client = openai.OpenAI(api_key=str(api_key).strip())
         
-        # NOVO PROMPT: Focado na estrutura de BI da nova tela
         prompt = f"""
-        Atue como a 'Gauge AI', um Consultor Sênior de Business Intelligence.
-        Analise a base de clientes no período '{periodo}' para o segmento '{segmento}'.
+        Atue como a 'Gauge AI', um Consultor Sênior de Business Intelligence em Customer Success.
+        
+        CONTEXTO ATUAL (Filtros aplicados pelo utilizador):
+        - Período: {periodo}
+        - Segmento: {segmento}
+        - Tamanho/ARR: {arr}
+        - Tempo de Casa (Safra): {safra}
+        
+        DADOS DESTE CORTE:
+        - Total de Respostas: {dados['total_respostas']}
+        - Detratores: {dados['total_detratores']}
+        - Promotores: {dados['total_promotores']}
         
         Crie um parecer executivo divido em duas partes:
-        1. "resumoParetoIA": Um parágrafo detalhado (usando tags HTML como <strong> para negrito) explicando onde está a maior concentração de risco de churn financeiro e qual o ofensor principal.
-        2. "recomendacaoIA": Uma recomendação tática, clara e direta do que o time de CS deve fazer nesta semana.
+        1. "resumoParetoIA": Um parágrafo detalhado (usando tags HTML como <strong> para negrito) explicando a situação deste grupo de clientes. Foque-se no risco de churn.
+        2. "recomendacaoIA": Uma recomendação tática, clara e direta do que o time de CS deve fazer nesta semana para este grupo de segmentação.
         
-        Responda estritamente em JSON com estas duas chaves.
+        Responda estritamente em JSON com as chaves "resumoParetoIA" e "recomendacaoIA".
         """
 
         response = client.chat.completions.create(
@@ -2440,7 +2543,6 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
             response_format={ "type": "json_object" }
         )
         
-        import json
         return json.loads(response.choices[0].message.content)
 
     except Exception as e:

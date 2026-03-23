@@ -138,28 +138,31 @@ def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_de
 
     return cliente_id
 
-def update_cliente(cliente_id, nome, email, telefone, empresa, perfil_decisor, segmento, cargo):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE dbo.nps_clientes
-            SET nome = :nome,
-                email = :email,
-                telefone = :telefone,
-                empresa = :empresa,
-                perfil_decisor = :perfil_decisor,
-                cargo = :cargo,
-                updated_at = GETDATE()
-            WHERE cliente_id = :id
-        """), {
-            "nome": nome, 
-            "email": email, 
-            "telefone": telefone or "", 
-            "empresa": empresa or "", 
-            "perfil_decisor": perfil_decisor or "",
-            "cargo": cargo or "", 
-            "id": cliente_id
-        })
+def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str):
+    sql = """
+    UPDATE dbo.nps_clientes 
+    SET 
+        nome = :nome, 
+        email = :email, 
+        telefone = :telefone, 
+        empresa = :empresa, 
+        perfil_decisor = :perfil_decisor, 
+        segmento = :segmento, 
+        cargo = :cargo,
+        updated_at = SYSUTCDATETIME()
+    WHERE cliente_id = :cliente_id;
+    """
+    
+    exec_sql(sql, {
+        "cliente_id": cliente_id,
+        "nome": (nome or "").strip() or None,
+        "email": (email or "").strip().lower(),
+        "telefone": (telefone or "").strip() or None,
+        "empresa": (empresa or "").strip() or None,
+        "perfil_decisor": (perfil_decisor or "").strip() or None,
+        "segmento": (segmento or "").strip() or None,
+        "cargo": (cargo or "").strip() or None
+    })
 
 def set_ativo(cliente_id: str, ativo: int):
     sql = "UPDATE dbo.nps_clientes SET ativo = :ativo, updated_at = SYSUTCDATETIME() WHERE cliente_id = :cliente_id;"

@@ -16,12 +16,14 @@ def load_respostas(q: str, empresa: str, categoria: str, perfil: str, incluir_ex
     where = []
     params = {}
 
+    # 🟢 AJUSTE: Pesquisa global agora procura também pelo nome resolvido da empresa
     if (q or "").strip():
-        where.append("(LOWER(r.motivo) LIKE :like OR LOWER(c.nome) LIKE :like OR LOWER(c.empresa) LIKE :like)")
+        where.append("(LOWER(r.motivo) LIKE :like OR LOWER(c.nome) LIKE :like OR LOWER(COALESCE(e.nome, r.empresa, c.empresa)) LIKE :like)")
         params["like"] = f"%{q.strip().lower()}%"
         
+    # 🟢 AJUSTE: Filtro de empresa específico pesquisa no COALESCE
     if (empresa or "").strip():
-        where.append("LOWER(c.empresa) LIKE :empresa")
+        where.append("LOWER(COALESCE(e.nome, r.empresa, c.empresa)) LIKE :empresa")
         params["empresa"] = f"%{empresa.strip().lower()}%"
         
     if categoria and categoria != "Todas":
@@ -49,7 +51,17 @@ def load_respostas(q: str, empresa: str, categoria: str, perfil: str, incluir_ex
         r.resposta_id, 
         r.cliente_id AS resposta_cliente_id,
         c.nome AS cliente_nome, 
-        c.empresa, 
+        
+        -- 🚨 CORREÇÃO: Limpa espaços e força as strings vazias a serem tratadas como NULL
+        COALESCE(
+            NULLIF(LTRIM(RTRIM(e.nome)), ''), 
+            NULLIF(LTRIM(RTRIM(r.empresa)), ''), 
+            NULLIF(LTRIM(RTRIM(c.empresa)), '')
+        ) AS empresa_resolvida,
+        
+        -- Enviamos também a original por segurança para o Frontend
+        r.empresa AS empresa,
+        
         c.perfil_decisor AS perfil_cliente,
         r.nota, 
         r.nota_anterior,
@@ -63,13 +75,14 @@ def load_respostas(q: str, empresa: str, categoria: str, perfil: str, incluir_ex
         r.excluido
     FROM BaseHistorico r
     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+    LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
     {where_sql}
     ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.resposta_id DESC;
     """
     
     df = read_df(sql, params)
     
-    # 🟢 CORREÇÃO 2: Força a nota anterior a ser uma String limpa ('8' em vez de 8.0 ou NaN)
+    # Força a nota anterior a ser uma String limpa ('8' em vez de 8.0 ou NaN)
     # Isto garante que o v-if do Vue.js funciona na perfeição!
     if 'nota_anterior' in df.columns:
         df['nota_anterior'] = df['nota_anterior'].apply(lambda x: str(int(x)) if pd.notnull(x) else "")
