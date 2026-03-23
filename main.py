@@ -910,6 +910,27 @@ def get_dashboard_kpis(
                 nps_anterior = round(((res_ant['prom'] - res_ant['detr']) / res_ant['total']) * 100)
                 
             variacao_nps = nps_score - nps_anterior
+
+            # --- 7. TÓPICOS CRÍTICOS (NOVO) ---
+            # Agrupa por categoria, conta menções e calcula a média, apenas para categorias não nulas
+            sql_topicos = text(f"""
+                SELECT TOP 5
+                    COALESCE(r.categoria, 'Sem Classificação') as tema,
+                    COUNT(r.resposta_id) as mencoes,
+                    AVG(CAST(r.nota AS FLOAT)) as notaMedia
+                FROM dbo.nps_respostas r
+                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                {condicao_filtro}
+                { "AND" if condicao_filtro else "WHERE" } r.categoria IS NOT NULL AND r.categoria != '' AND r.excluido = 0
+                GROUP BY COALESCE(r.categoria, 'Sem Classificação')
+                ORDER BY mencoes DESC, notaMedia ASC
+            """)
+            
+            topicos_raw = conn.execute(sql_topicos, parametros).mappings().all()
+            topicos_criticos = [{"tema": r['tema'], "mencoes": r['mencoes'], "notaMedia": float(r['notaMedia'])} for r in topicos_raw]
+
+
+            # ... (rest of the existing code calculating resgatados, variacao, etc.) ...
             
         return {
             "status": "success",
@@ -921,10 +942,11 @@ def get_dashboard_kpis(
                 "detratores": detratores,
                 "nps_decisor": nps_decisor, 
                 "clientes_resgatados": total_resgatados,
-                "variacao_nps": variacao_nps, # 👈 AQUI ESTÁ A NOSSA NOVA VARIÁVEL!
+                "variacao_nps": variacao_nps, 
                 "revenue_at_risk": float(risco_real),
                 "termos_frequentes": termos_frequentes,
-                "total_decisores": dec_total 
+                "total_decisores": dec_total,
+                "topicos_criticos": topicos_criticos # 👈 ADICIONADO AQUI
             },
             "feedbacks": feedbacks_processados
         }
@@ -933,7 +955,8 @@ def get_dashboard_kpis(
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-    
+            
+
 @app.get("/api/dashboard/detalhes")
 def get_dashboard_detalhes(
     empresa: Optional[str] = Query(None),
