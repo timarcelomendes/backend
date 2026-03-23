@@ -411,7 +411,8 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
                 algorithm=ALGORITHM
             )
             
-            link = f"http://localhost:5173/reset-password?token={token}"
+            FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+            link = f"{FRONTEND_URL}/reset-password?token={token}"
             
             print(f"📧 A disparar e-mail de recuperação para: {resultado['email']}")
             background_tasks.add_task(enviar_email_recuperacao, resultado['email'], link)
@@ -2217,7 +2218,8 @@ async def testar_envio_email(usuario_email: str = Depends(get_current_user)):
     try:
         from services.email_svc import enviar_email_teste
         
-        link_teste = "http://localhost:5173/configuracoes"
+        FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        link_teste = f"{FRONTEND_URL}/configuracoes"
         
         ok = enviar_email_teste(usuario_email)
         
