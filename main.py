@@ -62,12 +62,12 @@ app.add_middleware(
 # ==========================================
 
 class AcaoCriar(BaseModel):
-    resposta_id: Optional[str] = None
-    empresa_id: Optional[int] = None
+    resposta_id: str
+    empresa_id: Optional[int] = 0
     gestor_id: Optional[int] = None
     titulo: str
-    descricao: Optional[str] = None
-    prioridade: str = "Média"
+    descricao: Optional[str] = ""
+    prioridade: Optional[str] = "Alta"
     prazo_limite: Optional[str] = None
 
 class AcaoAtualizar(BaseModel):
@@ -2823,15 +2823,15 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
                 
             condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
 
+            # O segredo está no LEFT JOIN e no COALESCE para garantir que a query não quebre
             sql = text(f"""
                 SELECT 
                     a.*,
-                    e.nome as empresa_nome,
-                    g.nome as gestor_nome,
+                    COALESCE(e.nome, 'Empresa Geral') as empresa_nome,
+                    COALESCE(e.gestor, 'Sem Gestor') as gestor_nome,
                     r.nota as resposta_nota
                 FROM dbo.nps_acoes a
                 LEFT JOIN dbo.nps_empresas e ON a.empresa_id = e.id
-                LEFT JOIN dbo.nps_gestores g ON a.gestor_id = g.id
                 LEFT JOIN dbo.nps_respostas r ON a.resposta_id = r.resposta_id
                 {condicao}
                 ORDER BY 
@@ -2847,8 +2847,8 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
             resultados = conn.execute(sql, params).mappings().all()
             return [dict(r) for r in resultados]
     except Exception as e:
-        print(f"Erro ao listar ações: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"ERRO CRÍTICO SQL: {str(e)}")
+        raise HTTPException(status_code=500, detail="Erro interno ao processar a listagem de ações.")
 
 @app.put("/api/acoes/{acao_id}")
 def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
@@ -2871,4 +2871,17 @@ def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
         return {"status": "success", "message": "Ação atualizada!"}
     except Exception as e:
         print(f"Erro ao atualizar ação: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/api/acoes/{acao_id}")
+def excluir_acao(acao_id: int):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            # Remove a ação pelo ID único
+            sql = text("DELETE FROM dbo.nps_acoes WHERE id = :id")
+            conn.execute(sql, {"id": acao_id})
+        return {"status": "success", "message": "Ação excluída com sucesso!"}
+    except Exception as e:
+        print(f"Erro ao excluir ação: {e}")
         raise HTTPException(status_code=500, detail=str(e))
