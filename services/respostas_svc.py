@@ -115,6 +115,9 @@ def restore(resposta_id: str):
 from sqlalchemy import text
 from database import get_engine
 
+from sqlalchemy import text
+from database import get_engine
+
 def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
     engine = get_engine()
     
@@ -122,32 +125,47 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
         eid_val = int(empresa_id) if empresa_id else 0
     except:
         eid_val = 0
+
+    id_real = None
+    nome_emp = "Conta Geral"
+    id_gestor = None
         
-    with engine.connect() as conn:
-        if eid_val == 0:
-            # 💡 CORREÇÃO AQUI: Em vez de procurar pelo nome, procuramos pelo empresa_id da resposta!
-            sql_busca = text("""
-                SELECT e.id, e.nome, e.gestor_id 
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
-                WHERE r.resposta_id = :rid
-            """)
-            empresa_data = conn.execute(sql_busca, {"rid": str(resposta_id)}).mappings().first()
-        else:
-            sql_busca = text("""
-                SELECT id, nome, gestor_id 
-                FROM dbo.nps_empresas 
-                WHERE id = :eid
-            """)
-            empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
-
-    # Extração segura dos dados (se empresa_data existir)
-    id_real = empresa_data["id"] if empresa_data and empresa_data.get("id") else None
-    nome_emp = empresa_data["nome"] if empresa_data and empresa_data.get("nome") else "Conta Geral"
-    id_gestor = empresa_data["gestor_id"] if empresa_data and empresa_data.get("gestor_id") else None
-
-    # Gravação Definitiva
     try:
+        with engine.connect() as conn:
+            # 1. Tentar procurar a empresa diretamente pelo ID do n8n
+            empresa_data = None
+            if eid_val > 0:
+                sql_busca = text("SELECT id, nome, gestor_id FROM dbo.nps_empresas WHERE id = :eid")
+                empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
+
+            # 2. A REDE DE SEGURANÇA: Se falhar, procura em todo o lado (Respostas, Clientes e Nomes)
+            if not empresa_data:
+                sql_busca_resposta = text("""
+                    SELECT TOP 1 
+                        e.id, 
+                        COALESCE(e.nome, r.empresa, c.empresa, 'Conta Geral') as nome_encontrado, 
+                        e.gestor_id 
+                    FROM dbo.nps_respostas r
+                    LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                    LEFT JOIN dbo.nps_empresas e 
+                        ON e.id = r.empresa_id 
+                        OR e.id = c.empresa_id 
+                        OR e.nome = r.empresa 
+                        OR e.nome = c.empresa
+                    WHERE r.resposta_id = :rid
+                """)
+                row = conn.execute(sql_busca_resposta, {"rid": str(resposta_id)}).mappings().first()
+                
+                if row:
+                    id_real = row.get("id")
+                    nome_emp = row.get("nome_encontrado", "Conta Geral")
+                    id_gestor = row.get("gestor_id")
+            else:
+                id_real = empresa_data.get("id")
+                nome_emp = empresa_data.get("nome", "Conta Geral")
+                id_gestor = empresa_data.get("gestor_id")
+
+        # 3. Gravação garantida
         with engine.begin() as conn:
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
@@ -165,6 +183,7 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
             }
             
             conn.execute(sql_insert, params)
-            print(f"✅ GRAVADO COM SUCESSO: {nome_emp} (Gestor ID: {id_gestor})!")
+            print(f"✅ SUCESSO! Ação criada para {nome_emp} (ID Empresa: {id_real} | Gestor: {id_gestor})")
+            
     except Exception as e:
-        print(f"❌ Erro no SQL de Insert: {e}")
+        print(f"❌ Erro Crítico: {e}")
