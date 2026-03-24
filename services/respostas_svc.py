@@ -120,7 +120,7 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
         except:
             eid_val = 0
             
-        # 2. Busca Inteligente da Empresa (Com conexão mantida aberta para leitura)
+        # 2. Busca Inteligente da Empresa
         engine = get_engine()
         with engine.connect() as conn:
             if eid_val == 0:
@@ -130,7 +130,6 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
                     LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
                     WHERE r.resposta_id = :rid
                 """)
-                # O .mappings().first() converte a linha SQL num dicionário seguro do Python
                 empresa_data = conn.execute(sql_busca, {"rid": str(resposta_id)}).mappings().first()
             else:
                 sql_busca = text("""
@@ -140,12 +139,12 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
                 """)
                 empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
 
-        # 3. Extração super segura usando formato de dicionário ["coluna"]
+        # 3. Extração dos dados
         id_real = empresa_data["id"] if empresa_data else None
         nome_emp = empresa_data["nome"] if empresa_data else "Conta Geral"
         id_gestor = empresa_data["gestor_id"] if empresa_data else None
 
-        # 4. Gravação final usando a sua função nativa exec_sql
+        # 4. A GRAVAÇÃO À FORÇA (COM COMMIT EXPLÍCITO)
         sql_insert = text("""
             INSERT INTO dbo.nps_acoes 
             (resposta_id, empresa_id, gestor_id, titulo, descricao, status, prioridade)
@@ -161,9 +160,14 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
             "d": f"Nota: {nota}. Motivo: {motivo}"
         }
         
-        exec_sql(sql_insert, params)
-        print(f"✅ SUCESSO ABSOLUTO: Ação automática gravada para {nome_emp}!")
+        # Abriremos uma nova conexão, inserimos e forçamos o Commit
+        with engine.connect() as conn:
+            conn.execute(sql_insert, params)
+            conn.commit()  # 👈 ESTA É A LINHA MÁGICA QUE SALVA DEFINITIVAMENTE!
+            
+        print(f"✅ SUCESSO ABSOLUTO E GRAVADO COM COMMIT: {nome_emp}!")
         
     except Exception as e:
         print(f"❌ ERRO AO GRAVAR AÇÃO NO BANCO: {e}")
+        import traceback
         print(traceback.format_exc())
