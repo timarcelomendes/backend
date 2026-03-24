@@ -122,7 +122,7 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motiv
         
     try:
         with engine.connect() as conn:
-            # TENTATIVA 1: Pelo ID oficial (caso o n8n o envie corretamente)
+            # TENTATIVA 1: Pelo ID oficial
             try:
                 eid_val = int(empresa_id) if empresa_id else 0
             except:
@@ -136,14 +136,13 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motiv
                     nome_emp = empresa_data["nome"]
                     id_gestor = empresa_data["gestor_id"]
 
-            # TENTATIVA 2 (A SOLUÇÃO DEFINITIVA): Buscar usando o nome em texto enviado pelo n8n
+            # TENTATIVA 2: Buscar usando o nome em texto enviado pelo n8n
             if not id_real and empresa_nome and str(empresa_nome).strip() != "":
                 sql_busca_nome = text("""
                     SELECT TOP 1 id, nome, gestor_id 
                     FROM dbo.nps_empresas 
                     WHERE LOWER(LTRIM(RTRIM(nome))) LIKE :nome_busca
                 """)
-                # Usa % para encontrar até resultados com espaços escondidos (ex: "%itaú%")
                 param_nome = f"%{str(empresa_nome).strip().lower()}%"
                 empresa_data = conn.execute(sql_busca_nome, {"nome_busca": param_nome}).mappings().first()
                 
@@ -152,10 +151,9 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motiv
                     nome_emp = empresa_data["nome"]
                     id_gestor = empresa_data["gestor_id"]
                 else:
-                    # Se não achar na base de dados de todo, ao menos guarda o nome que o cliente digitou!
                     nome_emp = empresa_nome 
 
-        # 3. Gravação na Tabela de Ações
+        # Gravação na Tabela de Ações
         with engine.begin() as conn:
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
