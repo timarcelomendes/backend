@@ -114,35 +114,38 @@ def restore(resposta_id: str):
 
 def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
     try:
-        # 1. Tratamento à prova de balas para o ID do n8n (evita o crash do ValueError)
+        # 1. Tratamento seguro do ID do n8n
         try:
             eid_val = int(empresa_id) if empresa_id else 0
         except:
             eid_val = 0
             
-        # 2. Busca Inteligente da Empresa
-        if eid_val == 0:
-            sql_busca = text("""
-                SELECT e.id, e.nome, e.gestor_id 
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
-                WHERE r.resposta_id = :rid
-            """)
-            empresa_data = exec_sql(sql_busca, {"rid": str(resposta_id)}).first()
-        else:
-            sql_busca = text("""
-                SELECT id, nome, gestor_id 
-                FROM dbo.nps_empresas 
-                WHERE id = :eid
-            """)
-            empresa_data = exec_sql(sql_busca, {"eid": eid_val}).first()
+        # 2. Busca Inteligente da Empresa (Com conexão mantida aberta para leitura)
+        engine = get_engine()
+        with engine.connect() as conn:
+            if eid_val == 0:
+                sql_busca = text("""
+                    SELECT e.id, e.nome, e.gestor_id 
+                    FROM dbo.nps_respostas r
+                    LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
+                    WHERE r.resposta_id = :rid
+                """)
+                # O .mappings().first() converte a linha SQL num dicionário seguro do Python
+                empresa_data = conn.execute(sql_busca, {"rid": str(resposta_id)}).mappings().first()
+            else:
+                sql_busca = text("""
+                    SELECT id, nome, gestor_id 
+                    FROM dbo.nps_empresas 
+                    WHERE id = :eid
+                """)
+                empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
 
-        # 3. Extração segura dos dados
-        id_real = empresa_data.id if empresa_data else None
-        nome_emp = empresa_data.nome if empresa_data else "Conta Geral"
-        id_gestor = empresa_data.gestor_id if empresa_data else None
+        # 3. Extração super segura usando formato de dicionário ["coluna"]
+        id_real = empresa_data["id"] if empresa_data else None
+        nome_emp = empresa_data["nome"] if empresa_data else "Conta Geral"
+        id_gestor = empresa_data["gestor_id"] if empresa_data else None
 
-        # 4. Gravação usando a sua função nativa exec_sql (Garante o COMMIT)
+        # 4. Gravação final usando a sua função nativa exec_sql
         sql_insert = text("""
             INSERT INTO dbo.nps_acoes 
             (resposta_id, empresa_id, gestor_id, titulo, descricao, status, prioridade)
