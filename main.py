@@ -198,8 +198,8 @@ class EmpresaPayload(BaseModel):
 class WebhookN8nPayload(BaseModel):
     resposta_id: str
     nota: int
-    empresa_id: Optional[int] = None
-    motivo: Optional[str] = None
+    empresa_id: Optional[Any] = 0 
+    motivo: Optional[str] = ""
 
 # Configurações de Segurança e Autenticação
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")

@@ -113,31 +113,32 @@ def restore(resposta_id: str):
 
 def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
     try:
-        # 1. Tentar descobrir a empresa (Auto-Descoberta se n8n enviar 0)
-        if not empresa_id or int(empresa_id) == 0:
-            sql_busca = text("""
-                SELECT e.id, e.nome, e.gestor_id 
-                FROM dbo.nps_respostas r
-                -- Relaciona a resposta com a empresa pelo nome (ajuste se necessário)
-                LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
-                WHERE r.resposta_id = :rid
-            """)
-            empresa_data = exec_sql(sql_busca, {"rid": resposta_id}).first()
-        else:
-            # Se o n8n enviar o ID certinho, usamos ele
-            sql_busca = text("""
-                SELECT id, nome, gestor_id 
-                FROM dbo.nps_empresas 
-                WHERE id = :eid
-            """)
-            empresa_data = exec_sql(sql_busca, {"eid": empresa_id}).first()
+        engine = get_engine()
+        
+        # 1. Tentar descobrir a empresa (Auto-Descoberta)
+        with engine.connect() as conn:
+            if not empresa_id or int(empresa_id) == 0:
+                sql_busca = text("""
+                    SELECT e.id, e.nome, e.gestor_id 
+                    FROM dbo.nps_respostas r
+                    LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
+                    WHERE r.resposta_id = :rid
+                """)
+                empresa_data = conn.execute(sql_busca, {"rid": resposta_id}).mappings().first()
+            else:
+                sql_busca = text("""
+                    SELECT id, nome, gestor_id 
+                    FROM dbo.nps_empresas 
+                    WHERE id = :eid
+                """)
+                empresa_data = conn.execute(sql_busca, {"eid": empresa_id}).mappings().first()
 
-        # Extrai os dados seguros (Se não achar, cai no fallback)
-        id_real_empresa = empresa_data.id if empresa_data else None
-        nome_empresa = empresa_data.nome if empresa_data else "Conta Geral"
-        id_do_gestor = empresa_data.gestor_id if empresa_data else None
+        # Extrai os dados em segurança
+        id_real_empresa = empresa_data["id"] if empresa_data else None
+        nome_empresa = empresa_data["nome"] if empresa_data and empresa_data["nome"] else "Conta Geral"
+        id_do_gestor = empresa_data["gestor_id"] if empresa_data else None
 
-        # 2. Inserir a ação com os IDs reais!
+        # 2. Inserir a ação - USAMOS engine.begin() PARA FORÇAR O COMMIT!
         sql_insert = text("""
             INSERT INTO dbo.nps_acoes 
             (resposta_id, empresa_id, gestor_id, titulo, descricao, status, prioridade)
@@ -146,15 +147,17 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
         """)
         
         params = {
-            "rid": resposta_id,
+            "rid": str(resposta_id),
             "eid": id_real_empresa,
             "gid": id_do_gestor,
             "t": f"🔥 Ação Automática: {nome_empresa}",
             "d": f"Nota: {nota}. Motivo: {motivo}"
         }
         
-        exec_sql(sql_insert, params)
-        print(f"✅ Ação automática criada com sucesso para: {nome_empresa}")
+        with engine.begin() as conn:
+            conn.execute(sql_insert, params)
+            
+        print(f"✅ Ação automática criada com sucesso para a empresa: {nome_empresa}")
         
     except Exception as e:
-        print(f"❌ Erro na automação: {e}")
+        print(f"❌ Erro crítico na automação:\n{traceback.format_exc()}")
