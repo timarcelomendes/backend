@@ -1,6 +1,7 @@
 import pandas as pd
 from sqlalchemy import text
 from database import get_engine, exec_sql
+import traceback
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 

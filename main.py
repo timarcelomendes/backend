@@ -4,7 +4,7 @@ import openai
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Any
 from database import get_engine, exec_sql
 from sqlalchemy import text
 import traceback 
