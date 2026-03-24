@@ -75,6 +75,7 @@ class AcaoAtualizar(BaseModel):
     prioridade: Optional[str] = None
     descricao: Optional[str] = None
     prazo_limite: Optional[str] = None
+    gestor_id: Optional[int] = None
 
 class BasicoSchema(BaseModel):
     nome: str
@@ -2861,12 +2862,13 @@ def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
                     prioridade = COALESCE(:p, prioridade),
                     descricao = COALESCE(:d, descricao),
                     prazo_limite = COALESCE(:pl, prazo_limite),
+                    gestor_id = COALESCE(:gid, gestor_id), -- 👈 ATUALIZA O GESTOR
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = :id
             """)
             conn.execute(sql, {
                 "id": acao_id, "s": acao.status, "p": acao.prioridade, 
-                "d": acao.descricao, "pl": acao.prazo_limite
+                "d": acao.descricao, "pl": acao.prazo_limite, "gid": acao.gestor_id
             })
         return {"status": "success", "message": "Ação atualizada!"}
     except Exception as e:
