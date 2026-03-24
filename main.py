@@ -61,6 +61,21 @@ app.add_middleware(
 # Validam os dados que chegam do Frontend
 # ==========================================
 
+class AcaoCriar(BaseModel):
+    resposta_id: Optional[str] = None
+    empresa_id: Optional[int] = None
+    gestor_id: Optional[int] = None
+    titulo: str
+    descricao: Optional[str] = None
+    prioridade: str = "Média"
+    prazo_limite: Optional[str] = None
+
+class AcaoAtualizar(BaseModel):
+    status: Optional[str] = None
+    prioridade: Optional[str] = None
+    descricao: Optional[str] = None
+    prazo_limite: Optional[str] = None
+
 class BasicoSchema(BaseModel):
     nome: str
 
@@ -123,9 +138,11 @@ class SettingUpdate(BaseModel):
 
 class EmpresaSchema(BaseModel):
     nome: str
-    segmento: Optional[str] = ""
-    valor_contrato: float = 0.0
-    gestor: Optional[str] = ""
+    segmento: Optional[str] = None
+    valor_contrato: Optional[float] = 0.0
+    gestor: Optional[str] = None
+    gestor_id: Optional[int] = None 
+    companhia_id: Optional[int] = None #
 
 class ClienteCreate(BaseModel):
     nome: str
@@ -176,7 +193,13 @@ class EmpresaPayload(BaseModel):
     segmento: Optional[str] = None
     valor_contrato: Optional[float] = 0.0
     gestor: Optional[str] = None
-    gestor_id: Optional[int] = None # 👈 Nova propriedade adicionada
+    gestor_id: Optional[int] = None
+
+class WebhookN8nPayload(BaseModel):
+    resposta_id: str
+    nota: int
+    empresa_id: Optional[int] = None
+    motivo: Optional[str] = None
 
 # Configurações de Segurança e Autenticação
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
@@ -206,7 +229,36 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     except JWTError:
         raise credentials_exception
-
+    
+# ==========================================
+# 🤖 WEBHOOKS (Integrações Externas / n8n)
+# ==========================================
+@app.post("/api/webhook/n8n/gatilho-acao")
+def n8n_gatilho_acao(payload: WebhookN8nPayload):
+    """
+    O n8n chama esta rota logo após inserir uma resposta no SQL.
+    A API avalia se precisa de criar um ticket no Kanban.
+    """
+    try:
+        from services import respostas_svc
+        
+        # Chama a nossa função inteligente que criámos no passo anterior!
+        respostas_svc.processar_acao_automatica(
+            resposta_id=payload.resposta_id,
+            nota=payload.nota,
+            empresa_id=payload.empresa_id or 0, # Passa 0 se não houver empresa
+            motivo=payload.motivo
+        )
+        
+        return {"status": "success", "detail": "Gatilho avaliado com sucesso."}
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 🤖 AUTENTICACAO (Login, Registros)
+# ==========================================
 @app.post("/api/login")
 async def login(requisicao: LoginRequest, request: Request):
     engine = get_engine()
@@ -708,6 +760,7 @@ async def listar_operadores():
 @app.get("/api/dashboard/kpis")
 def get_dashboard_kpis(
     empresa: Optional[str] = Query(None),
+    companhia: Optional[str] = Query(None),
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None)
 ):
@@ -717,11 +770,23 @@ def get_dashboard_kpis(
             # 1. VERIFICA CONFIGURAÇÃO DE VISIBILIDADE
             sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
-            tipo_join = "LEFT JOIN" if config_valor == 'true' else "INNER JOIN"
+            tipo_join = "LEFT JOIN"
             
             # 2. SISTEMA DINÂMICO DE FILTROS
             filtros_sql = []
             parametros = {}
+            
+            # 👇 FILTRO DE COMPANHIA (Usa COALESCE)
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                parametros["companhia"] = companhia
             
             if empresa:
                 if empresa == "Não Identificado":
@@ -802,7 +867,7 @@ def get_dashboard_kpis(
                 SELECT SUM(e.valor_contrato) as risco
                 FROM dbo.nps_empresas e
                 WHERE e.nome IN (
-                    SELECT DISTINCT c.empresa
+                    SELECT DISTINCT COALESCE(r.empresa, c.empresa)
                     FROM dbo.nps_respostas r
                     INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                     WHERE r.nota <= 6 {filtro_sub}
@@ -815,7 +880,7 @@ def get_dashboard_kpis(
                 SELECT TOP 10 
                     r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario, 
                     r.created_at, r.jira_issue_url,
-                    c.nome as cliente, c.empresa, c.perfil_decisor
+                    c.nome as cliente, COALESCE(r.empresa, c.empresa) as empresa, c.perfil_decisor
                 FROM dbo.nps_respostas r
                 INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                 WHERE r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
@@ -846,8 +911,8 @@ def get_dashboard_kpis(
                 
             query_resgates = text(f"""
                 WITH Historico AS (
-                    SELECT cliente_id, nota, data_resposta, created_at,
-                           -- 🟢 CORREÇÃO: Desempate por resposta_id garante que a R1 e R2 são sempre corretas
+                    -- 👇 CORREÇÃO: Adicionada a coluna "empresa" aqui para o COALESCE do filtro não falhar!
+                    SELECT cliente_id, nota, data_resposta, created_at, empresa,
                            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
                     FROM dbo.nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
@@ -864,8 +929,21 @@ def get_dashboard_kpis(
             
             total_resgatados = conn.execute(query_resgates, parametros).scalar() or 0
 
+            # --- VARIÁVEIS ANTIGAS (PARA CÁLCULO DE VARIAÇÃO) ---
             filtros_sql_ant = []
             params_ant = {}
+            
+            # 👇 CORREÇÃO NO FILTRO ANTIGO (Usa COALESCE também)
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql_ant.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                params_ant["companhia"] = companhia
             
             if empresa:
                 if empresa == "Não Identificado":
@@ -875,7 +953,6 @@ def get_dashboard_kpis(
                     params_ant["empresa"] = empresa
                     
             if data_inicio and data_fim:
-                # Se filtrou data, compara com o período equivalente anterior (ex: 7 dias vs 7 dias anteriores)
                 dt_ini = datetime.strptime(data_inicio, "%Y-%m-%d")
                 dt_fim = datetime.strptime(data_fim, "%Y-%m-%d")
                 dias = (dt_fim - dt_ini).days + 1
@@ -887,7 +964,6 @@ def get_dashboard_kpis(
                 params_ant["ant_ini"] = ant_ini.strftime("%Y-%m-%d 00:00:00")
                 params_ant["ant_fim"] = ant_fim.strftime("%Y-%m-%d 23:59:59")
             else:
-                # Se for "Todo o Tempo", a variação é o Score atual vs Score de há 30 dias atrás
                 ant_fim = datetime.now(timezone.utc) - timedelta(days=30)
                 filtros_sql_ant.append("COALESCE(r.data_resposta, r.created_at) <= :ant_fim")
                 params_ant["ant_fim"] = ant_fim.strftime("%Y-%m-%d 23:59:59")
@@ -911,26 +987,53 @@ def get_dashboard_kpis(
                 
             variacao_nps = nps_score - nps_anterior
 
-            # --- 7. TÓPICOS CRÍTICOS (NOVO) ---
-            # Agrupa por categoria, conta menções e calcula a média, apenas para categorias não nulas
+            # --- 7. TÓPICOS CRÍTICOS ---
             sql_topicos = text(f"""
                 SELECT TOP 5
-                    COALESCE(r.categoria, 'Sem Classificação') as tema,
+                    COALESCE(r.motivo, 'Sem Classificação') as tema,
                     COUNT(r.resposta_id) as mencoes,
                     AVG(CAST(r.nota AS FLOAT)) as notaMedia
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                 {condicao_filtro}
-                { "AND" if condicao_filtro else "WHERE" } r.categoria IS NOT NULL AND r.categoria != '' AND r.excluido = 0
-                GROUP BY COALESCE(r.categoria, 'Sem Classificação')
+                { "AND" if condicao_filtro else "WHERE" } 
+                    r.motivo IS NOT NULL 
+                    AND r.motivo != '' 
+                    AND r.motivo NOT IN ('Promotor', 'Detrator', 'Neutro', 'Passivo')
+                    AND r.excluido = 0
+                GROUP BY COALESCE(r.motivo, 'Sem Classificação')
                 ORDER BY mencoes DESC, notaMedia ASC
             """)
             
             topicos_raw = conn.execute(sql_topicos, parametros).mappings().all()
-            topicos_criticos = [{"tema": r['tema'], "mencoes": r['mencoes'], "notaMedia": float(r['notaMedia'])} for r in topicos_raw]
+            
+            topicos_criticos = [
+                {"tema": r['tema'], "mencoes": r['mencoes'], "notaMedia": float(r['notaMedia'])} 
+                for r in topicos_raw if r['tema'] != 'Sem Classificação'
+            ]
 
-
-            # ... (rest of the existing code calculating resgatados, variacao, etc.) ...
+            # --- CÁLCULO DE PROMOTORES PERDIDOS / EM RISCO ---
+            query_perdidos = text(f"""
+                WITH Historico AS (
+                    -- 👇 CORREÇÃO: Adicionada a coluna "empresa" aqui também
+                    SELECT cliente_id, nota, data_resposta, created_at, empresa,
+                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
+                    FROM dbo.nps_respostas
+                    WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
+                )
+                SELECT 
+                    SUM(CASE WHEN anterior.nota >= 9 AND atual.nota <= 8 THEN 1 ELSE 0 END) as total_em_risco,
+                    SUM(CASE WHEN anterior.nota >= 9 AND atual.nota <= 6 THEN 1 ELSE 0 END) as queda_drastica
+                FROM Historico atual
+                JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
+                {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
+                WHERE atual.rn = 1      
+                  {condicao_resgate}      
+            """)
+            
+            res_perdidos = conn.execute(query_perdidos, parametros).mappings().first()
+            clientes_em_risco = res_perdidos['total_em_risco'] or 0
+            queda_drastica = res_perdidos['queda_drastica'] or 0
             
         return {
             "status": "success",
@@ -942,11 +1045,13 @@ def get_dashboard_kpis(
                 "detratores": detratores,
                 "nps_decisor": nps_decisor, 
                 "clientes_resgatados": total_resgatados,
+                "clientes_em_risco": clientes_em_risco, 
+                "queda_drastica": queda_drastica,       
                 "variacao_nps": variacao_nps, 
                 "revenue_at_risk": float(risco_real),
                 "termos_frequentes": termos_frequentes,
                 "total_decisores": dec_total,
-                "topicos_criticos": topicos_criticos # 👈 ADICIONADO AQUI
+                "topicos_criticos": topicos_criticos 
             },
             "feedbacks": feedbacks_processados
         }
@@ -955,11 +1060,12 @@ def get_dashboard_kpis(
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-            
+    
 
 @app.get("/api/dashboard/detalhes")
 def get_dashboard_detalhes(
     empresa: Optional[str] = Query(None),
+    companhia: Optional[str] = Query(None), 
     data_inicio: Optional[str] = Query(None), 
     data_fim: Optional[str] = Query(None)
 ):
@@ -971,6 +1077,27 @@ def get_dashboard_detalhes(
             filtros_sql_puro = []
             params = {}
 
+            # 👇 CORREÇÃO: Usar as variáveis corretas para esta rota (filtros_sql_c e params)
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql_c.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                # 👇 CORREÇÃO: Adicionado o filtro puro para o cálculo de taxa de resposta (que não tem r.empresa)
+                filtros_sql_puro.append("""
+                    empresa IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                params["companhia"] = companhia
+
             if empresa:
                 params["empresa"] = empresa
                 if empresa == "Não Identificado":
@@ -980,7 +1107,6 @@ def get_dashboard_detalhes(
                     filtros_sql_c.append("c.empresa = :empresa")
                     filtros_sql_puro.append("empresa = :empresa")
 
-            # 🟢 APLICA AS DATAS NO SQL
             if data_inicio and data_fim:
                 filtros_sql_c.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
                 filtros_sql_c.append("COALESCE(r.data_resposta, r.created_at) <= :data_fim")
@@ -995,12 +1121,12 @@ def get_dashboard_detalhes(
             if len(filtros_sql_puro) > 0:
                 str_filtro_puro = " WHERE " + " AND ".join(filtros_sql_puro)
 
-            coluna_nome = "COALESCE(c.empresa, 'Não Identificado')" if not empresa else "COALESCE(c.segmento, 'Sem Segmento')"
+            coluna_nome = "COALESCE(r.empresa, c.empresa, 'Não Identificado')" if not empresa else "COALESCE(c.segmento, 'Sem Segmento')"
             
             sql_ranking = text(f"""
                 SELECT 
                     {coluna_nome} as nome,
-                    MAX(e.gestor) as gestor, -- 👈 Agora lê de 'e' (empresas) e não de 'c'
+                    MAX(e.gestor) as gestor, 
                     COUNT(r.resposta_id) as total,
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
@@ -1008,7 +1134,7 @@ def get_dashboard_detalhes(
                     ) as nps
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome -- 👈 JOIN Necessário
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome 
                 {str_filtro_c}
                 GROUP BY {coluna_nome}
                 ORDER BY nps DESC;
@@ -1043,37 +1169,58 @@ def get_dashboard_detalhes(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dashboard/trend")
-def get_dashboard_trend(empresa: Optional[str] = Query(None)):
+def get_dashboard_trend(
+    empresa: Optional[str] = Query(None),
+    companhia: Optional[str] = Query(None),
+    data_inicio: Optional[str] = Query(None),
+    data_fim: Optional[str] = Query(None)
+):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 💡 AQUI ESTÁ A CORREÇÃO: Lê da nps_configuracoes em vez de nps_settings
             sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
-            
-            # Se a configuração for 'true', usa LEFT JOIN, senão usa INNER JOIN (padrão)
-            tipo_join = "LEFT JOIN" if config_valor == 'true' else "INNER JOIN"
+            tipo_join = "LEFT JOIN"
 
-            condicao = ""
+            # 👈 BLINDAGEM: Ignora respostas arquivadas e garante que existe data
+            filtros_sql = ["COALESCE(r.data_resposta, r.created_at) IS NOT NULL", "(r.excluido = 0 OR r.excluido IS NULL)"]
             params = {}
+            
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                params["companhia"] = companhia
+                
             if empresa:
                 if empresa == "Não Identificado":
-                    condicao = " AND c.empresa IS NULL "
+                    filtros_sql.append("c.empresa IS NULL")
                 else:
-                    condicao = " AND c.empresa = :empresa "
-                    params = {"empresa": empresa}
+                    filtros_sql.append("c.empresa = :empresa")
+                    params["empresa"] = empresa
+                    
+            if data_inicio and data_fim:
+                filtros_sql.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
+                filtros_sql.append("COALESCE(r.data_resposta, r.created_at) <= :data_fim")
+                params["data_inicio"] = f"{data_inicio} 00:00:00"
+                params["data_fim"] = f"{data_fim} 23:59:59"
+
+            condicao = " WHERE " + " AND ".join(filtros_sql)
 
             sql_trend = text(f"""
                 WITH UltimosMeses AS (
                     SELECT TOP 6
-                        -- Extrai apenas os primeiros 7 caracteres (YYYY-MM) de forma universal
                         LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) as mes,
                         COUNT(r.resposta_id) as total,
                         SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                         SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
                     FROM dbo.nps_respostas r
                     {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                    WHERE COALESCE(r.data_resposta, r.created_at) IS NOT NULL
                     {condicao}
                     GROUP BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7)
                     ORDER BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) DESC
@@ -1082,11 +1229,6 @@ def get_dashboard_trend(empresa: Optional[str] = Query(None)):
             """)
 
             result = conn.execute(sql_trend, params).mappings().all()
-            
-            print("\n=== 📊 DADOS DO GRÁFICO DE EVOLUÇÃO ===")
-            for r in result:
-                print(dict(r))
-            print("=========================================\n")
             
             labels = []
             scores = []
@@ -1099,7 +1241,6 @@ def get_dashboard_trend(empresa: Optional[str] = Query(None)):
                     continue
                 
                 ano, mes_num = row['mes'].split('-')
-                # get() garante que se o mês vier estranho, não quebra a aplicação
                 nome_mes = meses_pt.get(mes_num, mes_num) 
                 mes_nome = f"{nome_mes}/{ano[2:]}" 
                 
@@ -1121,32 +1262,54 @@ def get_dashboard_trend(empresa: Optional[str] = Query(None)):
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/dashboard/nuvem-palavras")
-def get_nuvem_palavras(empresa: Optional[str] = Query(None)):
+def get_nuvem_palavras(
+    empresa: Optional[str] = Query(None),
+    companhia: Optional[str] = Query(None), # 👈 Adicionado
+    data_inicio: Optional[str] = Query(None),
+    data_fim: Optional[str] = Query(None)
+):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            condicao = ""
+            # 👈 BLINDAGEM: Inclui apenas Detratores e ignora excluídos
+            filtros_sql = ["r.nota <= 6", "r.motivo IS NOT NULL", "LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0", "(r.excluido = 0 OR r.excluido IS NULL)"]
             params = {}
+            
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                params["companhia"] = companhia
+                
             if empresa:
                 if empresa == "Não Identificado":
-                    condicao = " AND c.empresa IS NULL "
+                    filtros_sql.append("c.empresa IS NULL")
                 else:
-                    condicao = " AND c.empresa = :empresa "
-                    params = {"empresa": empresa}
+                    filtros_sql.append("c.empresa = :empresa")
+                    params["empresa"] = empresa
+                    
+            if data_inicio and data_fim:
+                filtros_sql.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
+                filtros_sql.append("COALESCE(r.data_resposta, r.created_at) <= :data_fim")
+                params["data_inicio"] = f"{data_inicio} 00:00:00"
+                params["data_fim"] = f"{data_fim} 23:59:59"
+
+            condicao = " WHERE " + " AND ".join(filtros_sql)
 
             sql = text(f"""
                 SELECT CAST(r.motivo AS NVARCHAR(MAX)) as motivo
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE r.nota <= 6 AND r.motivo IS NOT NULL 
-                  AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
-                  {condicao}
+                {condicao}
             """)
             
             result = conn.execute(sql, params).mappings().all()
-            
             texto_completo = " ".join([r['motivo'].lower() for r in result if r['motivo']])
-            
             palavras = re.findall(r'\b[a-zà-ú]{3,}\b', texto_completo)
             
             stop_words = {
@@ -1157,8 +1320,7 @@ def get_nuvem_palavras(empresa: Optional[str] = Query(None)):
             }
             
             palavras_uteis = [p for p in palavras if p not in stop_words and len(p) > 3]
-            contagem = Counter(palavras_uteis).most_common(15) # Pega o Top 15 de termos
-            
+            contagem = Counter(palavras_uteis).most_common(15) 
             nuvem = [{"texto": p[0], "peso": p[1]} for p in contagem]
             
             return {"status": "success", "nuvem": nuvem}
@@ -1170,16 +1332,28 @@ def get_nuvem_palavras(empresa: Optional[str] = Query(None)):
 @app.get("/api/dashboard/exportar")
 def exportar_dashboard(
     empresa: Optional[str] = Query(None),
+    companhia: Optional[str] = Query(None), # 👈 Adicionado
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None)
 ):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. Constrói os mesmos filtros usados no Dashboard
-            filtros_sql = []
+            # 👈 BLINDAGEM: O Excel também não deve conter os arquivados
+            filtros_sql = ["(r.excluido = 0 OR r.excluido IS NULL)"]
             parametros = {}
             
+            if companhia and companhia != "Todas as Companhias":
+                filtros_sql.append("""
+                    COALESCE(r.empresa, c.empresa) IN (
+                        SELECT e.nome 
+                        FROM dbo.nps_empresas e 
+                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
+                        WHERE comp.nome = :companhia
+                    )
+                """)
+                parametros["companhia"] = companhia
+                
             if empresa:
                 if empresa == "Não Identificado":
                     filtros_sql.append("c.empresa IS NULL")
@@ -1193,16 +1367,13 @@ def exportar_dashboard(
                 parametros["data_inicio"] = f"{data_inicio} 00:00:00"
                 parametros["data_fim"] = f"{data_fim} 23:59:59"
 
-            condicao_filtro = ""
-            if len(filtros_sql) > 0:
-                condicao_filtro = " WHERE " + " AND ".join(filtros_sql)
+            condicao_filtro = " WHERE " + " AND ".join(filtros_sql)
 
-            # 2. Query focada em formato de Relatório Executivo Excel
             sql_relatorio = text(f"""
                 SELECT 
                     c.nome as Cliente,
                     c.email as Email,
-                    c.empresa as Empresa,
+                    COALESCE(r.empresa, c.empresa) as Empresa, -- 👈 Corrigido: Mostra sempre a empresa correta
                     c.segmento as Segmento,
                     c.perfil_decisor as Perfil,
                     c.valor_contrato as Receita_ARR,
@@ -1221,11 +1392,9 @@ def exportar_dashboard(
                 ORDER BY Data_Resposta DESC
             """)
 
-            # 3. Transforma em Pandas DataFrame e depois em CSV (Excel compatível)
             df = pd.read_sql(sql_relatorio, conn, params=parametros)
 
         stream = io.StringIO()
-        # O utf-8-sig garante que o Excel do Windows lê os acentos de forma perfeita
         df.to_csv(stream, index=False, sep=';', encoding='utf-8-sig') 
         
         response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
@@ -1235,7 +1404,20 @@ def exportar_dashboard(
     except Exception as e:
         print(f"Erro Exportação: {str(e)}")
         raise HTTPException(status_code=500, detail="Falha ao gerar o ficheiro.")
-    
+        
+@app.get("/api/dashboard/companhias")
+def get_lista_companhias():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text("SELECT nome FROM dbo.nps_companhias ORDER BY nome")
+            resultados = conn.execute(sql).scalars().all()
+            
+            return ["Todas as Companhias"] + list(resultados)
+    except Exception as e:
+        print(f"Erro ao buscar companhias: {e}")
+        return ["Todas as Companhias"]
+
 # ==========================================
 # 🏢 ROTAS: EMPRESAS, SEGMENTOS E PERFIS
 # ==========================================
@@ -1292,7 +1474,6 @@ def update_perfil(perf_id: int, perf: BasicoSchema):
     return {"status": "success"}
 
 # --- ROTAS DE SEGMENTOS ---
-# --- FÁBRICA DE ROTAS COM EFEITO CASCATA ---
 def crud_factory(route_path, table_name, schema=BasicoSchema):
     @app.get(route_path)
     def listar():
@@ -1341,6 +1522,7 @@ crud_factory("/api/cadastros/segmentos", "dbo.nps_segmentos")
 crud_factory("/api/cadastros/perfis", "dbo.nps_perfis")
 crud_factory("/api/cadastros/cargos", "dbo.nps_cargos")
 crud_factory("/api/cadastros/gestores", "dbo.nps_gestores", GestorSchema)
+crud_factory("/api/cadastros/companhias", "dbo.nps_companhias")
 
 # --- ROTAS DE PERFIS ---
 @app.get("/api/cadastros/perfis")
@@ -1568,16 +1750,15 @@ async def enviar_report_email(payload: ReportEmailPayload):
 async def listar_empresas():
     engine = get_engine()
     with engine.connect() as conn:
+        # 👈 Alterado para fazer JOIN e trazer o nome e ID da companhia
         sql = text("""
             SELECT 
-                e.id, 
-                e.nome, 
-                e.segmento, 
-                e.valor_contrato as arr_total, 
-                g.nome as gestor, 
-                e.gestor_id 
+                e.id, e.nome, e.segmento, e.valor_contrato as arr_total, 
+                g.nome as gestor, e.gestor_id,
+                comp.nome as companhia, e.companhia_id
             FROM dbo.nps_empresas e
             LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
+            LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
             ORDER BY e.nome ASC
         """)
         return conn.execute(sql).mappings().all()
@@ -1587,8 +1768,20 @@ def save_empresa(emp: EmpresaSchema):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            sql = text("INSERT INTO dbo.nps_empresas (nome, segmento, valor_contrato) VALUES (:n, :s, :v)")
-            conn.execute(sql, {"n": emp.nome, "s": emp.segmento, "v": emp.valor_contrato})
+            # 👇 CORREÇÃO: Inserir gestor e gestor_id na criação
+            sql_insert = text("""
+                INSERT INTO dbo.nps_empresas 
+                (nome, segmento, valor_contrato, gestor, gestor_id, companhia_id) 
+                VALUES (:n, :s, :v, :g, :gid, :cid)
+            """)
+            conn.execute(sql_insert, {
+                "n": emp.nome, 
+                "s": emp.segmento, 
+                "v": emp.valor_contrato, 
+                "g": emp.gestor,
+                "gid": emp.gestor_id, # 👈 O ID agora é guardado!
+                "cid": emp.companhia_id
+            })
         return {"status": "success", "message": "Empresa cadastrada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1597,14 +1790,25 @@ def save_empresa(emp: EmpresaSchema):
 def update_empresa(empresa_id: int, emp: EmpresaSchema):
     engine = get_engine()
     with engine.begin() as conn: 
-        # Guarda o nome antigo
         nome_antigo = conn.execute(text("SELECT nome FROM dbo.nps_empresas WHERE id=:id"), {"id": empresa_id}).scalar()
         
-        # Atualiza a empresa
-        conn.execute(text("UPDATE dbo.nps_empresas SET nome=:n, segmento=:s, valor_contrato=:v, gestor=:g WHERE id=:id"), 
-                     {"n": emp.nome, "s": emp.segmento, "v": emp.valor_contrato, "g": emp.gestor, "id": empresa_id})
+        # 👇 CORREÇÃO: Adicionado gestor_id=:gid na query SQL
+        sql_update = text("""
+            UPDATE dbo.nps_empresas 
+            SET nome=:n, segmento=:s, valor_contrato=:v, gestor=:g, gestor_id=:gid, companhia_id=:cid 
+            WHERE id=:id
+        """)
         
-        # Atualiza as pessoas se a empresa mudou de nome
+        conn.execute(sql_update, {
+            "n": emp.nome, 
+            "s": emp.segmento, 
+            "v": emp.valor_contrato, 
+            "g": emp.gestor, 
+            "gid": emp.gestor_id, # 👈 O ID agora é guardado!
+            "cid": emp.companhia_id, 
+            "id": empresa_id
+        })
+        
         if nome_antigo and str(nome_antigo) != str(emp.nome):
             conn.execute(text("UPDATE dbo.nps_clientes SET empresa=:novo WHERE empresa=:antigo"), 
                          {"novo": emp.nome, "antigo": nome_antigo})
@@ -1826,11 +2030,12 @@ def gerar_plano_acao_empresa(empresa: str):
         raise HTTPException(status_code=500, detail=f"Erro ao processar plano de IA: {str(e)}")
 
 # ==========================================
-# 📋 LISTAR FEEDBACKS (Respostas)
+# 📋 LISTAR E ATUALIZAR FEEDBACKS (Respostas)
 # ==========================================
 @app.get("/api/respostas")
 async def listar_respostas(
     q: str = "",
+    companhia: str = "Todas",
     empresa: str = "",
     categoria: str = "Todas",
     perfil: str = "Todos",
@@ -1839,7 +2044,7 @@ async def listar_respostas(
 ):
     try:
         from services import respostas_svc
-        df = respostas_svc.load_respostas(q, empresa, categoria, perfil, incluir_excluidas, topn)
+        df = respostas_svc.load_respostas(q, companhia, empresa, categoria, perfil, incluir_excluidas, topn)
         return df.fillna("").to_dict(orient="records")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1860,7 +2065,7 @@ def update_resposta_route(resposta_id: str, payload: RespostaUpdate):
 # 🗂️ ARQUIVAR / DESARQUIVAR FEEDBACKS
 # ==========================================
 @app.post("/api/respostas/{resposta_id}/soft-delete")
-async def soft_delete_resposta_route(resposta_id: str): # 💡 GARANTIDO COMO STRING
+async def soft_delete_resposta_route(resposta_id: str):
     try:
         engine = get_engine()
         with engine.begin() as conn:
@@ -1870,7 +2075,7 @@ async def soft_delete_resposta_route(resposta_id: str): # 💡 GARANTIDO COMO ST
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/respostas/{resposta_id}/restore")
-async def restore_resposta_route(resposta_id: str): # 💡 GARANTIDO COMO STRING
+async def restore_resposta_route(resposta_id: str):
     try:
         engine = get_engine()
         with engine.begin() as conn:
@@ -2576,3 +2781,94 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
             "resumoParetoIA": "Analisando os filtros aplicados, identificamos uma falha de conexão com o motor cognitivo.",
             "recomendacaoIA": "Por favor, tente gerar a análise novamente."
         }
+    
+# ==========================================
+# 🎯 ROTAS: PLANOS DE AÇÃO (Close the Loop)
+# ==========================================
+
+@app.post("/api/acoes")
+def criar_acao(acao: AcaoCriar):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            sql = text("""
+                INSERT INTO dbo.nps_acoes 
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite)
+                VALUES (:rid, :eid, :gid, :t, :d, :p, :pl)
+            """)
+            conn.execute(sql, {
+                "rid": acao.resposta_id, "eid": acao.empresa_id, "gid": acao.gestor_id,
+                "t": acao.titulo, "d": acao.descricao, "p": acao.prioridade, 
+                "pl": acao.prazo_limite if acao.prazo_limite else None
+            })
+        return {"status": "success", "message": "Ação criada com sucesso!"}
+    except Exception as e:
+        print(f"Erro ao criar ação: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/acoes")
+def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            filtros = []
+            params = {}
+            
+            if gestor_id:
+                filtros.append("a.gestor_id = :gid")
+                params["gid"] = gestor_id
+            if status and status != "Todas":
+                filtros.append("a.status = :status")
+                params["status"] = status
+                
+            condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
+
+            sql = text(f"""
+                SELECT 
+                    a.*,
+                    e.nome as empresa_nome,
+                    g.nome as gestor_nome,
+                    r.nota as resposta_nota
+                FROM dbo.nps_acoes a
+                LEFT JOIN dbo.nps_empresas e ON a.empresa_id = e.id
+                LEFT JOIN dbo.nps_gestores g ON a.gestor_id = g.id
+                LEFT JOIN dbo.nps_respostas r ON a.resposta_id = r.resposta_id
+                {condicao}
+                ORDER BY 
+                    CASE a.status 
+                        WHEN 'Pendente' THEN 1 
+                        WHEN 'Em Andamento' THEN 2 
+                        WHEN 'Concluído' THEN 3 
+                    END,
+                    a.prazo_limite ASC, 
+                    a.created_at DESC
+            """)
+            
+            resultados = conn.execute(sql, params).mappings().all()
+            return [dict(r) for r in resultados]
+    except Exception as e:
+        print(f"Erro ao listar ações: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/acoes/{acao_id}")
+def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            sql = text("""
+                UPDATE dbo.nps_acoes 
+                SET status = COALESCE(:s, status),
+                    prioridade = COALESCE(:p, prioridade),
+                    descricao = COALESCE(:d, descricao),
+                    prazo_limite = COALESCE(:pl, prazo_limite),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+            """)
+            conn.execute(sql, {
+                "id": acao_id, "s": acao.status, "p": acao.prioridade, 
+                "d": acao.descricao, "pl": acao.prazo_limite
+            })
+        return {"status": "success", "message": "Ação atualizada!"}
+    except Exception as e:
+        print(f"Erro ao atualizar ação: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
