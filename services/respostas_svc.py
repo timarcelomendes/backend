@@ -1,7 +1,7 @@
 import pandas as pd
 from sqlalchemy import text
 from database import get_engine, exec_sql
-import traceback
+import time
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
@@ -112,13 +112,10 @@ def soft_delete(resposta_id: str):
 def restore(resposta_id: str):
     exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
-from sqlalchemy import text
-from database import get_engine
-
-from sqlalchemy import text
-from database import get_engine
-
 def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
+    # 1. O "TRAVÃO": Espera 2 segundos para dar tempo à base de dados de gravar o registo do n8n
+    time.sleep(2)
+    
     engine = get_engine()
     
     try:
@@ -132,40 +129,36 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
         
     try:
         with engine.connect() as conn:
-            # 1. Tentar procurar a empresa diretamente pelo ID do n8n
-            empresa_data = None
+            # 2. Tentar procurar a empresa diretamente pelo ID do n8n (se vier)
             if eid_val > 0:
                 sql_busca = text("SELECT id, nome, gestor_id FROM dbo.nps_empresas WHERE id = :eid")
                 empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
+                if empresa_data:
+                    id_real = empresa_data.get("id")
+                    nome_emp = empresa_data.get("nome")
+                    id_gestor = empresa_data.get("gestor_id")
 
-            # 2. A REDE DE SEGURANÇA: Se falhar, procura em todo o lado (Respostas, Clientes e Nomes)
-            if not empresa_data:
+            # 3. Se não veio ID, procura a resposta (agora que demos 2 segundos, ela já estará lá!)
+            if not id_real:
                 sql_busca_resposta = text("""
                     SELECT TOP 1 
-                        e.id, 
-                        COALESCE(e.nome, r.empresa, c.empresa, 'Conta Geral') as nome_encontrado, 
+                        e.id as id_empresa, 
+                        COALESCE(e.nome, r.empresa, 'Conta Geral') as nome_encontrado, 
                         e.gestor_id 
                     FROM dbo.nps_respostas r
-                    LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                     LEFT JOIN dbo.nps_empresas e 
                         ON e.id = r.empresa_id 
-                        OR e.id = c.empresa_id 
-                        OR e.nome = r.empresa 
-                        OR e.nome = c.empresa
+                        OR LOWER(e.nome) = LOWER(r.empresa) 
                     WHERE r.resposta_id = :rid
                 """)
                 row = conn.execute(sql_busca_resposta, {"rid": str(resposta_id)}).mappings().first()
                 
                 if row:
-                    id_real = row.get("id")
-                    nome_emp = row.get("nome_encontrado", "Conta Geral")
+                    id_real = row.get("id_empresa")
+                    nome_emp = row.get("nome_encontrado") or "Conta Geral"
                     id_gestor = row.get("gestor_id")
-            else:
-                id_real = empresa_data.get("id")
-                nome_emp = empresa_data.get("nome", "Conta Geral")
-                id_gestor = empresa_data.get("gestor_id")
 
-        # 3. Gravação garantida
+        # 4. Gravação garantida com os IDs corretos
         with engine.begin() as conn:
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
@@ -183,7 +176,7 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
             }
             
             conn.execute(sql_insert, params)
-            print(f"✅ SUCESSO! Ação criada para {nome_emp} (ID Empresa: {id_real} | Gestor: {id_gestor})")
+            print(f"✅ SUCESSO DEFINITIVO! Ação criada. Empresa ID: {id_real} | Gestor ID: {id_gestor}")
             
     except Exception as e:
         print(f"❌ Erro Crítico: {e}")
