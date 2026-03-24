@@ -2824,15 +2824,20 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
             condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
 
             # O segredo está no LEFT JOIN e no COALESCE para garantir que a query não quebre
+            condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
+
+            # Adicionámos JOINs para garantir que o Kanban exibe o nome, mesmo se o ID for Nulo
             sql = text(f"""
                 SELECT 
                     a.*,
-                    COALESCE(e.nome, 'Empresa Geral') as empresa_nome,
-                    COALESCE(e.gestor, 'Sem Gestor') as gestor_nome,
+                    COALESCE(e.nome, r.empresa, c.empresa, 'Conta Geral') as empresa_nome,
+                    COALESCE(e.gestor, g.nome, 'Sem Gestor') as gestor_nome,
                     r.nota as resposta_nota
                 FROM dbo.nps_acoes a
                 LEFT JOIN dbo.nps_empresas e ON a.empresa_id = e.id
                 LEFT JOIN dbo.nps_respostas r ON a.resposta_id = r.resposta_id
+                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN dbo.nps_gestores g ON a.gestor_id = g.id
                 {condicao}
                 ORDER BY 
                     CASE a.status 
@@ -2843,7 +2848,7 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
                     a.prazo_limite ASC, 
                     a.created_at DESC
             """)
-            
+                        
             resultados = conn.execute(sql, params).mappings().all()
             return [dict(r) for r in resultados]
     except Exception as e:
