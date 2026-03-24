@@ -2,6 +2,7 @@ import pandas as pd
 from sqlalchemy import text
 from database import get_engine, exec_sql
 import time
+import traceback
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
@@ -112,4 +113,68 @@ def soft_delete(resposta_id: str):
 def restore(resposta_id: str):
     exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
-import time
+def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motivo):
+    engine = get_engine()
+    
+    id_real = None
+    nome_emp = "Conta Geral"
+    id_gestor = None
+        
+    try:
+        with engine.connect() as conn:
+            # TENTATIVA 1: Pelo ID oficial (caso o n8n o envie corretamente)
+            try:
+                eid_val = int(empresa_id) if empresa_id else 0
+            except:
+                eid_val = 0
+
+            if eid_val > 0:
+                sql_busca = text("SELECT id, nome, gestor_id FROM dbo.nps_empresas WHERE id = :eid")
+                empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
+                if empresa_data:
+                    id_real = empresa_data["id"]
+                    nome_emp = empresa_data["nome"]
+                    id_gestor = empresa_data["gestor_id"]
+
+            # TENTATIVA 2 (A SOLUÇÃO DEFINITIVA): Buscar usando o nome em texto enviado pelo n8n
+            if not id_real and empresa_nome and str(empresa_nome).strip() != "":
+                sql_busca_nome = text("""
+                    SELECT TOP 1 id, nome, gestor_id 
+                    FROM dbo.nps_empresas 
+                    WHERE LOWER(LTRIM(RTRIM(nome))) LIKE :nome_busca
+                """)
+                # Usa % para encontrar até resultados com espaços escondidos (ex: "%itaú%")
+                param_nome = f"%{str(empresa_nome).strip().lower()}%"
+                empresa_data = conn.execute(sql_busca_nome, {"nome_busca": param_nome}).mappings().first()
+                
+                if empresa_data:
+                    id_real = empresa_data["id"]
+                    nome_emp = empresa_data["nome"]
+                    id_gestor = empresa_data["gestor_id"]
+                else:
+                    # Se não achar na base de dados de todo, ao menos guarda o nome que o cliente digitou!
+                    nome_emp = empresa_nome 
+
+        # 3. Gravação na Tabela de Ações
+        with engine.begin() as conn:
+            sql_insert = text("""
+                INSERT INTO dbo.nps_acoes 
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade)
+                VALUES 
+                (:rid, :eid, :gid, :t, :d, 'Alta')
+            """)
+            
+            params = {
+                "rid": str(resposta_id),
+                "eid": id_real,
+                "gid": id_gestor,
+                "t": f"🔥 Ação Automática: {nome_emp}",
+                "d": f"Nota: {nota}. Motivo: {motivo}"
+            }
+            
+            conn.execute(sql_insert, params)
+            print(f"✅ SUCESSO! Ação criada. Empresa: {nome_emp} | ID Emp: {id_real} | Gestor: {id_gestor}")
+            
+    except Exception as e:
+        print(f"❌ Erro Crítico: {e}")
+        print(traceback.format_exc())
