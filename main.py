@@ -199,6 +199,7 @@ class WebhookN8nPayload(BaseModel):
     resposta_id: str
     nota: int
     empresa_id: Optional[Any] = 0 
+    empresa_nome: Optional[str] = ""
     motivo: Optional[str] = ""
 
 # Configurações de Segurança e Autenticação
@@ -235,22 +236,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 # ==========================================
 @app.post("/api/webhook/n8n/gatilho-acao")
 def n8n_gatilho_acao(payload: WebhookN8nPayload):
-    """
-    O n8n chama esta rota logo após inserir uma resposta no SQL.
-    A API avalia se precisa de criar um ticket no Kanban.
-    """
     try:
         from services import respostas_svc
-        
-        # Chama a nossa função inteligente que criámos no passo anterior!
         respostas_svc.processar_acao_automatica(
             resposta_id=payload.resposta_id,
             nota=payload.nota,
-            empresa_id=payload.empresa_id or 0, # Passa 0 se não houver empresa
+            empresa_id=payload.empresa_id,
+            empresa_nome=payload.empresa_nome, # 👈 PASSA O NOME AQUI
             motivo=payload.motivo
         )
-        
-        return {"status": "success", "detail": "Gatilho avaliado com sucesso."}
+        return {"status": "success"}
     except Exception as e:
         import traceback
         print(traceback.format_exc())
