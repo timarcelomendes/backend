@@ -118,19 +118,18 @@ from database import get_engine
 def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
     engine = get_engine()
     
-    # Tratamento seguro do ID
     try:
         eid_val = int(empresa_id) if empresa_id else 0
     except:
         eid_val = 0
         
-    # Busca Inteligente da Empresa
     with engine.connect() as conn:
         if eid_val == 0:
+            # 💡 CORREÇÃO AQUI: Em vez de procurar pelo nome, procuramos pelo empresa_id da resposta!
             sql_busca = text("""
                 SELECT e.id, e.nome, e.gestor_id 
                 FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa = e.nome
+                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
                 WHERE r.resposta_id = :rid
             """)
             empresa_data = conn.execute(sql_busca, {"rid": str(resposta_id)}).mappings().first()
@@ -142,27 +141,30 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, motivo):
             """)
             empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
 
-    # Extração dos dados
-    id_real = empresa_data["id"] if empresa_data else None
-    nome_emp = empresa_data["nome"] if empresa_data else "Conta Geral"
-    id_gestor = empresa_data["gestor_id"] if empresa_data else None
+    # Extração segura dos dados (se empresa_data existir)
+    id_real = empresa_data["id"] if empresa_data and empresa_data.get("id") else None
+    nome_emp = empresa_data["nome"] if empresa_data and empresa_data.get("nome") else "Conta Geral"
+    id_gestor = empresa_data["gestor_id"] if empresa_data and empresa_data.get("gestor_id") else None
 
-    # 🚨 GRAVAÇÃO COM ENGINE.BEGIN() - IDÊNTICO À SUA CRIAÇÃO MANUAL
-    with engine.begin() as conn:
-        sql_insert = text("""
-            INSERT INTO dbo.nps_acoes 
-            (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade)
-            VALUES 
-            (:rid, :eid, :gid, :t, :d, 'Alta')
-        """)
-        
-        params = {
-            "rid": str(resposta_id),
-            "eid": id_real,
-            "gid": id_gestor,
-            "t": f"🔥 Ação Automática: {nome_emp}",
-            "d": f"Nota: {nota}. Motivo: {motivo}"
-        }
-        
-        conn.execute(sql_insert, params)
-        print(f"✅ GRAVADO COM SUCESSO: {nome_emp}!")
+    # Gravação Definitiva
+    try:
+        with engine.begin() as conn:
+            sql_insert = text("""
+                INSERT INTO dbo.nps_acoes 
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade)
+                VALUES 
+                (:rid, :eid, :gid, :t, :d, 'Alta')
+            """)
+            
+            params = {
+                "rid": str(resposta_id),
+                "eid": id_real,
+                "gid": id_gestor,
+                "t": f"🔥 Ação Automática: {nome_emp}",
+                "d": f"Nota: {nota}. Motivo: {motivo}"
+            }
+            
+            conn.execute(sql_insert, params)
+            print(f"✅ GRAVADO COM SUCESSO: {nome_emp} (Gestor ID: {id_gestor})!")
+    except Exception as e:
+        print(f"❌ Erro no SQL de Insert: {e}")
