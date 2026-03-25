@@ -258,13 +258,23 @@ class IntegracoesConfig(BaseModel):
     teams_webhook_url: Optional[str] = ""
 
 class RegrasNegocioConfig(BaseModel):
+    scheduler_hora_inicio: str = "09:00"
     scheduler_horas: int = 6
     sla_detrator_dias: int = 2
     sla_neutro_dias: int = 5
     sla_promotor_dias: int = 7
     fillout_campos: str = "clienteid,email,nome,empresa,empresa_id"
     email_template_html: Optional[str] = ""
-    email_agradecimento_html: Optional[str] = ""
+    email_agradecimento_promotor: Optional[str] = ""
+    email_agradecimento_neutro: Optional[str] = ""
+    email_agradecimento_detrator: Optional[str] = ""
+    lembrete_dias: int = 3
+    email_template_lembrete: Optional[str] = ""
+
+class TesteTemplatePayload(BaseModel):
+    email_destino: str
+    html_content: str
+    categoria: str # 'promotor', 'neutro', 'detrator'
 
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
@@ -353,23 +363,31 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_html')")
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'lembrete_dias', 'email_template_lembrete')")
             resultados = conn.execute(query).fetchall()
             
             # Valores padrão de segurança
             config = {
+                "scheduler_hora_inicio": "09:00",
                 "scheduler_horas": 6,
                 "sla_detrator_dias": 2,
                 "sla_neutro_dias": 5,
                 "sla_promotor_dias": 7,
                 "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
                 "email_template_html": "",
-                "email_agradecimento_html": ""
+                "email_agradecimento_promotor": "",
+                "email_agradecimento_neutro": "",
+                "email_agradecimento_detrator": "",
+                "lembrete_dias": 3,
+                "email_template_lembrete": ""
+                
             }
             
             for linha in resultados:
-                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
+                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'lembrete_dias']:
                     config[linha.chave] = int(linha.valor) if linha.valor else config[linha.chave]
+                elif linha.chave == 'scheduler_hora_inicio':
+                    config[linha.chave] = linha.valor if linha.valor else "09:00"
                 else:
                     config[linha.chave] = linha.valor
                     
@@ -397,6 +415,65 @@ def salvar_regras_negocio(payload: RegrasNegocioConfig, usuario_email: str = Dep
         return {"status": "success", "message": "Regras de negócio atualizadas com sucesso!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Erro ao gravar regras de negócio.")
+    
+@app.post("/api/config/testar-template")
+def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Depends(get_current_user)):
+    """Recebe um HTML do frontend e envia um e-mail de teste instantâneo"""
+    try:
+        from services.email_svc import get_valid_access_token
+        import requests
+
+        access_token = get_valid_access_token()
+        if not access_token:
+            raise HTTPException(status_code=400, detail="A conexão com o e-mail não está ativa. Autorize o Microsoft Graph primeiro.")
+
+        if not payload.html_content:
+            raise HTTPException(status_code=400, detail="A caixa de texto do HTML está vazia.")
+
+        # Escolher o assunto e injetar dados dependendo do tipo de e-mail
+        if payload.categoria == 'convite':
+            assunto_teste = "[Gauge Teste] Preview do Convite NPS"
+            html_pronto = payload.html_content.replace("{nome}", "Maria (Teste)") \
+                                              .replace("{empresa}", "Empresa Fictícia S/A") \
+                                              .replace("{survey_url}", "https://forms.fillout.com/t/preview123456789")
+        else:
+            assunto_teste = f"[Gauge Teste] Preview do Layout — {payload.categoria.capitalize()}"
+            nota_teste = "10" if payload.categoria == 'promotor' else "7" if payload.categoria == 'neutro' else "3"
+            motivo_teste = "A equipa foi fantástica, mas acho que o portal poderia ser mais intuitivo."
+            exp_teste = "Sim, o atendimento atendeu às expectativas."
+            falta_teste = "Faltou apenas um manual de utilizador mais detalhado."
+            
+            html_pronto = payload.html_content.replace("{nome}", "João (Teste)") \
+                                              .replace("{empresa}", "Empresa Fictícia S/A") \
+                                              .replace("{nota}", nota_teste) \
+                                              .replace("{motivo}", motivo_teste) \
+                                              .replace("{expectativas}", exp_teste) \
+                                              .replace("{o_que_faltava}", falta_teste)
+
+        # Montar a mensagem do Microsoft Graph
+        msg_payload = {
+            "message": {
+                "subject": assunto_teste, # 👈 USA O ASSUNTO DINÂMICO
+                "body": {"contentType": "HTML", "content": html_pronto},
+                "toRecipients": [{"emailAddress": {"address": payload.email_destino}}]
+            },
+            "saveToSentItems": False
+        }
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        res = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=msg_payload)
+        if res.status_code not in (200, 202):
+            raise Exception(res.text)
+
+        return {"status": "success", "message": "E-mail de teste despachado!"}
+
+    except Exception as e:
+        print(f"❌ Erro ao enviar e-mail de teste: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     
 # ==========================================
 # 🤖 AUTENTICACAO (Login, Registros)

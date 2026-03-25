@@ -363,7 +363,10 @@ def processar_webhook_fillout(payload: dict):
                 nome=nome, 
                 empresa=empresa, 
                 nota=nota, 
-                categoria=categoria
+                categoria=categoria,
+                motivo=motivo,
+                expectativas=expectativas,
+                o_que_faltava=o_que_faltava
             )
         except Exception as erro_email:
             print(f"⚠️ Erro ao enviar o e-mail de agradecimento: {erro_email}")

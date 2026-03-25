@@ -16,7 +16,9 @@ def obter_regras_dinamicas():
         "sla_promotor_dias": 7,
         "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
         "email_template_html": "",
-        "email_agradecimento_html": ""
+        "email_agradecimento_promotor": "",
+        "email_agradecimento_neutro": "",
+        "email_agradecimento_detrator": ""
     }
     
     try:
@@ -469,8 +471,7 @@ def disparar_convite_nps_especifico(cliente_ids: list):
     except Exception as e:
         print(f"❌ Erro fatal no disparo manual: {e}")
 
-def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int, categoria: str):
-    """Envia um e-mail de agradecimento dinâmico com base na categoria do NPS"""
+def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int, categoria: str, motivo: str = "", expectativas: str = "", o_que_faltava: str = ""):
     if not email_destino or email_destino == "-":
         print("⚠️ E-mail de destino não fornecido. Agradecimento ignorado.")
         return
@@ -485,61 +486,36 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
 
     # Textos de exibição seguros
     primeiro_nome = nome.split(" ")[0] if nome else "Parceiro"
-    nome_empresa = f" na {empresa}" if empresa else ""
-    empresa_exibicao = empresa if empresa else "sua empresa"
+    empresa_exibicao = empresa if empresa else "sua empresa" 
+    motivo_exibicao = motivo if motivo else "Nenhum comentário adicional deixado no formulário."
+    expectativas_exibicao = expectativas if expectativas else "Não respondido."
+    falta_exibicao = o_que_faltava if o_que_faltava else "Não respondido."
 
-    # 2. Lógica Dinâmica: O texto muda consoante a categoria
+    # 1. Carregar os Templates do Banco
+    regras = obter_regras_dinamicas()
+    
+    # 2. Escolher o template e assunto com base na Categoria
     if categoria == 'Promotor':
-        assunto = "Obrigado pela sua excelente avaliação! 🌟"
-        titulo = "Ficamos muito felizes!"
-        mensagem = f"Que bom saber que estamos no caminho certo{nome_empresa}. A sua nota <strong>{nota}/10</strong> motiva muito a nossa equipa a continuar a entregar o melhor serviço possível. Obrigado pela confiança!"
-        cor_destaque = "#10B981" # Emerald
-        
+        assunto = f"Obrigado pela sua nota {nota}! 🌟"
+        template_customizado = regras.get("email_agradecimento_promotor", "")
     elif categoria == 'Neutro':
         assunto = "Recebemos a sua avaliação. Vamos melhorar! 🚀"
-        titulo = "Obrigado pelo seu feedback"
-        mensagem = f"Agradecemos o tempo que dedicou a avaliar-nos com a nota <strong>{nota}/10</strong>. O seu feedback é fundamental para entendermos onde podemos melhorar a sua experiência{nome_empresa} e transformar este número num 10 no futuro."
-        cor_destaque = "#F59E0B" # Yellow/Orange
-        
-    else: # Detrator
+        template_customizado = regras.get("email_agradecimento_neutro", "")
+    else:
         assunto = "O seu feedback é muito importante para nós 💡"
-        titulo = "Recebemos os seus comentários"
-        mensagem = f"Agradecemos a sua honestidade ao partilhar a sua avaliação (<strong>{nota}/10</strong>). Levamos a sua opinião muito a sério e os pontos que levantou já foram partilhados com a equipa responsável{nome_empresa} para análise imediata. Trabalharemos para reverter esta impressão."
-        cor_destaque = "#EF4444" # Rose/Red
+        template_customizado = regras.get("email_agradecimento_detrator", "")
 
-    # 3. Template HTML Corporativo
-    # 3. Ler o Template Dinâmico do Banco
-    regras = obter_regras_dinamicas()
-    template_customizado = regras.get("email_agradecimento_html", "")
-
-    if template_customizado and "{mensagem}" in template_customizado:
-        # Se o admin gravou um HTML com a tag {mensagem}, usamos esse!
+    # 3. Injetar Variáveis no Template
+    if template_customizado:
         mail_html = template_customizado.replace("{nome}", primeiro_nome) \
                                         .replace("{empresa}", empresa_exibicao) \
-                                        .replace("{titulo}", titulo) \
-                                        .replace("{mensagem}", mensagem) \
-                                        .replace("{nota}", str(nota))
+                                        .replace("{nota}", str(nota)
+                                        .replace("{motivo}", motivo_exibicao)
+                                        .replace("{expectativas}", expectativas_exibicao)
+                                        .replace("{o_que_faltava}", falta_exibicao))
     else:
-        # Template padrão de fallback da Gauge
-        mail_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);border-top: 6px solid {cor_destaque};">
-                <tr>
-                    <td style="padding:40px;color:#333333;line-height:1.6;">
-                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;font-weight:700;">{titulo}</h1>
-                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{primeiro_nome}</strong>,</p>
-                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">{mensagem}</p>
-                        <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
-                            <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
-                        </div>
-                    </td>
-                </tr>
-            </table>
-        </body>
-        </html>
-        """
+        # Fallback de emergência caso o Admin deixe as caixas em branco
+        mail_html = f"<h2>Obrigado, {primeiro_nome}!</h2><p>A sua nota {nota} foi registada para a empresa {empresa_exibicao}.</p>"
 
     # 4. Disparo via MS Graph API
     payload = {
