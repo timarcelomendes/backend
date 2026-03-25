@@ -1978,36 +1978,30 @@ def change_cliente_status(cliente_id: str, payload: StatusUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/clientes/{cliente_id}/forcar-envio")
-def forcar_envio_n8n(cliente_id: str):
+def forcar_envio_nps(cliente_id: str, background_tasks: BackgroundTasks, usuario: str = Depends(get_current_user)):
     try:
-        clientes_svc.forcar_envio_db(cliente_id)
+        from services.email_svc import disparar_convite_nps_especifico
+        background_tasks.add_task(disparar_convite_nps_especifico, [cliente_id])
         
-        ok, msg, details = clientes_svc.disparar_n8n_force(cliente_id)
-        if not ok:
-            raise HTTPException(status_code=400, detail=msg)
-            
-        return {"status": "success", "message": msg, "details": details}
+        return {
+            "status": "success", 
+            "message": "Solicitação recebida! O e-mail está a ser despachado agora mesmo."
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Não conseguimos processar o envio manual. Tente novamente em instantes.")
 
 @app.post("/api/clientes/forcar-envio-lote")
-async def forcar_envio_lote_n8n(dados: LoteEnvio, background_tasks: BackgroundTasks):
-    """
-    Aciona o n8n APENAS para os clientes selecionados via checkboxes no Vue.
-    """
-    if not dados.cliente_ids:
-        raise HTTPException(status_code=400, detail="Selecione pelo menos um cliente.")
+def forcar_envio_lote(payload: LoteEnvio, background_tasks: BackgroundTasks, usuario: str = Depends(get_current_user)):
+    try:
+        from services.email_svc import disparar_convite_nps_especifico
+        background_tasks.add_task(disparar_convite_nps_especifico, payload.cliente_ids)
         
-    def processar_lote_selecionados(lista_ids):
-        for c_id in lista_ids:
-            try:
-                clientes_svc.forcar_envio_db(c_id)
-                clientes_svc.disparar_n8n_force(c_id)
-            except Exception as e:
-                print(f"Erro no disparo em lote para {c_id}: {e}")
-
-    background_tasks.add_task(processar_lote_selecionados, dados.cliente_ids)
-    return {"status": "success", "message": f"Disparo em lote iniciado para {len(dados.cliente_ids)} clientes."}
+        return {
+            "status": "success", 
+            "message": f"O motor de disparos iniciou o processamento de {len(payload.cliente_ids)} e-mails com sucesso."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Ocorreu um erro ao tentar processar o lote de envios.")
 
 @app.delete("/api/clientes/{cliente_id}")
 def delete_cliente_route(cliente_id: str, delete_respostas: bool = True): 
