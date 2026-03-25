@@ -257,6 +257,14 @@ class WebhookN8nPayload(BaseModel):
 class IntegracoesConfig(BaseModel):
     teams_webhook_url: Optional[str] = ""
 
+class RegrasNegocioConfig(BaseModel):
+    scheduler_horas: int = 6
+    sla_detrator_dias: int = 2
+    sla_neutro_dias: int = 5
+    sla_promotor_dias: int = 7
+    fillout_campos: str = "clienteid,email,nome,empresa,empresa_id" # Guardado como string separada por vírgulas
+    email_template_html: Optional[str] = ""
+
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
 # ==========================================
@@ -338,6 +346,55 @@ def salvar_configuracoes_integracoes(payload: IntegracoesConfig, usuario_email: 
     except Exception as e:
         print(f"❌ Erro ao salvar integrações: {e}")
         raise HTTPException(status_code=500, detail="Erro ao guardar configurações de integração.")
+    
+@app.get("/api/config/regras")
+def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html')")
+            resultados = conn.execute(query).fetchall()
+            
+            # Valores padrão de segurança
+            config = {
+                "scheduler_horas": 6,
+                "sla_detrator_dias": 2,
+                "sla_neutro_dias": 5,
+                "sla_promotor_dias": 7,
+                "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
+                "email_template_html": ""
+            }
+            
+            for linha in resultados:
+                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
+                    config[linha.chave] = int(linha.valor) if linha.valor else config[linha.chave]
+                else:
+                    config[linha.chave] = linha.valor
+                    
+            return config
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Erro ao ler regras de negócio.")
+
+@app.post("/api/config/regras")
+def salvar_regras_negocio(payload: RegrasNegocioConfig, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            sql_upsert = text("""
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
+                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = SYSUTCDATETIME() WHERE chave = :chave
+                ELSE
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, SYSUTCDATETIME())
+            """)
+            
+            # Grava cada chave individualmente no banco
+            dados_para_gravar = payload.dict()
+            for chave, valor in dados_para_gravar.items():
+                conn.execute(sql_upsert, {"chave": chave, "valor": str(valor)})
+                
+        return {"status": "success", "message": "Regras de negócio atualizadas com sucesso!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Erro ao gravar regras de negócio.")
     
 # ==========================================
 # 🤖 AUTENTICACAO (Login, Registros)

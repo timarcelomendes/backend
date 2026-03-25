@@ -4,7 +4,7 @@ from database import get_engine, exec_sql
 import traceback
 import uuid
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
@@ -115,73 +115,71 @@ def soft_delete(resposta_id: str):
 def restore(resposta_id: str):
     exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
-def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motivo):
+def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
+    """
+    Substitui o antigo fluxo do Jira. 
+    Gera tickets automáticos no Kanban interno para notas de risco (<= 8).
+    """
+    # 1. Regra de Negócio: Não gerar ticket automático para Promotores (9-10)
+    if nota is None or nota >= 9:
+        return
+
     engine = get_engine()
-    
-    id_real = None
-    nome_emp = "Conta Geral"
-    id_gestor = None
-        
     try:
-        with engine.connect() as conn:
-            # TENTATIVA 1: Pelo ID oficial
-            try:
-                eid_val = int(empresa_id) if empresa_id else 0
-            except:
-                eid_val = 0
-
-            if eid_val > 0:
-                sql_busca = text("SELECT id, nome, gestor_id FROM dbo.nps_empresas WHERE id = :eid")
-                empresa_data = conn.execute(sql_busca, {"eid": eid_val}).mappings().first()
-                if empresa_data:
-                    id_real = empresa_data["id"]
-                    nome_emp = empresa_data["nome"]
-                    id_gestor = empresa_data["gestor_id"]
-
-            # TENTATIVA 2: Buscar usando o nome em texto enviado pelo n8n
-            if not id_real and empresa_nome and str(empresa_nome).strip() != "":
-                sql_busca_nome = text("""
-                    SELECT TOP 1 id, nome, gestor_id 
-                    FROM dbo.nps_empresas 
-                    WHERE LOWER(LTRIM(RTRIM(nome))) LIKE :nome_busca
-                """)
-                param_nome = f"%{str(empresa_nome).strip().lower()}%"
-                empresa_data = conn.execute(sql_busca_nome, {"nome_busca": param_nome}).mappings().first()
-                
-                if empresa_data:
-                    id_real = empresa_data["id"]
-                    nome_emp = empresa_data["nome"]
-                    id_gestor = empresa_data["gestor_id"]
-                else:
-                    nome_emp = empresa_nome 
-
-        # Gravação na Tabela de Ações
         with engine.begin() as conn:
+            # 2. Roteamento Inteligente (Descobrir o Gestor da Conta)
+            gestor_id_encontrado = None
+            emp_id_real = empresa_id
+
+            if emp_id_real and emp_id_real > 0:
+                query_gestor = text("SELECT gestor_id FROM dbo.nps_empresas WHERE id = :eid")
+                res = conn.execute(query_gestor, {"eid": emp_id_real}).fetchone()
+                if res: 
+                    gestor_id_encontrado = res.gestor_id
+
+            elif empresa_nome:
+                # Se o Fillout não enviou o ID, tenta achar pelo Nome exato
+                query_gestor = text("SELECT id, gestor_id FROM dbo.nps_empresas WHERE nome = :nome")
+                res = conn.execute(query_gestor, {"nome": empresa_nome}).fetchone()
+                if res:
+                    emp_id_real = res.id
+                    gestor_id_encontrado = res.gestor_id
+
+            # 3. Definir Prioridade e SLA (Prazo de Resolução)
+            if nota <= 6:
+                prioridade = "Alta"
+                dias_prazo = 2 # SLA de 48h para detratores
+            else:
+                prioridade = "Média"
+                dias_prazo = 5 # SLA de 5 dias para neutros
+
+            prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d")
+            
+            # 4. Formatar o Título e a Descrição do Ticket
+            titulo = f"[Risco NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
+            descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original da Avaliação:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
+
+            # 5. Inserir na Tabela do Kanban
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade)
-                VALUES 
-                (:rid, :eid, :gid, :t, :d, 'Alta')
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status)
+                VALUES (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente')
             """)
-            
-            params = {
-                "rid": str(resposta_id),
-                "eid": id_real,
-                "gid": id_gestor,
-                "t": f"🔥 Ação Automática: {nome_emp}",
-                "d": f"Nota: {nota}. Motivo: {motivo}"
-            }
-            
-            conn.execute(sql_insert, params)
-            print(f"✅ SUCESSO! Ação criada. Empresa: {nome_emp} | ID Emp: {id_real} | Gestor: {id_gestor}")
-            
-    except Exception as e:
-        print(f"❌ Erro Crítico: {e}")
-        print(traceback.format_exc())
 
-import uuid
-from sqlalchemy import text
-from database import get_engine
+            conn.execute(sql_insert, {
+                "rid": resposta_id,
+                "eid": emp_id_real if emp_id_real and emp_id_real > 0 else None,
+                "gid": gestor_id_encontrado,
+                "t": titulo,
+                "d": descricao_txt,
+                "p": prioridade,
+                "pl": prazo_limite
+            })
+
+            print(f"🎫 Ticket automático no Kanban criado com sucesso para a resposta {resposta_id}!")
+
+    except Exception as e:
+        print(f"❌ Erro ao tentar criar ação automática no Kanban: {e}")
 
 def processar_webhook_fillout(payload: dict):
     """Recebe o JSON nativo do Fillout, grava a resposta e gera a ação no Kanban"""
