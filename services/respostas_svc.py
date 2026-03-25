@@ -8,6 +8,34 @@ from datetime import datetime, timedelta
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
+def obter_regras_dinamicas():
+    """Lê as parametrizações de negócio da base de dados"""
+    from database import get_engine
+    from sqlalchemy import text
+    
+    # Valores de segurança (Fallback)
+    regras = {
+        "sla_detrator_dias": 2,
+        "sla_neutro_dias": 5,
+        "sla_promotor_dias": 7,
+        "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
+        "email_template_html": ""
+    }
+    
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html')")
+            for linha in conn.execute(query).fetchall():
+                if linha.chave in ['sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
+                    regras[linha.chave] = int(linha.valor) if linha.valor else regras[linha.chave]
+                else:
+                    regras[linha.chave] = linha.valor
+    except Exception as e:
+        print(f"⚠️ Usando regras padrão. Erro ao ler banco: {e}")
+        
+    return regras
+
 def read_df(sql: str, params: dict = None) -> pd.DataFrame:
     engine = get_engine()
     with engine.connect() as conn:
@@ -146,13 +174,20 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                     gestor_id_encontrado = res.gestor_id
 
             # 3. Definir Prioridade e SLA (Prazo de Resolução)
+            
+            # 1. Carregar Regras da Base de Dados
+            regras = obter_regras_dinamicas()
+
+            # 2. Definir Prioridade e SLA Dinâmico baseado no Ecrã de Configurações
             if nota <= 6:
                 prioridade = "Alta"
-                dias_prazo = 2 # SLA de 48h para detratores
+                dias_prazo = regras["sla_detrator_dias"]
             else:
                 prioridade = "Média"
-                dias_prazo = 5 # SLA de 5 dias para neutros
+                dias_prazo = regras["sla_neutro_dias"]
 
+            prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d")
+            
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d")
             
             # 4. Formatar o Título e a Descrição do Ticket

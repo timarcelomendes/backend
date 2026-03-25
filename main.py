@@ -262,8 +262,9 @@ class RegrasNegocioConfig(BaseModel):
     sla_detrator_dias: int = 2
     sla_neutro_dias: int = 5
     sla_promotor_dias: int = 7
-    fillout_campos: str = "clienteid,email,nome,empresa,empresa_id" # Guardado como string separada por vírgulas
+    fillout_campos: str = "clienteid,email,nome,empresa,empresa_id"
     email_template_html: Optional[str] = ""
+    email_agradecimento_html: Optional[str] = ""
 
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
@@ -352,7 +353,7 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html')")
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_html')")
             resultados = conn.execute(query).fetchall()
             
             # Valores padrão de segurança
@@ -362,7 +363,8 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
                 "sla_neutro_dias": 5,
                 "sla_promotor_dias": 7,
                 "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
-                "email_template_html": ""
+                "email_template_html": "",
+                "email_agradecimento_html": ""
             }
             
             for linha in resultados:

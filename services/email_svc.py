@@ -4,6 +4,35 @@ import urllib.parse
 from database import get_engine
 from datetime import datetime
 
+def obter_regras_dinamicas():
+    """Lê as parametrizações de negócio da base de dados"""
+    from database import get_engine
+    from sqlalchemy import text
+    
+    # Valores de segurança (Fallback)
+    regras = {
+        "sla_detrator_dias": 2,
+        "sla_neutro_dias": 5,
+        "sla_promotor_dias": 7,
+        "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
+        "email_template_html": "",
+        "email_agradecimento_html": ""
+    }
+    
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_html')")
+            for linha in conn.execute(query).fetchall():
+                if linha.chave in ['sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
+                    regras[linha.chave] = int(linha.valor) if linha.valor else regras[linha.chave]
+                else:
+                    regras[linha.chave] = linha.valor
+    except Exception as e:
+        print(f"⚠️ Usando regras padrão. Erro ao ler banco: {e}")
+        
+    return regras
+
 def obter_configuracoes_email():
     """Procura as credenciais ativas na base de dados."""
     # Import local para evitar import circular
@@ -340,48 +369,64 @@ def disparar_convite_nps_especifico(cliente_ids: list):
         with engine.begin() as conn:
             for cliente in clientes:
                 try:
-                    # 1. Montar a URL dinâmica do Fillout
-                    params = {
+                    # 1. Carregar regras
+                    regras = obter_regras_dinamicas()
+                    
+                    # 2. Construir URL do Fillout apenas com os campos permitidos
+                    campos_permitidos = [c.strip().lower() for c in regras["fillout_campos"].split(",")]
+                    
+                    params_completos = {
                         "clienteId": cliente["cliente_id"],
                         "email": cliente["email"],
                         "nome": cliente["nome"],
                         "empresa": cliente["empresa"] or "",
                         "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
+                        # Se adicionar gestor/segmento na query da tabela nps_clientes, pode mapear aqui também
                     }
-                    query_string = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+                    
+                    # Filtra o dicionário para conter apenas as chaves que o admin selecionou no frontend
+                    params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
+                    
+                    query_string = urllib.parse.urlencode(params_finais)
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
-                    # 2. Template HTML
-                    nome_exibicao = cliente["nome"] or "Parceiro"
+                    # 3. Textos de exibição seguros
+                    nome_exibicao = cliente["nome"].split(" ")[0] if cliente["nome"] else "Parceiro"
                     empresa_exibicao = cliente["empresa"] or "sua empresa"
                     
-                    mail_html = f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-                        <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
-                            <tr><td><img src="https://images.fillout.com/orgid-605566/flowpublicid-dPJSvuBRcDus/widgetid-undefined/4XSnUZoTXsHHQrgj2vxtL4/1763399620234.jpg?a=8rcQiWHivWYgnLfV5ojCyf" width="600" style="display:block;width:100%;max-width:600px;height:auto;"></td></tr>
-                            <tr>
-                                <td style="padding:40px;color:#333333;line-height:1.6;">
-                                    <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
-                                    <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
-                                    <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
-                                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
-                                        <tr>
-                                            <td align="center">
-                                                <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
-                                            </td>
-                                        </tr>
-                                    </table>
-                                    <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
-                                        <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
-                                    </div>
-                                </td>
-                            </tr>
-                        </table>
-                    </body>
-                    </html>
-                    """
+                    # 4. Template HTML Dinâmico (Se o admin tiver criado um, usa-o. Senão, usa o código padrão Gauge)
+                    template_customizado = regras["email_template_html"]
+                    
+                    if template_customizado and "{survey_url}" in template_customizado:
+                        # Substitui as variáveis dinâmicas no HTML do administrador
+                        mail_html = template_customizado.replace("{nome}", nome_exibicao) \
+                                                        .replace("{empresa}", empresa_exibicao) \
+                                                        .replace("{survey_url}", survey_url)
+                    else:
+                        # O template fixo da Gauge que você já tinha caso o admin não insira nada
+                        mail_html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+                            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
+                                <tr>
+                                    <td style="padding:40px;color:#333333;line-height:1.6;">
+                                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
+                                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
+                                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
+                                        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
+                                            <tr>
+                                                <td align="center">
+                                                    <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </body>
+                        </html>
+                        """
 
                     # 3. Disparar via MS Graph API
                     payload = {
@@ -441,6 +486,7 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
     # Textos de exibição seguros
     primeiro_nome = nome.split(" ")[0] if nome else "Parceiro"
     nome_empresa = f" na {empresa}" if empresa else ""
+    empresa_exibicao = empresa if empresa else "sua empresa"
 
     # 2. Lógica Dinâmica: O texto muda consoante a categoria
     if categoria == 'Promotor':
@@ -462,26 +508,38 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
         cor_destaque = "#EF4444" # Rose/Red
 
     # 3. Template HTML Corporativo
-    mail_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-        <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);border-top: 6px solid {cor_destaque};">
-            <tr>
-                <td style="padding:40px;color:#333333;line-height:1.6;">
-                    <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;font-weight:700;">{titulo}</h1>
-                    <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{primeiro_nome}</strong>,</p>
-                    <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">{mensagem}</p>
-                    
-                    <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
-                        <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
-                    </div>
-                </td>
-            </tr>
-        </table>
-    </body>
-    </html>
-    """
+    # 3. Ler o Template Dinâmico do Banco
+    regras = obter_regras_dinamicas()
+    template_customizado = regras.get("email_agradecimento_html", "")
+
+    if template_customizado and "{mensagem}" in template_customizado:
+        # Se o admin gravou um HTML com a tag {mensagem}, usamos esse!
+        mail_html = template_customizado.replace("{nome}", primeiro_nome) \
+                                        .replace("{empresa}", empresa_exibicao) \
+                                        .replace("{titulo}", titulo) \
+                                        .replace("{mensagem}", mensagem) \
+                                        .replace("{nota}", str(nota))
+    else:
+        # Template padrão de fallback da Gauge
+        mail_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);border-top: 6px solid {cor_destaque};">
+                <tr>
+                    <td style="padding:40px;color:#333333;line-height:1.6;">
+                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;font-weight:700;">{titulo}</h1>
+                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{primeiro_nome}</strong>,</p>
+                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">{mensagem}</p>
+                        <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
+                            <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
+                        </div>
+                    </td>
+                </tr>
+            </table>
+        </body>
+        </html>
+        """
 
     # 4. Disparo via MS Graph API
     payload = {
