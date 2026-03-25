@@ -1,6 +1,8 @@
 import requests
 from sqlalchemy import text
-import traceback
+import urllib.parse
+from database import get_engine
+from datetime import datetime
 
 def obter_configuracoes_email():
     """Procura as credenciais ativas na base de dados."""
@@ -153,3 +155,137 @@ def enviar_email_teste(email_destino):
     except Exception as e:
         print(f"❌ Falha no disparo de teste: {e}")
         return False
+
+def processar_disparos_nps():
+    """Busca clientes elegíveis e envia a pesquisa via Microsoft Graph"""
+    print("⏳ Iniciando rotina de disparo de NPS...")
+    engine = get_engine()
+    
+    # 1. Buscar quem deve receber a pesquisa hoje
+    sql_busca = text("""
+        SELECT TOP (100)
+            c.cliente_id, c.email, c.nome, c.empresa, 
+            e.id AS empresa_id
+        FROM dbo.nps_clientes c
+        LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
+        WHERE c.ativo = 1
+          AND c.status_envio IN ('Pendente', 'Erro')
+          AND (c.proximo_envio IS NULL OR c.proximo_envio <= CAST(GETDATE() AS DATE))
+        ORDER BY COALESCE(c.proximo_envio, '1900-01-01') ASC
+    """)
+    
+    try:
+        with engine.connect() as conn:
+            elegiveis = conn.execute(sql_busca).mappings().all()
+            
+        if not elegiveis:
+            print("✅ Nenhum cliente elegível para disparo de NPS no momento.")
+            return
+
+        # 2. Obter o Token do Microsoft Graph (USE A SUA FUNÇÃO EXISTENTE AQUI)
+        # access_token = obter_token_microsoft() # <- Substitua pela sua função real
+        # Para este exemplo, assumo que você tem uma função que retorna o token válido:
+        from services.email_svc import get_valid_access_token 
+        access_token = get_valid_access_token()
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        enviados = 0
+        with engine.begin() as conn: # Usamos begin() para garantir os updates
+            for cliente in elegiveis:
+                try:
+                    # 3. Montar a URL do Fillout
+                    params = {
+                        "clienteId": cliente["cliente_id"],
+                        "email": cliente["email"],
+                        "nome": cliente["nome"],
+                        "empresa": cliente["empresa"] or "",
+                        "empresa_id": cliente["empresa_id"] or ""
+                    }
+                    query_string = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+                    survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
+                    
+                    # 4. Montar o HTML do E-mail
+                    nome_exibicao = cliente["nome"] or "Parceiro"
+                    empresa_exibicao = cliente["empresa"] or "sua empresa"
+                    
+                    mail_html = f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+                        <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
+                            <tr>
+                                <td><img src="https://images.fillout.com/orgid-605566/flowpublicid-dPJSvuBRcDus/widgetid-undefined/4XSnUZoTXsHHQrgj2vxtL4/1763399620234.jpg?a=8rcQiWHivWYgnLfV5ojCyf" width="600" style="display:block;width:100%;max-width:600px;height:auto;"></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:40px;color:#333333;line-height:1.6;">
+                                    <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
+                                    <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
+                                    <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
+                                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
+                                        <tr>
+                                            <td align="center">
+                                                <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
+                                            </td>
+                                        </tr>
+                                    </table>
+                                    <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
+                                        <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        </table>
+                    </body>
+                    </html>
+                    """
+
+                    # 5. Disparar via Microsoft Graph API
+                    payload = {
+                        "message": {
+                            "subject": f"[Pesquisa NPS] Sua opinião importa {'— ' + cliente['empresa'] if cliente['empresa'] else ''}",
+                            "body": {"contentType": "HTML", "content": mail_html},
+                            "toRecipients": [{"emailAddress": {"address": cliente["email"]}}]
+                        },
+                        "saveToSentItems": True
+                    }
+
+                    resposta_ms = requests.post(
+                        "https://graph.microsoft.com/v1.0/me/sendMail",
+                        headers=headers,
+                        json=payload
+                    )
+                    
+                    if resposta_ms.status_code in (200, 202):
+                        # 6. Sucesso! Atualiza o banco (Soma 90 dias para o próximo envio)
+                        sql_update = text("""
+                            UPDATE dbo.nps_clientes
+                            SET status_envio = 'Enviado',
+                                ultimo_envio = CAST(GETDATE() AS DATE),
+                                proximo_envio = DATEADD(DAY, 90, CAST(GETDATE() AS DATE)),
+                                ultimo_erro = NULL,
+                                updated_at = SYSUTCDATETIME()
+                            WHERE cliente_id = :id
+                        """)
+                        conn.execute(sql_update, {"id": cliente["cliente_id"]})
+                        enviados += 1
+                    else:
+                        # Falha ao enviar pela MS
+                        raise Exception(f"Erro MS Graph: {resposta_ms.text}")
+
+                except Exception as erro_cliente:
+                    # 7. Regista o erro neste cliente específico, mas não para o loop!
+                    sql_erro = text("""
+                        UPDATE dbo.nps_clientes
+                        SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME()
+                        WHERE cliente_id = :id
+                    """)
+                    conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
+                    print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
+
+        print(f"🏁 Rotina finalizada! {enviados} convites de NPS enviados com sucesso.")
+        
+    except Exception as e:
+        print(f"❌ Erro Fatal na rotina de NPS: {e}")

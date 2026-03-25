@@ -1,40 +1,73 @@
 import os
+import io
 import json
+import traceback
+import re
+import secrets
+import string
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Any
+from contextlib import asynccontextmanager
+
+import pandas as pd
+import bcrypt
+import requests
 import openai
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from typing import Optional, List, Any
-from database import get_engine, exec_sql
-from sqlalchemy import text
-import traceback 
-import re
-from collections import Counter
-import pandas as pd
-from passlib.context import CryptContext
-from datetime import datetime, timedelta, timezone
-import bcrypt
-import requests
-import secrets
-import string
-from services.auth_utils import hash_password
-from services.email_svc import enviar_email_recuperacao
-from fastapi.security import OAuth2PasswordBearer
-from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
-from database import get_engine
 from fastapi.responses import StreamingResponse
-import io
-from pydantic import BaseModel
-from fastapi import HTTPException
-from sqlalchemy import text
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import jwt, JWTError, ExpiredSignatureError
+from sqlalchemy import text
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
+# Importações Locais
+from database import get_engine, exec_sql
+from services.auth_utils import hash_password
+from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
+from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
 
+# ==========================================
+# ⚙️ 1. CONFIGURAÇÕES E SEGURANÇA
+# ==========================================
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("ERRO CRÍTICO: JWT_SECRET_KEY não configurada nas variáveis de ambiente.")
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 2
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+
+# ==========================================
+# ⏰ 2. LIFESPAN E SCHEDULERS
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        processar_disparos_nps, 
+        IntervalTrigger(hours=6), 
+        id="disparo_nps_job", 
+        replace_existing=True
+    )
+    scheduler.start()
+    print("⏰ Agendador de tarefas (CRON) iniciado com sucesso!")
+    yield
+    scheduler.shutdown()
+
+# ==========================================
+# 🚀 3. INICIALIZAÇÃO DO APP E MIDDLEWARES
+# ==========================================
 app = FastAPI(
     title="NPS API - Gauge Stefanini",
     description="API centralizada para gestão de NPS, Clientes e Respostas",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 origins = [
@@ -57,7 +90,25 @@ app.add_middleware(
 )
 
 # ==========================================
-# 📦 SCHEMAS (Pydantic Models)
+# 🔐 4. DEPENDÊNCIAS DE AUTENTICAÇÃO
+# ==========================================
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Sessão expirada. Por favor, faça login novamente.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True})
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+        return email
+    except (ExpiredSignatureError, JWTError):
+        raise credentials_exception
+
+# ==========================================
+# 📦 5. SCHEMAS (Pydantic Models)
 # Validam os dados que chegam do Frontend
 # ==========================================
 
@@ -143,7 +194,7 @@ class EmpresaSchema(BaseModel):
     valor_contrato: Optional[float] = 0.0
     gestor: Optional[str] = None
     gestor_id: Optional[int] = None 
-    companhia_id: Optional[int] = None #
+    companhia_id: Optional[int] = None 
 
 class ClienteCreate(BaseModel):
     nome: str
@@ -203,35 +254,9 @@ class WebhookN8nPayload(BaseModel):
     empresa_nome: Optional[str] = ""
     motivo: Optional[str] = ""
 
-# Configurações de Segurança e Autenticação
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+class IntegracoesConfig(BaseModel):
+    teams_webhook_url: Optional[str] = ""
 
-if not SECRET_KEY:
-    raise RuntimeError("ERRO CRÍTICO: JWT_SECRET_KEY não configurada nas variáveis de ambiente.")
-
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 2
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
-
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Sessão expirada. Por favor, faça login novamente.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True})
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-        return email
-    except ExpiredSignatureError:
-        raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
 # ==========================================
@@ -251,6 +276,68 @@ def n8n_gatilho_acao(payload: WebhookN8nPayload):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/webhooks/fillout")
+async def webhook_receber_fillout(request: Request):
+    """Rota oficial para receber os dados quando o cliente submete o Fillout"""
+    try:
+        # Pega no JSON bruto que o Fillout envia
+        payload = await request.json()
+        
+        # Manda para o serviço processar
+        from services.respostas_svc import processar_webhook_fillout
+        resultado = processar_webhook_fillout(payload)
+        
+        # Retorna 200 OK para o Fillout saber que recebemos bem
+        return resultado
+    except Exception as e:
+        print(f"Erro no webhook do fillout: {e}")
+        # Retorna 200 na mesma para o Fillout não ficar a tentar re-enviar infinitamente
+        return {"status": "error", "message": "Erro processado internamente"}
+    
+# ==========================================
+# 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
+# ==========================================
+
+@app.get("/api/config/integracoes")
+def obter_configuracoes_integracoes(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Busca o webhook do Teams na tabela genérica de configurações
+            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
+            resultado = conn.execute(query).scalar()
+            
+            return {"teams_webhook_url": resultado or ""}
+    except Exception as e:
+        print(f"❌ Erro ao obter integrações: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao carregar integrações.")
+
+@app.post("/api/config/integracoes")
+def salvar_configuracoes_integracoes(payload: IntegracoesConfig, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            # Usa a lógica de UPSERT (Se a chave existir atualiza, senão insere)
+            sql = text("""
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url')
+                BEGIN
+                    UPDATE dbo.nps_configuracoes 
+                    SET valor = :valor, updated_at = SYSUTCDATETIME() 
+                    WHERE chave = 'teams_webhook_url'
+                END
+                ELSE
+                BEGIN
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) 
+                    VALUES ('teams_webhook_url', :valor, SYSUTCDATETIME())
+                END
+            """)
+            conn.execute(sql, {"valor": payload.teams_webhook_url})
+            
+        return {"status": "success", "message": "Integrações atualizadas com sucesso!"}
+    except Exception as e:
+        print(f"❌ Erro ao salvar integrações: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao guardar configurações de integração.")
     
 # ==========================================
 # 🤖 AUTENTICACAO (Login, Registros)
@@ -2454,6 +2541,35 @@ async def testar_envio_email(usuario_email: str = Depends(get_current_user)):
             
     except Exception as e:
         print(f"❌ ERRO NO TESTE DE ENVIO: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/config/nps/elegiveis")
+def contar_elegiveis_nps():
+    """Conta quantos clientes estão prontos para receber o NPS hoje"""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text("""
+                SELECT COUNT(*) as total
+                FROM dbo.nps_clientes 
+                WHERE ativo = 1 
+                  AND status_envio IN ('Pendente', 'Erro') 
+                  AND (proximo_envio IS NULL OR proximo_envio <= CAST(GETDATE() AS DATE))
+            """)
+            total = conn.execute(sql).scalar()
+        return {"total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/config/nps/forcar-disparo")
+def forcar_disparo_nps(background_tasks: BackgroundTasks):
+    """Inicia a rotina de disparo imediatamente em segundo plano"""
+    try:
+        from services.email_svc import processar_disparos_nps
+        # Adiciona a tarefa ao background para responder ao Frontend imediatamente
+        background_tasks.add_task(processar_disparos_nps)
+        return {"status": "success", "message": "Disparo iniciado com sucesso! A enviar em segundo plano."}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================

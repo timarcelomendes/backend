@@ -1,8 +1,9 @@
 import pandas as pd
 from sqlalchemy import text
 from database import get_engine, exec_sql
-import time
 import traceback
+import uuid
+import requests
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
@@ -176,3 +177,217 @@ def processar_acao_automatica(resposta_id, nota, empresa_id, empresa_nome, motiv
     except Exception as e:
         print(f"❌ Erro Crítico: {e}")
         print(traceback.format_exc())
+
+def processar_webhook_fillout(payload: dict):
+    """Recebe o JSON nativo do Fillout, grava a resposta e gera a ação no Kanban"""
+    try:
+        engine = get_engine()
+        
+        # 1. EXTRAÇÃO DE DADOS
+        submission = payload.get("submission", {})
+        form_id = str(payload.get("formId", ""))
+        submission_id = str(submission.get("submissionId", ""))
+        
+        # Extrair Hidden Fields (URL Parameters)
+        url_params = {str(p.get("name", "")).lower(): p.get("value", "") for p in submission.get("urlParameters", [])}
+        cliente_id = url_params.get("clienteid", "")
+        email = url_params.get("email", "")
+        nome = url_params.get("nome", "")
+        empresa = url_params.get("empresa", "")
+        empresa_id_str = url_params.get("empresa_id", "") or url_params.get("empresaid", "")
+        empresa_id = int(empresa_id_str) if empresa_id_str.isdigit() else 0
+        
+        # Extrair Perguntas (Nota e Motivo)
+        nota = None
+        motivo = ""
+        expectativas = ""
+        o_que_faltava = ""
+        
+        for q in submission.get("questions", []):
+            tipo = q.get("type")
+            nome_pergunta = str(q.get("name", "")).lower()
+            valor = q.get("value")
+            
+            if tipo == "OpinionScale" and valor is not None:
+                nota = int(valor)
+            elif tipo == "LongAnswer" and not motivo:
+                motivo = str(valor or "")
+            elif "expectativas" in nome_pergunta:
+                expectativas = str(valor or "")
+            elif "faltando" in nome_pergunta or "melhorar" in nome_pergunta:
+                o_que_faltava = str(valor or "")
+                
+        # Classificar Categoria
+        categoria = "Indefinido"
+        if nota is not None:
+            if nota <= 6: categoria = "Detrator"
+            elif nota <= 8: categoria = "Neutro"
+            else: categoria = "Promotor"
+            
+        resposta_id = f"F-{cliente_id}-{uuid.uuid4().hex[:8].upper()}"
+
+        with engine.begin() as conn:
+            # 2. VERIFICAR DUPLICIDADE (Anti-Spam)
+            sql_check = text("SELECT 1 FROM dbo.nps_respostas WHERE submission_id = :sub_id")
+            if conn.execute(sql_check, {"sub_id": submission_id}).scalar():
+                print(f"⚠️ Webhook ignorado: Submissão {submission_id} já existe.")
+                return {"status": "ignorado", "motivo": "duplicado"}
+
+            # 3. GRAVAR A RESPOSTA
+            sql_insert = text("""
+                INSERT INTO dbo.nps_respostas (
+                    resposta_id, cliente_id, email, empresa, empresa_id,
+                    data_resposta, nota, categoria, motivo, canal,
+                    form_id, submission_id, created_at, expectativas, o_que_faltava
+                ) VALUES (
+                    :rid, :cid, :email, :emp, :eid,
+                    CAST(GETDATE() AS DATE), :nota, :cat, :motivo, 'Fillout',
+                    :fid, :sub_id, SYSUTCDATETIME(), :exp, :falta
+                )
+            """)
+            conn.execute(sql_insert, {
+                "rid": resposta_id, "cid": cliente_id, "email": email, "emp": empresa, "eid": empresa_id if empresa_id > 0 else None,
+                "nota": nota, "cat": categoria, "motivo": motivo,
+                "fid": form_id, "sub_id": submission_id, "exp": expectativas, "falta": o_que_faltava
+            })
+            
+            # 4. ATUALIZAR STATUS DO CLIENTE PARA "Respondido"
+            if cliente_id:
+                sql_update_cli = text("""
+                    UPDATE dbo.nps_clientes 
+                    SET status_envio = 'Respondido', updated_at = SYSUTCDATETIME() 
+                    WHERE cliente_id = :cid
+                """)
+                conn.execute(sql_update_cli, {"cid": cliente_id})
+
+        print(f"✅ Nova Resposta NPS Guardada! Cliente: {nome} | Nota: {nota}")
+
+        # 5. GERAR AÇÃO NO KANBAN AUTOMATICAMENTE
+        # Importação colocada dentro da função para evitar "Circular Imports"
+        from services.respostas_svc import processar_acao_automatica
+        processar_acao_automatica(
+            resposta_id=resposta_id,
+            nota=nota,
+            empresa_id=empresa_id,
+            empresa_nome=empresa,
+            motivo=motivo
+        )
+
+        # 6. ENVIAR ALERTA TEAMS E E-MAIL DE AGRADECIMENTO
+        # Certifique-se de que a função `enviar_alerta_teams` está acessível neste ficheiro
+        try:
+            enviar_alerta_teams(
+                resposta_id=resposta_id,
+                nome=nome,
+                email=email,
+                empresa=empresa,
+                nota=nota,
+                categoria=categoria,
+                motivo=motivo,
+                expectativas=expectativas,
+                o_que_faltava=o_que_faltava
+            )
+        except Exception as erro_teams:
+            print(f"⚠️ Erro ao tentar enviar alerta para o Teams: {erro_teams}")
+            
+        # enviar_email_resposta(...)  <-- (Aguardando o próximo passo!)
+
+        return {"status": "success", "resposta_id": resposta_id, "nota": nota}
+
+    except Exception as e:
+        print(f"❌ Erro ao processar Webhook Fillout: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+def enviar_alerta_teams(resposta_id: str, nome: str, email: str, empresa: str, nota: int, categoria: str, motivo: str, expectativas: str, o_que_faltava: str):
+    """Monta um Adaptive Card e envia para o canal do Microsoft Teams configurado"""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 1. Vai buscar o URL do webhook que guardámos nas Configurações
+            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
+            webhook_url = conn.execute(query).scalar()
+            
+        if not webhook_url:
+            print("⚠️ Webhook do Teams não configurado. Alerta ignorado.")
+            return
+
+        # 2. Lógica visual (Emojis e Cores baseadas na Categoria)
+        if categoria == 'Detrator':
+            emoji, cor_nota = '🚨', 'Attention'  # Vermelho
+        elif categoria == 'Neutro':
+            emoji, cor_nota = '⚠️', 'Warning'    # Amarelo
+        elif categoria == 'Promotor':
+            emoji, cor_nota = '✅', 'Good'       # Verde
+        else:
+            emoji, cor_nota = '📊', 'Default'
+
+        # Textos seguros caso venham vazios
+        motivo_txt = motivo if motivo else "Sem comentário adicional."
+        expectativas_txt = expectativas if expectativas else "Não respondido."
+
+        # 3. Construção do "Adaptive Card" (O layout oficial da Microsoft)
+        card_body = [
+            {
+                "type": "ColumnSet",
+                "columns": [
+                    {
+                        "type": "Column",
+                        "width": "stretch",
+                        "items": [
+                            { "type": "TextBlock", "text": f"{emoji} NPS Fillout — {categoria}", "weight": "Bolder", "size": "Large", "wrap": True },
+                            { "type": "TextBlock", "text": f"Empresa: {empresa if empresa else 'Não identificada'}", "wrap": True, "spacing": "None", "isSubtle": True }
+                        ]
+                    },
+                    {
+                        "type": "Column",
+                        "width": "auto",
+                        "items": [
+                            { "type": "TextBlock", "text": f"{nota}/10", "weight": "Bolder", "size": "ExtraLarge", "color": cor_nota, "horizontalAlignment": "Right" }
+                        ]
+                    }
+                ]
+            },
+            {
+                "type": "FactSet",
+                "spacing": "Medium",
+                "facts": [
+                    { "title": "Contato:", "value": nome if nome else "-" },
+                    { "title": "E-mail:", "value": email if email else "-" },
+                    { "title": "ID Resposta:", "value": resposta_id }
+                ]
+            },
+            { "type": "TextBlock", "text": f"**Motivo da nota:**\n\n{motivo_txt}", "wrap": True, "spacing": "Medium" },
+            { "type": "TextBlock", "text": f"**Atendeu às expectativas?**\n\n{expectativas_txt}", "wrap": True, "spacing": "Small" }
+        ]
+
+        # Só adiciona a secção "O que faltava" se o cliente tiver preenchido
+        if o_que_faltava:
+            card_body.append({ "type": "TextBlock", "text": f"**O que estava faltando?**\n\n{o_que_faltava}", "wrap": True, "spacing": "Small" })
+
+        # Embrulha tudo no formato JSON que o Teams exige
+        payload_teams = {
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": card_body
+                }
+            }]
+        }
+
+        # 4. Disparo!
+        resposta = requests.post(webhook_url, json=payload_teams, headers={"Content-Type": "application/json"})
+        
+        if resposta.status_code in (200, 201, 202):
+            print(f"📣 Alerta Teams enviado com sucesso para {nome}!")
+        else:
+            print(f"❌ Falha ao enviar para o Teams. HTTP {resposta.status_code}: {resposta.text}")
+
+    except Exception as e:
+        print(f"❌ Erro interno ao enviar alerta do Teams: {e}")
