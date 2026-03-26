@@ -146,9 +146,8 @@ def restore(resposta_id: str):
 
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
-    Gera tickets automáticos no Kanban interno.
-    A criação é baseada na parametrização de SLA: se os dias definidos para a categoria 
-    forem 0, o sistema entende que não deve gerar plano de ação.
+    Gera tickets automáticos no Kanban interno para TODAS as respostas.
+    Promotores agora recebem SLA padrão de 7 dias para garantir o fechamento do ciclo (agradecimento/upsell).
     """
     if nota is None:
         return
@@ -168,12 +167,13 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
     else:
         categoria = "Promotor"
         prioridade = "Baixa" # Promotores entram com prioridade Baixa (Manutenção Padrão)
-        dias_prazo = int(regras.get("sla_promotor_dias", 0))
+        # 💡 ALTERAÇÃO: Mudámos o fallback de 0 para 7 dias para garantir a criação do ticket
+        dias_prazo = int(regras.get("sla_promotor_dias", 7))
 
-    # 3. MÁGICA DA PARAMETRIZAÇÃO: Se o SLA configurado for 0, ignorar a criação!
-    if dias_prazo == 0:
-        print(f"ℹ️ Ticket ignorado para nota {nota} ({categoria}) - SLA configurado como 0 dias.")
-        return
+    # 💡 ALTERAÇÃO: Bloco de bloqueio comentado para garantir que NINGUÉM fica de fora do Kanban
+    # if dias_prazo == 0:
+    #     print(f"ℹ️ Ticket ignorado para nota {nota} ({categoria}) - SLA configurado como 0 dias.")
+    #     return
 
     engine = get_engine()
     try:
