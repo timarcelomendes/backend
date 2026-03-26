@@ -13,7 +13,6 @@ def obter_regras_dinamicas():
     from database import get_engine
     from sqlalchemy import text
     
-    # Valores de segurança (Fallback)
     regras = {
         "sla_detrator_dias": 2,
         "sla_neutro_dias": 5,
@@ -52,12 +51,10 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
         where.append("(LOWER(r.motivo) LIKE :like OR LOWER(c.nome) LIKE :like OR LOWER(COALESCE(e.nome, r.empresa, c.empresa)) LIKE :like)")
         params["like"] = f"%{q.strip().lower()}%"
         
-    # 🏢 Filtro de Companhia
     if companhia and companhia != "Todas":
         where.append("comp.nome = :companhia")
         params["companhia"] = companhia
         
-    # 🏢 Filtro de Empresa
     if (empresa or "").strip() and empresa != "Todas":
         where.append("LOWER(COALESCE(e.nome, r.empresa, c.empresa)) LIKE :empresa")
         params["empresa"] = f"%{empresa.strip().lower()}%"
@@ -145,17 +142,39 @@ def restore(resposta_id: str):
 
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
-    Substitui o antigo fluxo do Jira. 
-    Gera tickets automáticos no Kanban interno para notas de risco (<= 8).
+    Gera tickets automáticos no Kanban interno.
+    A criação é baseada na parametrização de SLA: se os dias definidos para a categoria 
+    forem 0, o sistema entende que não deve gerar plano de ação.
     """
-    # 1. Regra de Negócio: Não gerar ticket automático para Promotores (9-10)
-    if nota is None or nota >= 9:
+    if nota is None:
+        return
+
+    # 1. Carregar as regras (SLA) antes de tomar qualquer decisão
+    regras = obter_regras_dinamicas()
+    
+    # 2. Descobrir Categoria, SLA e a Prioridade apropriada
+    if nota <= 6:
+        categoria = "Detrator"
+        prioridade = "Alta"
+        dias_prazo = int(regras.get("sla_detrator_dias", 2))
+    elif nota <= 8:
+        categoria = "Neutro"
+        prioridade = "Média"
+        dias_prazo = int(regras.get("sla_neutro_dias", 5))
+    else:
+        categoria = "Promotor"
+        prioridade = "Baixa" # Promotores entram com prioridade Baixa (Manutenção Padrão)
+        dias_prazo = int(regras.get("sla_promotor_dias", 0))
+
+    # 3. MÁGICA DA PARAMETRIZAÇÃO: Se o SLA configurado for 0, ignorar a criação!
+    if dias_prazo == 0:
+        print(f"ℹ️ Ticket ignorado para nota {nota} ({categoria}) - SLA configurado como 0 dias.")
         return
 
     engine = get_engine()
     try:
         with engine.begin() as conn:
-            # 2. Roteamento Inteligente (Descobrir o Gestor da Conta)
+            # 4. Roteamento Inteligente (Descobrir o Gestor da Conta)
             gestor_id_encontrado = None
             emp_id_real = empresa_id
 
@@ -173,27 +192,14 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                     emp_id_real = res.id
                     gestor_id_encontrado = res.gestor_id
 
-            # 3. Definir Prioridade e SLA (Prazo de Resolução)
-            # Carregar Regras da Base de Dados
-            regras = obter_regras_dinamicas() # Ou obter_regras_negocio() consoante o nome da sua função
-
-            # Definir Prioridade e SLA Dinâmico baseado nas regras (com fallback seguro de segurança)
-            if nota <= 6:
-                prioridade = "Alta"
-                dias_prazo = int(regras.get("sla_detrator_dias", 2))
-            else:
-                prioridade = "Média"
-                dias_prazo = int(regras.get("sla_neutro_dias", 5))
-            
-            # Formatar a data alvo do SLA
+            # 5. Formatar a data alvo do SLA
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             
-            # 4. Formatar o Título e a Descrição do Ticket
-            titulo = f"[Risco NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
+            # 6. Formatar o Título (agora com a Categoria no nome)
+            titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
             descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original da Avaliação:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
 
-            # 5. Inserir na Tabela do Kanban
-            # Nota: Adicionado resposta_nota, resposta_comentario e empresa_nome para o Vue.js renderizar os cartões perfeitamente
+            # 7. Inserir na Tabela do Kanban
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
                 (resposta_id, empresa_id, empresa_nome, gestor_id, titulo, descricao, prioridade, prazo_limite, status, resposta_nota, resposta_comentario, created_at, updated_at)
@@ -214,28 +220,24 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                 "comentario": motivo
             })
 
-            print(f"🎫 Ticket automático no Kanban criado com sucesso para a resposta {resposta_id}!")
+            print(f"🎫 Ticket automático ({categoria}) no Kanban criado com sucesso para a resposta {resposta_id}!")
 
     except Exception as e:
-        # Tratamento de erro robusto para evitar que a API rebente no webhook
         print(f"❌ Erro crítico ao processar ação automática no Kanban: {e}")
-        traceback.print_exc() # Imprime a linha exata do erro no terminal da Azure para fácil diagnóstico
-        print(f"❌ Erro ao tentar criar ação automática no Kanban: {e}")
+        import traceback
+        traceback.print_exc()
 
 def processar_webhook_fillout(payload: dict):
     """Recebe o JSON nativo do Fillout, grava a resposta e gera a ação no Kanban"""
     try:
         engine = get_engine()
         
-        # 1. EXTRAÇÃO DE DADOS (Dupla Verificação: URL e Formulário)
         submission = payload.get("submission", {})
         form_id = str(payload.get("formId", ""))
         submission_id = str(submission.get("submissionId", ""))
         
-        # Mapear parâmetros da URL (Hidden Fields)
         url_params = {str(p.get("name", "")).lower().replace("_", ""): p.get("value") for p in submission.get("urlParameters", [])}
         
-        # Mapear as Perguntas
         by_label = {}
         nota = None
         motivo = ""
@@ -247,7 +249,6 @@ def processar_webhook_fillout(payload: dict):
             nome_pergunta = str(q.get("name", "")).lower()
             valor = q.get("value")
             
-            # Guardar tudo num dicionário para busca fácil depois
             by_label[nome_pergunta] = valor
             
             if tipo == "OpinionScale" and valor not in (None, ""):
@@ -260,16 +261,12 @@ def processar_webhook_fillout(payload: dict):
             elif "faltando" in nome_pergunta or "melhorar" in nome_pergunta:
                 o_que_faltava = str(valor or "")
             elif tipo == "LongAnswer" and not motivo:
-                # O primeiro LongAnswer que sobrar é o motivo
                 motivo = str(valor or "")
 
-        # Função auxiliar para procurar dados (Primeiro na URL, depois nas Perguntas)
         def extrair_dado_seguro(chaves):
-            # 1. Tentar na URL
             for chave in chaves:
                 if chave in url_params and url_params[chave] not in (None, ""):
                     return str(url_params[chave]).strip()
-            # 2. Tentar nas Perguntas
             for key_pergunta, val_pergunta in by_label.items():
                 if val_pergunta not in (None, ""):
                     for chave in chaves:
@@ -277,7 +274,6 @@ def processar_webhook_fillout(payload: dict):
                             return str(val_pergunta).strip()
             return ""
 
-        # Extração blindada
         cliente_id = extrair_dado_seguro(["clienteid", "id cliente"])
         email = extrair_dado_seguro(["email"])
         nome = extrair_dado_seguro(["nome"])
@@ -285,7 +281,6 @@ def processar_webhook_fillout(payload: dict):
         empresa_id_str = extrair_dado_seguro(["empresaid"])
         empresa_id = int(empresa_id_str) if empresa_id_str.isdigit() else 0
                 
-        # Classificar Categoria
         categoria = "Indefinido"
         if nota is not None:
             if nota <= 6: categoria = "Detrator"
@@ -295,13 +290,11 @@ def processar_webhook_fillout(payload: dict):
         resposta_id = f"F-{cliente_id}-{uuid.uuid4().hex[:8].upper()}"
 
         with engine.begin() as conn:
-            # 2. VERIFICAR DUPLICIDADE (Anti-Spam)
             sql_check = text("SELECT 1 FROM dbo.nps_respostas WHERE submission_id = :sub_id")
             if conn.execute(sql_check, {"sub_id": submission_id}).scalar():
                 print(f"⚠️ Webhook ignorado: Submissão {submission_id} já existe.")
                 return {"status": "ignorado", "motivo": "duplicado"}
 
-            # 3. GRAVAR A RESPOSTA
             sql_insert = text("""
                 INSERT INTO dbo.nps_respostas (
                     resposta_id, cliente_id, email, empresa, empresa_id,
@@ -319,7 +312,6 @@ def processar_webhook_fillout(payload: dict):
                 "fid": form_id, "sub_id": submission_id, "exp": expectativas, "falta": o_que_faltava
             })
             
-            # 4. ATUALIZAR STATUS DO CLIENTE PARA "Respondido"
             if cliente_id:
                 sql_update_cli = text("""
                     UPDATE dbo.nps_clientes 
@@ -330,7 +322,6 @@ def processar_webhook_fillout(payload: dict):
 
         print(f"✅ Nova Resposta Guardada! Cliente: {nome} | Empresa: {empresa} | Nota: {nota}")
 
-        # 5. GERAR AÇÃO NO KANBAN AUTOMATICAMENTE
         from services.respostas_svc import processar_acao_automatica
         processar_acao_automatica(
             resposta_id=resposta_id,
@@ -340,7 +331,6 @@ def processar_webhook_fillout(payload: dict):
             motivo=motivo
         )
 
-        # 6. ENVIAR ALERTA TEAMS
         try:
             enviar_alerta_teams(
                 resposta_id=resposta_id,
@@ -359,9 +349,6 @@ def processar_webhook_fillout(payload: dict):
         except Exception as erro_teams:
             print(f"⚠️ Erro ao enviar alerta Teams: {erro_teams}")
 
-        # =======================================================
-        # 7. ENVIAR E-MAIL DE AGRADECIMENTO (CLOSE THE LOOP)
-        # =======================================================
         try:
             from services.email_svc import enviar_email_resposta
             enviar_email_resposta(
@@ -391,11 +378,9 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. URL do webhook
             query_webhook = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
             webhook_url = conn.execute(query_webhook).scalar()
             
-            # 2. Buscar Perfil e Segmento na base de dados
             perfil, segmento = "-", "-"
             if cliente_id:
                 query_cli = text("SELECT perfil_decisor, segmento FROM dbo.nps_clientes WHERE cliente_id = :cid")
@@ -408,7 +393,6 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
             print("⚠️ Webhook do Teams não configurado. Alerta ignorado.")
             return
 
-        # 3. Lógica visual (Emojis e Cores baseadas na Categoria)
         if categoria == 'Detrator':
             emoji, cor_nota = '🚨', 'Attention'
         elif categoria == 'Neutro':
@@ -418,16 +402,13 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
         else:
             emoji, cor_nota = '📊', 'Default'
 
-        # Textos seguros caso venham vazios
         motivo_txt = motivo if motivo else "Sem comentário."
         expectativas_txt = expectativas if expectativas else "Não respondido."
         data_hoje = datetime.now().strftime("%Y-%m-%d")
 
-        # 4. URLs dos Botões do Fillout
         url_painel = f"https://build.fillout.com/editor/{form_id}/results"
         url_resposta = f"https://build.fillout.com/editor/{form_id}/results?sessionId={submission_id}"
 
-        # 5. Construção do "Adaptive Card" (O layout exato que pediu)
         card_body = [
             {
                 "type": "ColumnSet",
@@ -466,11 +447,9 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
             { "type": "TextBlock", "text": f"**Atendeu às expectativas?**\n{expectativas_txt}", "wrap": True, "spacing": "Small" }
         ]
 
-        # Se o cliente preencheu "O que estava faltando", adiciona esse bloco
         if o_que_faltava:
             card_body.append({ "type": "TextBlock", "text": f"**O que estava faltando?**\n{o_que_faltava}", "wrap": True, "spacing": "Small" })
 
-        # Assinatura do sistema (substitui a propaganda do n8n)
         card_body.append({
             "type": "TextBlock", 
             "text": "🤖 *Enviado automaticamente pelo Hub de NPS*", 
@@ -480,7 +459,6 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
             "isSubtle": True
         })
 
-        # 6. Embrulha no formato JSON do Teams e adiciona as "Actions" (Botões)
         payload_teams = {
             "type": "message",
             "attachments": [{
@@ -499,7 +477,6 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
             }]
         }
 
-        # 7. Disparo!
         resposta = requests.post(webhook_url, json=payload_teams, headers={"Content-Type": "application/json"})
         
         if resposta.status_code in (200, 201, 202):
