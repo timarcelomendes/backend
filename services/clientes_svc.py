@@ -79,7 +79,7 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    # 🟢 LÊ O GESTOR DA TABELA DE EMPRESAS (e.gestor)
+    # Query Corrigida: Busca o ID da empresa através do JOIN para verificar ações
     sql = f"""
     SELECT TOP ({int(topn)})
         c.cliente_id, 
@@ -87,7 +87,7 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.email, 
         c.telefone,          
         c.cargo,             
-        e.gestor,            /* 👈 Gestor atrelado à Conta */
+        e.gestor,            
         c.empresa, 
         c.perfil_decisor, 
         c.segmento,
@@ -96,8 +96,21 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.proximo_envio, 
         c.ativo, 
         c.updated_at,
+        
+        -- IDs e Contadores
+        e.id AS empresa_id,
         (SELECT COUNT(1) FROM dbo.nps_respostas r WHERE r.cliente_id = c.cliente_id) AS respostas_cliente,
-        (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa = c.empresa) AS respostas_empresa
+        (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa = c.empresa) AS respostas_empresa,
+        
+        -- Verificação de Ação Pendente vinculando o ID da empresa encontrada no JOIN
+        CAST(CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM dbo.nps_acoes a 
+                WHERE a.empresa_id = e.id 
+                  AND a.status != 'Concluído'
+            ) THEN 1 ELSE 0 
+        END AS BIT) AS tem_acao_pendente
+        
     FROM dbo.nps_clientes c
     LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
     {where_sql}
