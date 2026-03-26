@@ -144,15 +144,18 @@ def soft_delete(resposta_id: str):
 def restore(resposta_id: str):
     exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from database import get_engine
+
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
     Gera tickets automáticos no Kanban interno para TODAS as respostas.
-    Promotores agora recebem SLA padrão de 7 dias para garantir o fechamento do ciclo (agradecimento/upsell).
     """
     if nota is None:
         return
 
-    # 1. Carregar as regras (SLA) antes de tomar qualquer decisão
+    # 1. Carregar as regras (SLA)
     regras = obter_regras_dinamicas()
     
     # 2. Descobrir Categoria, SLA e a Prioridade apropriada
@@ -166,19 +169,13 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
         dias_prazo = int(regras.get("sla_neutro_dias", 5))
     else:
         categoria = "Promotor"
-        prioridade = "Baixa" # Promotores entram com prioridade Baixa (Manutenção Padrão)
-        # 💡 ALTERAÇÃO: Mudámos o fallback de 0 para 7 dias para garantir a criação do ticket
-        dias_prazo = int(regras.get("sla_promotor_dias", 7))
-
-    # 💡 ALTERAÇÃO: Bloco de bloqueio comentado para garantir que NINGUÉM fica de fora do Kanban
-    # if dias_prazo == 0:
-    #     print(f"ℹ️ Ticket ignorado para nota {nota} ({categoria}) - SLA configurado como 0 dias.")
-    #     return
+        prioridade = "Baixa"
+        dias_prazo = int(regras.get("sla_promotor_dias", 7)) # SLA garantido para Promotores
 
     engine = get_engine()
     try:
         with engine.begin() as conn:
-            # 4. Roteamento Inteligente (Descobrir o Gestor da Conta)
+            # 3. Roteamento Inteligente (Gestor da Conta)
             gestor_id_encontrado = None
             emp_id_real = empresa_id
 
@@ -189,30 +186,22 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                     gestor_id_encontrado = res.gestor_id
 
             elif empresa_nome:
-                # Se o Fillout não enviou o ID, tenta achar pelo Nome exato
                 query_gestor = text("SELECT id, gestor_id FROM dbo.nps_empresas WHERE nome = :nome")
                 res = conn.execute(query_gestor, {"nome": empresa_nome}).fetchone()
                 if res:
                     emp_id_real = res.id
                     gestor_id_encontrado = res.gestor_id
 
-            # 5. Formatar a data alvo do SLA
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Formatar o Título
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
             
-            # ==========================================
-            # 🤖 INTEGRAÇÃO GAUGE AI (Plano de Ação)
-            # ==========================================
+            # 4. Gauge AI (Plano de Ação)
             descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
             
-            # Só chama a IA se houver um comentário com substância (mais de 3 letras)
             if motivo and len(motivo.strip()) > 3:
                 import os
                 from openai import OpenAI
                 try:
-                    # Usa o gpt-4o-mini por ser incrivelmente rápido (não atrasa o webhook)
                     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
                     prompt_ai = f"O cliente '{empresa_nome}' deu nota {nota} no NPS. Comentário: '{motivo}'. Como especialista em Customer Success, crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa recuperar/fidelizar este cliente. Comece exatamente com a frase: '🤖 Análise Gauge AI:'"
                     
@@ -223,31 +212,26 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                         max_tokens=200
                     )
                     plano_ai = resposta_ai.choices[0].message.content
-                    
-                    # Junta o comentário original com o plano brilhante da IA
                     descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original:\n\"{motivo}\"\n\n{plano_ai}"
                 except Exception as e_ai:
-                    print(f"⚠️ Aviso: Falha ao gerar plano com Gauge AI (fallback para texto padrão). Erro: {e_ai}")
+                    print(f"⚠️ Aviso: Falha ao gerar plano com Gauge AI. Erro: {e_ai}")
 
-            # 7. Inserir na Tabela do Kanban
+            # 5. Inserir na Tabela (CORRIGIDO: Apenas colunas que existem fisicamente na tabela nps_acoes)
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, empresa_nome, gestor_id, titulo, descricao, prioridade, prazo_limite, status, resposta_nota, resposta_comentario, created_at, updated_at)
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
                 VALUES 
-                (:rid, :eid, :enome, :gid, :t, :d, :p, :pl, 'Pendente', :nota, :comentario, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """)
 
             conn.execute(sql_insert, {
                 "rid": resposta_id,
                 "eid": emp_id_real if emp_id_real and emp_id_real > 0 else None,
-                "enome": empresa_nome,
                 "gid": gestor_id_encontrado,
                 "t": titulo,
                 "d": descricao_txt,
                 "p": prioridade,
-                "pl": prazo_limite,
-                "nota": nota,
-                "comentario": motivo
+                "pl": prazo_limite
             })
 
             print(f"🎫 Ticket automático ({categoria}) no Kanban criado com sucesso para a resposta {resposta_id}!")
