@@ -148,9 +148,14 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from database import get_engine
 
+from datetime import datetime, timedelta
+from sqlalchemy import text
+from database import get_engine
+
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
     Gera tickets automáticos no Kanban interno para TODAS as respostas.
+    Inclui análise de Inteligência Artificial baseada no histórico completo do cliente.
     """
     if nota is None:
         return
@@ -170,7 +175,7 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
     else:
         categoria = "Promotor"
         prioridade = "Baixa"
-        dias_prazo = int(regras.get("sla_promotor_dias", 7)) # SLA garantido para Promotores
+        dias_prazo = int(regras.get("sla_promotor_dias", 7))
 
     engine = get_engine()
     try:
@@ -195,28 +200,81 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
             
-            # 4. Gauge AI (Plano de Ação)
+            # ==========================================
+            # 🧠 NOVO: BUSCA O HISTÓRICO DO CLIENTE
+            # ==========================================
+            historico_str = ""
+            try:
+                # Procura as últimas 5 respostas desta empresa no banco
+                query_hist = text("""
+                    SELECT TOP 5 resposta_id, nota, motivo, created_at 
+                    FROM dbo.nps_respostas 
+                    WHERE empresa_id = :eid OR (empresa = :enome AND empresa IS NOT NULL AND empresa != '')
+                    ORDER BY created_at DESC
+                """)
+                res_hist = conn.execute(query_hist, {
+                    "eid": emp_id_real if emp_id_real else -1, 
+                    "enome": empresa_nome or ""
+                }).fetchall()
+                
+                historico_lista = []
+                for h in res_hist:
+                    # Filtra para não repetir a resposta que acabou de entrar e ignora os que não têm texto
+                    if str(h.resposta_id) != str(resposta_id) and h.motivo and str(h.motivo).strip():
+                        data_formatada = h.created_at.strftime("%d/%m/%Y") if h.created_at else "Data Desconhecida"
+                        historico_lista.append(f"- Em {data_formatada} | Nota: {h.nota} | Comentário: '{h.motivo}'")
+                
+                if historico_lista:
+                    historico_str = "\n📜 Histórico de Respostas Anteriores deste Cliente:\n" + "\n".join(historico_lista)
+                else:
+                    historico_str = "\n📜 Histórico: Este é o primeiro comentário detalhado do cliente."
+                    
+            except Exception as e_hist:
+                print(f"Aviso ao buscar histórico: {e_hist}")
+                historico_str = ""
+
+            # ==========================================
+            # 🤖 INTEGRAÇÃO GAUGE AI (Plano Contextualizado)
+            # ==========================================
             descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
             
+            # Só chama a IA se houver um comentário atual com substância
             if motivo and len(motivo.strip()) > 3:
                 import os
                 from openai import OpenAI
                 try:
                     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-                    prompt_ai = f"O cliente '{empresa_nome}' deu nota {nota} no NPS. Comentário: '{motivo}'. Como especialista em Customer Success, crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa recuperar/fidelizar este cliente. Comece exatamente com a frase: '🤖 Análise Gauge AI:'"
+                    
+                    # O NOVO PROMPT QUE INCLUI O PASSADO E O PRESENTE
+                    prompt_ai = f"""
+Atue como um especialista sênior em Customer Success da Gauge.
+
+CENÁRIO ATUAL:
+O cliente '{empresa_nome}' acabou de dar nota {nota} no NPS.
+Comentário de agora: '{motivo}'
+{historico_str}
+
+TAREFA:
+Levando em conta o comentário de hoje e a evolução/padrão do cliente no histórico (se houver), crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa atuar (recuperar, manter ou fazer upsell). 
+
+Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não inclua saudações.
+"""
                     
                     resposta_ai = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt_ai}],
-                        temperature=0.7,
-                        max_tokens=200
+                        temperature=0.6, # Baixamos a temperatura um pouco para respostas mais analíticas e menos criativas
+                        max_tokens=300
                     )
                     plano_ai = resposta_ai.choices[0].message.content
-                    descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original:\n\"{motivo}\"\n\n{plano_ai}"
+                    
+                    descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original (Atual):\n\"{motivo}\"\n\n{plano_ai}"
                 except Exception as e_ai:
                     print(f"⚠️ Aviso: Falha ao gerar plano com Gauge AI. Erro: {e_ai}")
 
-            # 5. Inserir na Tabela (CORRIGIDO: Apenas colunas que existem fisicamente na tabela nps_acoes)
+            # ==========================================
+            # 7. Inserir na Tabela do Kanban
+            # ==========================================
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
                 (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
