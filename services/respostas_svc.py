@@ -174,46 +174,52 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                     gestor_id_encontrado = res.gestor_id
 
             # 3. Definir Prioridade e SLA (Prazo de Resolução)
-            
-            # 1. Carregar Regras da Base de Dados
-            regras = obter_regras_dinamicas()
+            # Carregar Regras da Base de Dados
+            regras = obter_regras_dinamicas() # Ou obter_regras_negocio() consoante o nome da sua função
 
-            # 2. Definir Prioridade e SLA Dinâmico baseado no Ecrã de Configurações
+            # Definir Prioridade e SLA Dinâmico baseado nas regras (com fallback seguro de segurança)
             if nota <= 6:
                 prioridade = "Alta"
-                dias_prazo = regras["sla_detrator_dias"]
+                dias_prazo = int(regras.get("sla_detrator_dias", 2))
             else:
                 prioridade = "Média"
-                dias_prazo = regras["sla_neutro_dias"]
-
-            prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d")
+                dias_prazo = int(regras.get("sla_neutro_dias", 5))
             
-            prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d")
+            # Formatar a data alvo do SLA
+            prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             
             # 4. Formatar o Título e a Descrição do Ticket
             titulo = f"[Risco NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
             descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original da Avaliação:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
 
             # 5. Inserir na Tabela do Kanban
+            # Nota: Adicionado resposta_nota, resposta_comentario e empresa_nome para o Vue.js renderizar os cartões perfeitamente
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status)
-                VALUES (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente')
+                (resposta_id, empresa_id, empresa_nome, gestor_id, titulo, descricao, prioridade, prazo_limite, status, resposta_nota, resposta_comentario, created_at, updated_at)
+                VALUES 
+                (:rid, :eid, :enome, :gid, :t, :d, :p, :pl, 'Pendente', :nota, :comentario, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """)
 
             conn.execute(sql_insert, {
                 "rid": resposta_id,
                 "eid": emp_id_real if emp_id_real and emp_id_real > 0 else None,
+                "enome": empresa_nome,
                 "gid": gestor_id_encontrado,
                 "t": titulo,
                 "d": descricao_txt,
                 "p": prioridade,
-                "pl": prazo_limite
+                "pl": prazo_limite,
+                "nota": nota,
+                "comentario": motivo
             })
 
             print(f"🎫 Ticket automático no Kanban criado com sucesso para a resposta {resposta_id}!")
 
     except Exception as e:
+        # Tratamento de erro robusto para evitar que a API rebente no webhook
+        print(f"❌ Erro crítico ao processar ação automática no Kanban: {e}")
+        traceback.print_exc() # Imprime a linha exata do erro no terminal da Azure para fácil diagnóstico
         print(f"❌ Erro ao tentar criar ação automática no Kanban: {e}")
 
 def processar_webhook_fillout(payload: dict):

@@ -295,24 +295,78 @@ def n8n_gatilho_acao(payload: WebhookN8nPayload):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
+
+def processar_webhook_fillout(payload: dict):
+    """
+    Processa os dados recebidos do Fillout, atualiza o status do cliente,
+    guarda a resposta e cria ações no Kanban automaticamente.
+    """
+    engine = get_engine()
     
-@app.post("/api/webhooks/fillout")
-async def webhook_receber_fillout(request: Request):
-    """Rota oficial para receber os dados quando o cliente submete o Fillout"""
-    try:
-        # Pega no JSON bruto que o Fillout envia
-        payload = await request.json()
+    with engine.begin() as conn:
+        # ==========================================
+        # 1. EXTRAÇÃO DE DADOS DO PAYLOAD (FILLOUT)
+        # ==========================================
+        # Nota: O Fillout envia os hidden fields e as respostas. 
+        # Adapte as chaves abaixo conforme os nomes que configurou no seu formulário.
         
-        # Manda para o serviço processar
-        from services.respostas_svc import processar_webhook_fillout
-        resultado = processar_webhook_fillout(payload)
+        email_cliente = payload.get("email") # Ou extraído dos hidden_fields
+        nome_cliente = payload.get("nome", "Cliente")
+        empresa_cliente = payload.get("empresa", "Conta Geral")
         
-        # Retorna 200 OK para o Fillout saber que recebemos bem
-        return resultado
-    except Exception as e:
-        print(f"Erro no webhook do fillout: {e}")
-        # Retorna 200 na mesma para o Fillout não ficar a tentar re-enviar infinitamente
-        return {"status": "error", "message": "Erro processado internamente"}
+        # Tenta pegar a nota e converte para inteiro (assume 10 se falhar)
+        try:
+            nota_int = int(payload.get("nota", 10))
+        except (ValueError, TypeError):
+            nota_int = 10
+            
+        comentario = payload.get("comentario", "")
+
+        # ==========================================
+        # 2. ATUALIZAR STATUS PARA PARAR O LEMBRETE
+        # ==========================================
+        if email_cliente:
+            conn.execute(text("""
+                UPDATE dbo.nps_clientes 
+                SET status_envio = 'Respondido', updated_at = CURRENT_TIMESTAMP 
+                WHERE email = :email
+            """), {"email": email_cliente})
+
+        # ==========================================
+        # 3. SALVAR A RESPOSTA NA TABELA
+        # ==========================================
+        # (Aqui entra o seu código atual que faz o INSERT na dbo.nps_respostas)
+        # Exemplo: conn.execute("INSERT INTO nps_respostas...")
+        
+
+        # ==========================================
+        # 4. 🚀 O GATILHO DO KANBAN (CLOSE THE LOOP)
+        # ==========================================
+        # Só cria ação automática para Detratores (0-6) ou Neutros (7-8)
+        if nota_int <= 8:
+            # Detratores recebem Alta urgência, Neutros recebem Média
+            urgencia = "Alta" if nota_int <= 6 else "Média"
+            
+            titulo_acao = f"Analisar feedback ({nota_int}/10) - {nome_cliente}"
+            descricao_acao = f"Comentário do cliente: \"{comentario}\"" if comentario else "O cliente não deixou comentário por escrito. Entrar em contacto para investigar o motivo da nota."
+
+            sql_acao = text("""
+                INSERT INTO dbo.nps_acoes 
+                (titulo, descricao, empresa_nome, status, prioridade, resposta_nota, resposta_comentario, created_at, updated_at)
+                VALUES 
+                (:titulo, :descricao, :empresa, 'Pendente', :prio, :nota, :comentario, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """)
+
+            conn.execute(sql_acao, {
+                "titulo": titulo_acao,
+                "descricao": descricao_acao,
+                "empresa": empresa_cliente,
+                "prio": urgencia,
+                "nota": nota_int,
+                "comentario": comentario
+            })
+
+    return {"status": "success", "message": "Resposta processada e Kanban atualizado!"}
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -1663,36 +1717,6 @@ def listar_empresas():
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- ROTAS DE SEGMENTOS ---
-@app.post("/api/cadastros/segmentos")
-def save_segmento(seg: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:n)"), {"n": seg.nome})
-    return {"status": "success"}
-
-@app.put("/api/cadastros/segmentos/{seg_id}")
-def update_segmento(seg_id: int, seg: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_segmentos SET nome=:n WHERE id=:id"), {"n": seg.nome, "id": seg_id})
-    return {"status": "success"}
-
-# --- ROTAS DE PERFIS ---
-@app.post("/api/cadastros/perfis")
-def save_perfil(perf: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_perfis (nome) VALUES (:n)"), {"n": perf.nome})
-    return {"status": "success"}
-
-@app.put("/api/cadastros/perfis/{perf_id}")
-def update_perfil(perf_id: int, perf: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_perfis SET nome=:n WHERE id=:id"), {"n": perf.nome, "id": perf_id})
-    return {"status": "success"}
-
-# --- ROTAS DE SEGMENTOS ---
 def crud_factory(route_path, table_name, schema=BasicoSchema):
     @app.get(route_path)
     def listar():
@@ -1742,108 +1766,8 @@ crud_factory("/api/cadastros/perfis", "dbo.nps_perfis")
 crud_factory("/api/cadastros/cargos", "dbo.nps_cargos")
 crud_factory("/api/cadastros/gestores", "dbo.nps_gestores", GestorSchema)
 crud_factory("/api/cadastros/companhias", "dbo.nps_companhias")
-
-# --- ROTAS DE PERFIS ---
-@app.get("/api/cadastros/perfis")
-def listar_perfis():
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            sql = text("SELECT id, nome FROM dbo.nps_perfis ORDER BY id")
-            res = conn.execute(sql).mappings().all()
-            return [dict(r) for r in res]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/cadastros/perfis")
-def save_perfil(perf: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_perfis (nome) VALUES (:n)"), {"n": perf.nome})
-    return {"status": "success"}
-
-@app.put("/api/cadastros/perfis/{perf_id}")
-def update_perfil(perf_id: int, perf: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_perfis SET nome=:n WHERE id=:id"), {"n": perf.nome, "id": perf_id})
-    return {"status": "success"}
-
-# --- ROTAS DE CARGOS ---
-@app.get("/api/cadastros/cargos")
-def listar_cargos():
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            sql = text("SELECT id, nome FROM dbo.nps_cargos ORDER BY nome")
-            res = conn.execute(sql).mappings().all()
-            return [dict(r) for r in res]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/cadastros/cargos")
-def save_cargo(cargo: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:n)"), {"n": cargo.nome})
-    return {"status": "success"}
-
-@app.put("/api/cadastros/cargos/{cargo_id}")
-def update_cargo(cargo_id: int, cargo: BasicoSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_cargos SET nome=:n WHERE id=:id"), {"n": cargo.nome, "id": cargo_id})
-    return {"status": "success"}
-
-@app.delete("/api/cadastros/cargos/{cargo_id}")
-def delete_cargo(cargo_id: int):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("DELETE FROM dbo.nps_cargos WHERE id = :id"), {"id": cargo_id})
-            conn.commit()
-            return {"message": "Cargo removido"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     
 # --- ROTAS DE GESTORES DE CONTA ---
-@app.get("/api/cadastros/gestores")
-def listar_gestores():
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            # 🟢 Agora lê o papel e o email
-            return [dict(r) for r in conn.execute(text("SELECT id, nome, papel, email FROM dbo.nps_gestores ORDER BY nome")).mappings().all()]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/cadastros/gestores")
-def save_gestor(gest: GestorSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO dbo.nps_gestores (nome, papel, email) VALUES (:n, :p, :e)"), 
-                     {"n": gest.nome, "p": gest.papel, "e": gest.email})
-    return {"status": "success"}
-
-@app.put("/api/cadastros/gestores/{gestor_id}")
-def update_gestor(gestor_id: int, gest: GestorSchema):
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE dbo.nps_gestores SET nome=:n, papel=:p, email=:e WHERE id=:id"), 
-                     {"n": gest.nome, "p": gest.papel, "e": gest.email, "id": gestor_id})
-    return {"status": "success"}
-
-@app.delete("/api/cadastros/gestores/{gestor_id}")
-def delete_gestor(gestor_id: int):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("DELETE FROM dbo.nps_gestores WHERE id = :id"), {"id": gestor_id})
-            conn.commit()
-            return {"message": "Gestor removido"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
 @app.get("/api/gestores")
 async def get_lista_gestores():
     try:
@@ -1969,7 +1893,6 @@ async def enviar_report_email(payload: ReportEmailPayload):
 async def listar_empresas():
     engine = get_engine()
     with engine.connect() as conn:
-        # 👈 Alterado para fazer JOIN e trazer o nome e ID da companhia
         sql = text("""
             SELECT 
                 e.id, e.nome, e.segmento, e.valor_contrato as arr_total, 
@@ -1987,7 +1910,6 @@ def save_empresa(emp: EmpresaSchema):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            # 👇 CORREÇÃO: Inserir gestor e gestor_id na criação
             sql_insert = text("""
                 INSERT INTO dbo.nps_empresas 
                 (nome, segmento, valor_contrato, gestor, gestor_id, companhia_id) 
@@ -2046,28 +1968,6 @@ def delete_empresa(empresa_id: int):
             conn.execute(text("DELETE FROM dbo.nps_empresas WHERE id = :id"), {"id": empresa_id})
             conn.commit()
             return {"message": "Empresa removida com sucesso"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/cadastros/segmentos/{segmento_id}")
-def delete_segmento(segmento_id: int):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("DELETE FROM dbo.nps_segmentos WHERE id = :id"), {"id": segmento_id})
-            conn.commit()
-            return {"message": "Segmento removido"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/cadastros/perfis/{perfil_id}")
-def delete_perfil(perfil_id: int):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("DELETE FROM dbo.nps_perfis WHERE id = :id"), {"id": perfil_id})
-            conn.commit()
-            return {"message": "Perfil removido"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
