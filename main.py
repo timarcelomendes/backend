@@ -295,78 +295,23 @@ def n8n_gatilho_acao(payload: WebhookN8nPayload):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
-
-def processar_webhook_fillout(payload: dict):
-    """
-    Processa os dados recebidos do Fillout, atualiza o status do cliente,
-    guarda a resposta e cria ações no Kanban automaticamente.
-    """
-    engine = get_engine()
     
-    with engine.begin() as conn:
-        # ==========================================
-        # 1. EXTRAÇÃO DE DADOS DO PAYLOAD (FILLOUT)
-        # ==========================================
-        # Nota: O Fillout envia os hidden fields e as respostas. 
-        # Adapte as chaves abaixo conforme os nomes que configurou no seu formulário.
+@app.post("/api/webhooks/fillout")
+async def webhook_receber_fillout(request: Request):
+    """Rota oficial para receber os dados quando o cliente submete o Fillout"""
+    try:
+        # Pega no JSON bruto que o Fillout envia
+        payload = await request.json()
         
-        email_cliente = payload.get("email") # Ou extraído dos hidden_fields
-        nome_cliente = payload.get("nome", "Cliente")
-        empresa_cliente = payload.get("empresa", "Conta Geral")
+        # Manda para o serviço processar (onde a lógica real vive)
+        from services.respostas_svc import processar_webhook_fillout
+        resultado = processar_webhook_fillout(payload)
         
-        # Tenta pegar a nota e converte para inteiro (assume 10 se falhar)
-        try:
-            nota_int = int(payload.get("nota", 10))
-        except (ValueError, TypeError):
-            nota_int = 10
-            
-        comentario = payload.get("comentario", "")
-
-        # ==========================================
-        # 2. ATUALIZAR STATUS PARA PARAR O LEMBRETE
-        # ==========================================
-        if email_cliente:
-            conn.execute(text("""
-                UPDATE dbo.nps_clientes 
-                SET status_envio = 'Respondido', updated_at = CURRENT_TIMESTAMP 
-                WHERE email = :email
-            """), {"email": email_cliente})
-
-        # ==========================================
-        # 3. SALVAR A RESPOSTA NA TABELA
-        # ==========================================
-        # (Aqui entra o seu código atual que faz o INSERT na dbo.nps_respostas)
-        # Exemplo: conn.execute("INSERT INTO nps_respostas...")
-        
-
-        # ==========================================
-        # 4. 🚀 O GATILHO DO KANBAN (CLOSE THE LOOP)
-        # ==========================================
-        # Só cria ação automática para Detratores (0-6) ou Neutros (7-8)
-        if nota_int <= 8:
-            # Detratores recebem Alta urgência, Neutros recebem Média
-            urgencia = "Alta" if nota_int <= 6 else "Média"
-            
-            titulo_acao = f"Analisar feedback ({nota_int}/10) - {nome_cliente}"
-            descricao_acao = f"Comentário do cliente: \"{comentario}\"" if comentario else "O cliente não deixou comentário por escrito. Entrar em contacto para investigar o motivo da nota."
-
-            sql_acao = text("""
-                INSERT INTO dbo.nps_acoes 
-                (titulo, descricao, empresa_nome, status, prioridade, resposta_nota, resposta_comentario, created_at, updated_at)
-                VALUES 
-                (:titulo, :descricao, :empresa, 'Pendente', :prio, :nota, :comentario, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """)
-
-            conn.execute(sql_acao, {
-                "titulo": titulo_acao,
-                "descricao": descricao_acao,
-                "empresa": empresa_cliente,
-                "prio": urgencia,
-                "nota": nota_int,
-                "comentario": comentario
-            })
-
-    return {"status": "success", "message": "Resposta processada e Kanban atualizado!"}
+        return resultado
+    except Exception as e:
+        print(f"Erro no webhook do fillout: {e}")
+        # Retorna 200 na mesma para o Fillout não ficar a tentar re-enviar infinitamente
+        return {"status": "error", "message": "Erro processado internamente"}
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -377,10 +322,8 @@ def obter_configuracoes_integracoes(usuario_email: str = Depends(get_current_use
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # Busca o webhook do Teams na tabela genérica de configurações
             query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
             resultado = conn.execute(query).scalar()
-            
             return {"teams_webhook_url": resultado or ""}
     except Exception as e:
         print(f"❌ Erro ao obter integrações: {e}")
