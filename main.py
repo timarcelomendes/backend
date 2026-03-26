@@ -296,9 +296,18 @@ def n8n_gatilho_acao(payload: WebhookN8nPayload):
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/api/webhooks/fillout")
+from fastapi import Request, Response
+
+@app.api_route("/api/webhooks/fillout", methods=["POST", "GET", "OPTIONS"])
 async def webhook_receber_fillout(request: Request):
-    """Rota oficial para receber os dados quando o cliente submete o Fillout"""
+    """Rota oficial (à prova de bala) para receber webhooks do Fillout"""
+    
+    if request.method == "OPTIONS":
+        return Response(status_code=200)
+        
+    if request.method == "GET":
+        return {"status": "success", "message": "🟢 O Webhook está online e pronto para receber dados!"}
+        
     try:
         payload = await request.json()
         
@@ -306,8 +315,11 @@ async def webhook_receber_fillout(request: Request):
         resultado = processar_webhook_fillout(payload)
         
         return resultado
+        
     except Exception as e:
-        print(f"Erro no webhook do fillout: {e}")
+        print(f"❌ Erro crítico no webhook do fillout: {e}")
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "message": "Erro processado internamente"}
     
 # ==========================================
