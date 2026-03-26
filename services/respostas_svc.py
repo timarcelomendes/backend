@@ -144,18 +144,10 @@ def soft_delete(resposta_id: str):
 def restore(resposta_id: str):
     exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
-from datetime import datetime, timedelta
-from sqlalchemy import text
-from database import get_engine
-
-from datetime import datetime, timedelta
-from sqlalchemy import text
-from database import get_engine
-
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
     Gera tickets automáticos no Kanban interno para TODAS as respostas.
-    Inclui análise de Inteligência Artificial baseada no histórico completo do cliente.
+    Busca a chave da OpenAI no banco de dados para gerar a análise contextualizada.
     """
     if nota is None:
         return
@@ -175,12 +167,12 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
     else:
         categoria = "Promotor"
         prioridade = "Baixa"
-        dias_prazo = int(regras.get("sla_promotor_dias", 7))
+        dias_prazo = int(regras.get("sla_promotor_dias", 7)) # Garante SLA para os Promotores
 
     engine = get_engine()
     try:
         with engine.begin() as conn:
-            # 3. Roteamento Inteligente (Gestor da Conta)
+            # 3. Roteamento Inteligente (Encontrar o Gestor da Conta)
             gestor_id_encontrado = None
             emp_id_real = empresa_id
 
@@ -201,11 +193,10 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
             
             # ==========================================
-            # 🧠 NOVO: BUSCA O HISTÓRICO DO CLIENTE
+            # 🧠 BUSCAR O HISTÓRICO DO CLIENTE
             # ==========================================
             historico_str = ""
             try:
-                # Procura as últimas 5 respostas desta empresa no banco
                 query_hist = text("""
                     SELECT TOP 5 resposta_id, nota, motivo, created_at 
                     FROM dbo.nps_respostas 
@@ -219,7 +210,6 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                 
                 historico_lista = []
                 for h in res_hist:
-                    # Filtra para não repetir a resposta que acabou de entrar e ignora os que não têm texto
                     if str(h.resposta_id) != str(resposta_id) and h.motivo and str(h.motivo).strip():
                         data_formatada = h.created_at.strftime("%d/%m/%Y") if h.created_at else "Data Desconhecida"
                         historico_lista.append(f"- Em {data_formatada} | Nota: {h.nota} | Comentário: '{h.motivo}'")
@@ -227,35 +217,46 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                 if historico_lista:
                     historico_str = "\n📜 Histórico de Respostas Anteriores deste Cliente:\n" + "\n".join(historico_lista)
                 else:
-                    historico_str = "\n📜 Histórico: Este é o primeiro comentário detalhado do cliente."
+                    historico_str = "\n📜 Histórico: Este é o primeiro registo detalhado do cliente."
                     
             except Exception as e_hist:
                 print(f"Aviso ao buscar histórico: {e_hist}")
                 historico_str = ""
 
             # ==========================================
-            # 🤖 INTEGRAÇÃO GAUGE AI (Plano Contextualizado)
+            # 🤖 INTEGRAÇÃO GAUGE AI (Com Chave do Banco de Dados)
             # ==========================================
-            descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
+            texto_motivo = motivo.strip() if motivo else "O cliente apenas deu a nota e não deixou comentário."
+            descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\n💬 Comentário Original:\n\"{texto_motivo}\""
             
-            # Só chama a IA se houver um comentário atual com substância
-            if motivo and len(motivo.strip()) > 3:
-                import os
-                from openai import OpenAI
+            # 💡 NOVO: Vai ao banco de dados buscar a chave da OpenAI
+            chave_api = None
+            try:
+                res_chave = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'OPENAI_API_KEY'")).fetchone()
+                if res_chave and res_chave.valor:
+                    chave_api = res_chave.valor.strip()
+            except Exception as e_chave:
+                print(f"Aviso: Erro ao tentar ler a chave OPENAI_API_KEY do banco: {e_chave}")
+            
+            if not chave_api:
+                # Falha: A chave não existe na tabela
+                descricao_txt += "\n\n⚠️ [ERRO DO SISTEMA]: A análise da Gauge AI não foi gerada porque a chave 'OPENAI_API_KEY' não foi encontrada na tabela dbo.nps_configuracoes."
+            else:
                 try:
-                    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                    from openai import OpenAI
+                    client = OpenAI(api_key=chave_api)
                     
-                    # O NOVO PROMPT QUE INCLUI O PASSADO E O PRESENTE
                     prompt_ai = f"""
 Atue como um especialista sênior em Customer Success da Gauge.
 
 CENÁRIO ATUAL:
 O cliente '{empresa_nome}' acabou de dar nota {nota} no NPS.
-Comentário de agora: '{motivo}'
+Comentário de agora: '{texto_motivo}'
 {historico_str}
 
 TAREFA:
-Levando em conta o comentário de hoje e a evolução/padrão do cliente no histórico (se houver), crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa atuar (recuperar, manter ou fazer upsell). 
+Levando em conta o momento atual e a evolução/padrão do cliente no histórico, crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa atuar (recuperar, manter ou fazer upsell). 
+Mesmo que o cliente não tenha deixado comentário hoje, sugira uma abordagem tática baseada exclusivamente na nota ({nota}) e no histórico (se houver).
 
 Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não inclua saudações.
 """
@@ -263,14 +264,19 @@ Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não i
                     resposta_ai = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt_ai}],
-                        temperature=0.6, # Baixamos a temperatura um pouco para respostas mais analíticas e menos criativas
+                        temperature=0.6,
                         max_tokens=300
                     )
+                    
                     plano_ai = resposta_ai.choices[0].message.content
                     
-                    descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original (Atual):\n\"{motivo}\"\n\n{plano_ai}"
+                    # Sucesso Total: Monta a descrição final
+                    descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original:\n\"{texto_motivo}\"\n\n{plano_ai}"
+                    
+                except ImportError:
+                    descricao_txt += "\n\n❌ [ERRO TÉCNICO]: A biblioteca 'openai' não foi encontrada ou está desatualizada. Instale com: pip install openai"
                 except Exception as e_ai:
-                    print(f"⚠️ Aviso: Falha ao gerar plano com Gauge AI. Erro: {e_ai}")
+                    descricao_txt += f"\n\n❌ [ERRO NA GAUGE AI]: Falha ao comunicar com a OpenAI. Detalhe: {str(e_ai)}"
 
             # ==========================================
             # 7. Inserir na Tabela do Kanban
