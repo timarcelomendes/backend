@@ -300,17 +300,14 @@ def n8n_gatilho_acao(payload: WebhookN8nPayload):
 async def webhook_receber_fillout(request: Request):
     """Rota oficial para receber os dados quando o cliente submete o Fillout"""
     try:
-        # Pega no JSON bruto que o Fillout envia
         payload = await request.json()
         
-        # Manda para o serviço processar (onde a lógica real vive)
         from services.respostas_svc import processar_webhook_fillout
         resultado = processar_webhook_fillout(payload)
         
         return resultado
     except Exception as e:
         print(f"Erro no webhook do fillout: {e}")
-        # Retorna 200 na mesma para o Fillout não ficar a tentar re-enviar infinitamente
         return {"status": "error", "message": "Erro processado internamente"}
     
 # ==========================================
