@@ -105,7 +105,10 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
         r.o_que_faltava, 
         r.jira_issue_url,
         r.created_at,
-        r.excluido
+        r.excluido,
+        
+        (SELECT TOP 1 id FROM dbo.nps_acoes WHERE resposta_id = r.resposta_id) AS acao_vinculada
+        
     FROM BaseHistorico r
     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
     LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
@@ -114,6 +117,7 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
     ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.resposta_id DESC;
     """
     
+    # Executa o sql gigante de cima
     df = read_df(sql, params)
     
     if 'nota_anterior' in df.columns:
@@ -195,9 +199,35 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             # 5. Formatar a data alvo do SLA
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             
-            # 6. Formatar o Título (agora com a Categoria no nome)
+            # Formatar o Título
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
-            descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original da Avaliação:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
+            
+            # ==========================================
+            # 🤖 INTEGRAÇÃO GAUGE AI (Plano de Ação)
+            # ==========================================
+            descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\nComentário Original:\n\"{motivo or 'O cliente não deixou comentários de texto.'}\""
+            
+            # Só chama a IA se houver um comentário com substância (mais de 3 letras)
+            if motivo and len(motivo.strip()) > 3:
+                import os
+                from openai import OpenAI
+                try:
+                    # Usa o gpt-4o-mini por ser incrivelmente rápido (não atrasa o webhook)
+                    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                    prompt_ai = f"O cliente '{empresa_nome}' deu nota {nota} no NPS. Comentário: '{motivo}'. Como especialista em Customer Success, crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa recuperar/fidelizar este cliente. Comece exatamente com a frase: '🤖 Análise Gauge AI:'"
+                    
+                    resposta_ai = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt_ai}],
+                        temperature=0.7,
+                        max_tokens=200
+                    )
+                    plano_ai = resposta_ai.choices[0].message.content
+                    
+                    # Junta o comentário original com o plano brilhante da IA
+                    descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original:\n\"{motivo}\"\n\n{plano_ai}"
+                except Exception as e_ai:
+                    print(f"⚠️ Aviso: Falha ao gerar plano com Gauge AI (fallback para texto padrão). Erro: {e_ai}")
 
             # 7. Inserir na Tabela do Kanban
             sql_insert = text("""
