@@ -168,32 +168,34 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
     else:
         categoria = "Promotor"
         prioridade = "Baixa"
-        dias_prazo = int(regras.get("sla_promotor_dias", 7)) # Garante SLA para os Promotores
+        dias_prazo = int(regras.get("sla_promotor_dias", 7))
 
+    from database import get_engine
+    from sqlalchemy import text
+    from datetime import datetime, timedelta
+    
     engine = get_engine()
     try:
         with engine.begin() as conn:
             # ==========================================
-            # 3. Roteamento Inteligente (Gestor e Companhia)
+            # 3. Roteamento Inteligente (Gestor)
             # ==========================================
             gestor_id_encontrado = None
-            companhia_encontrada = None
             emp_id_real = empresa_id
 
+            # CORREÇÃO: Removida a busca pela coluna "companhia" que não existia nesta tabela
             if emp_id_real and emp_id_real > 0:
-                query_dados = text("SELECT gestor_id, companhia FROM dbo.nps_empresas WHERE id = :eid")
+                query_dados = text("SELECT gestor_id FROM dbo.nps_empresas WHERE id = :eid")
                 res = conn.execute(query_dados, {"eid": emp_id_real}).fetchone()
                 if res: 
                     gestor_id_encontrado = res.gestor_id
-                    companhia_encontrada = getattr(res, 'companhia', None)
 
             elif empresa_nome:
-                query_dados = text("SELECT id, gestor_id, companhia FROM dbo.nps_empresas WHERE nome = :nome")
+                query_dados = text("SELECT id, gestor_id FROM dbo.nps_empresas WHERE nome = :nome")
                 res = conn.execute(query_dados, {"nome": empresa_nome}).fetchone()
                 if res:
                     emp_id_real = res.id
                     gestor_id_encontrado = res.gestor_id
-                    companhia_encontrada = getattr(res, 'companhia', None)
 
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
@@ -230,75 +232,63 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
                 historico_str = ""
 
             # ==========================================
-            # 🤖 INTEGRAÇÃO GAUGE AI (Com Chave do Banco de Dados)
+            # 🤖 INTEGRAÇÃO GAUGE AI 
             # ==========================================
             texto_motivo = motivo.strip() if motivo else "O cliente apenas deu a nota e não deixou comentário."
             descricao_txt = f"🚨 Ticket gerado automaticamente via sistema NPS.\n\n💬 Comentário Original:\n\"{texto_motivo}\""
             
-            # 💡 NOVO: Vai ao banco de dados buscar a chave da OpenAI
             chave_api = None
             try:
                 res_chave = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'OPENAI_API_KEY'")).fetchone()
                 if res_chave and res_chave.valor:
                     chave_api = res_chave.valor.strip()
-            except Exception as e_chave:
-                print(f"Aviso: Erro ao tentar ler a chave OPENAI_API_KEY do banco: {e_chave}")
+            except Exception:
+                pass
             
             if not chave_api:
-                # Falha: A chave não existe na tabela
-                descricao_txt += "\n\n⚠️ [ERRO DO SISTEMA]: A análise da Gauge AI não foi gerada porque a chave 'OPENAI_API_KEY' não foi encontrada na tabela dbo.nps_configuracoes."
+                descricao_txt += "\n\n⚠️ [ERRO DO SISTEMA]: A análise da Gauge AI não foi gerada porque a chave 'OPENAI_API_KEY' não foi encontrada."
             else:
                 try:
                     from openai import OpenAI
                     client = OpenAI(api_key=chave_api)
                     
                     prompt_ai = f"""
-Atue como um especialista sênior em Customer Success da Gauge.
-
-CENÁRIO ATUAL:
-O cliente '{empresa_nome}' acabou de dar nota {nota} no NPS.
+Atue como um especialista sênior em Customer Success.
+CENÁRIO ATUAL: O cliente '{empresa_nome}' acabou de dar nota {nota} no NPS.
 Comentário de agora: '{texto_motivo}'
 {historico_str}
-
-TAREFA:
-Levando em conta o momento atual e a evolução/padrão do cliente no histórico, crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa atuar (recuperar, manter ou fazer upsell). 
-Mesmo que o cliente não tenha deixado comentário hoje, sugira uma abordagem tática baseada exclusivamente na nota ({nota}) e no histórico (se houver).
-
+TAREFA: Crie um plano de ação direto, prático e em bullet points (máximo 3 passos curtos) para a nossa equipa atuar. 
 Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não inclua saudações.
 """
-                    
                     resposta_ai = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt_ai}],
                         temperature=0.6,
                         max_tokens=300
                     )
-                    
                     plano_ai = resposta_ai.choices[0].message.content
-                    
-                    # Sucesso Total: Monta a descrição final
                     descricao_txt = f"🚨 Ticket gerado via sistema NPS.\n\n💬 Comentário Original:\n\"{texto_motivo}\"\n\n{plano_ai}"
                     
                 except ImportError:
-                    descricao_txt += "\n\n❌ [ERRO TÉCNICO]: A biblioteca 'openai' não foi encontrada ou está desatualizada. Instale com: pip install openai"
+                    descricao_txt += "\n\n❌ [ERRO TÉCNICO]: A biblioteca 'openai' não foi encontrada."
                 except Exception as e_ai:
                     descricao_txt += f"\n\n❌ [ERRO NA GAUGE AI]: Falha ao comunicar com a OpenAI. Detalhe: {str(e_ai)}"
 
             # ==========================================
-            # 7. Inserir na Tabela do Kanban (Agora com Companhia)
+            # 7. Inserir na Tabela do Kanban 
             # ==========================================
+            # CORREÇÃO: Removido o campo "companhia" do INSERT para evitar erros de SQL
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, gestor_id, companhia, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
                 VALUES 
-                (:rid, :eid, :gid, :comp, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """)
 
             conn.execute(sql_insert, {
                 "rid": resposta_id,
                 "eid": emp_id_real if emp_id_real and emp_id_real > 0 else None,
                 "gid": gestor_id_encontrado,
-                "comp": companhia_encontrada,  # 👈 Injeta a companhia automaticamente!
                 "t": titulo,
                 "d": descricao_txt,
                 "p": prioridade,
