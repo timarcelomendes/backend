@@ -304,34 +304,37 @@ class TesteWebhookPayload(BaseModel):
     webhook_url: str
 
 # ==========================================
-# 🤖 WEBHOOKS (Integrações Externas / n8n)
+# 🔗 ROTAS DE INTEGRAÇÕES (WEBHOOKS)
 # ==========================================
 
-@app.api_route("/api/webhooks/fillout", methods=["POST", "GET", "OPTIONS"])
+# 👇 Empilhar decoradores garante que a Azure compreende as permissões
+@app.post("/api/webhooks/fillout")
+@app.get("/api/webhooks/fillout")
+@app.options("/api/webhooks/fillout")
 async def webhook_receber_fillout(request: Request, background_tasks: BackgroundTasks):
-    """Rota Enterprise Assíncrona para Webhooks"""
+    """Rota Enterprise Assíncrona para Webhooks do Fillout"""
     
-    # 1. Handshake / Preflight de CORS (Para serviços externos)
+    # 1. Handshake / Preflight de CORS
     if request.method == "OPTIONS":
         return Response(status_code=200)
         
-    # 2. Healthcheck (Para validar pelo navegador se a rota existe)
+    # 2. Healthcheck
     if request.method == "GET":
-        return {"status": "success", "message": "🟢 Recebedor de Webhooks Online."}
+        return {"status": "success", "message": "🟢 Recebedor de Webhooks Online e a aceitar POST."}
         
     try:
-        # 3. Lê os dados brutos assincronamente (rápido)
+        # 3. Lê os dados brutos assincronamente
         payload = await request.json()
         print(f"📥 WEBHOOK RECEBIDO! Tamanho: {len(str(payload))} bytes")
         
         # 4. Delega o processamento pesado para o SVC em segundo plano
+        from services.webhook_svc import processar_webhook_background
         background_tasks.add_task(processar_webhook_background, payload)
         
-        # 5. Liberta o Fillout imediatamente (Devolve HTTP 200/202 na hora)
+        # 5. Liberta o serviço externo imediatamente
         return {"status": "accepted", "message": "Webhook recebido e na fila de processamento"}
         
     except Exception as e:
-        # Se falhar aqui, o JSON enviado não era válido (muito raro)
         print(f"❌ Erro Crítico no Parser do Webhook: {e}")
         return {"status": "error", "message": "Falha na leitura do payload"}
     
