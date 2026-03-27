@@ -118,6 +118,37 @@ app.add_middleware(
 )
 
 # ==========================================
+# 🥇 1. WEBHOOKS (PRIORIDADE MÁXIMA)
+# ==========================================
+# Colocamos isto no topo para evitar que outras rotas "roubem" o pedido (Route Shadowing)
+
+@app.post("/api/webhooks/fillout")
+@app.post("/api/webhooks/fillout/")
+async def webhook_receber_fillout_post(request: Request, background_tasks: BackgroundTasks):
+    """Apenas recebe o POST e devolve sucesso imediato"""
+    try:
+        # Lê o pacote json do Fillout
+        payload = await request.json()
+        print(f"📥 WEBHOOK POST RECEBIDO: {len(str(payload))} bytes")
+        
+        # Manda processar no fundo
+        from services.webhook_svc import processar_webhook_background
+        background_tasks.add_task(processar_webhook_background, {"payload": payload})
+        
+        # Resposta imediata 200 OK
+        return {"status": "accepted", "message": "Recebido com sucesso"}
+    except Exception as e:
+        print(f"❌ Erro no payload: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/webhooks/fillout")
+@app.get("/api/webhooks/fillout/")
+async def webhook_receber_fillout_get():
+    """Para o botão de teste do seu Frontend (Healthcheck)"""
+    return {"status": "success", "message": "🟢 Webhook Online e a escutar POSTs!"}
+
+# ==========================================
 # 🔐 4. DEPENDÊNCIAS DE AUTENTICAÇÃO
 # ==========================================
 async def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -302,62 +333,6 @@ class TesteTemplatePayload(BaseModel):
 
 class TesteWebhookPayload(BaseModel):
     webhook_url: str
-
-# ==========================================
-# 🔗 ROTAS DE INTEGRAÇÕES (WEBHOOKS)
-# ==========================================
-@app.api_route("/api/webhooks/fillout", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-@app.api_route("/api/webhooks/fillout/", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-async def webhook_receber_fillout(request: Request, background_tasks: BackgroundTasks):
-    if request.method == "OPTIONS":
-        return Response(status_code=200)
-
-    if request.method == "GET":
-        return {"status": "success", "message": "🟢 Recebedor online."}
-
-    try:
-        raw_body = await request.body()
-        content_type = request.headers.get("content-type", "")
-        query_params = dict(request.query_params)
-
-        payload = None
-
-        if raw_body:
-            if "application/json" in content_type:
-                payload = await request.json()
-            else:
-                payload = {
-                    "raw_body": raw_body.decode("utf-8", errors="replace"),
-                    "content_type": content_type,
-                }
-
-        evento = {
-            "method": request.method,
-            "headers": dict(request.headers),
-            "query_params": query_params,
-            "payload": payload,
-        }
-
-        print("📥 WEBHOOK RECEBIDO")
-        print(f"Method: {request.method}")
-        print(f"Content-Type: {content_type}")
-        print(f"Query: {query_params}")
-        print(f"Body size: {len(raw_body)}")
-
-        from services.webhook_svc import processar_webhook_background
-        background_tasks.add_task(processar_webhook_background, evento)
-
-        return JSONResponse(
-            status_code=200,
-            content={"status": "accepted", "message": "Webhook recebido"}
-        )
-
-    except Exception as e:
-        print(f"❌ Erro crítico no webhook: {e}")
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": str(e)}
-        )
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
