@@ -22,14 +22,18 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import jwt, JWTError, ExpiredSignatureError
 from sqlalchemy import text
+
+# Importações do Agendador (Scheduler)
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 # Importações Locais
 from database import get_engine, exec_sql
 from services.auth_utils import hash_password
 from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
+from services.teams_svc import enviar_resumo_matinal_gestores  # 👈 Importação da nova função
 
 # ==========================================
 # ⚙️ 1. CONFIGURAÇÕES E SEGURANÇA
@@ -49,14 +53,25 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
+    
+    # Job 1: Robô de Disparo de NPS a cada 6 horas
     scheduler.add_job(
         processar_disparos_nps, 
         IntervalTrigger(hours=6), 
         id="disparo_nps_job", 
         replace_existing=True
     )
+    
+    # Job 2: Robô de Alertas do Teams (Segunda a Sexta às 08h00)
+    scheduler.add_job(
+        enviar_resumo_matinal_gestores, 
+        CronTrigger(day_of_week='mon-fri', hour=8, minute=0), 
+        id="alerta_matinal_teams_job", 
+        replace_existing=True
+    )
+    
     scheduler.start()
-    print("⏰ Agendador de tarefas (CRON) iniciado com sucesso!")
+    print("⏰ Agendador de tarefas (CRON) iniciado com sucesso! (NPS e Teams)")
     yield
     scheduler.shutdown()
 
@@ -227,6 +242,7 @@ class GestorSchema(BaseModel):
     nome: str
     papel: Optional[str] = ""
     email: Optional[str] = ""
+    teams_webhook: Optional[str] = ""
 
 class AlertaGestorRequest(BaseModel):
     empresa: str
@@ -275,6 +291,9 @@ class TesteTemplatePayload(BaseModel):
     email_destino: str
     html_content: str
     categoria: str # 'promotor', 'neutro', 'detrator'
+
+class TesteWebhookPayload(BaseModel):
+    webhook_url: str
 
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
@@ -1668,7 +1687,6 @@ def listar_empresas():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- ROTAS DE SEGMENTOS ---
 def crud_factory(route_path, table_name, schema=BasicoSchema):
     @app.get(route_path)
     def listar():
@@ -1679,7 +1697,13 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
     def salvar(item: schema): # type: ignore  
         with get_engine().begin() as conn:
             if table_name == 'dbo.nps_gestores': 
-                conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email) VALUES (:n, :p, :e)"), {"n": item.nome, "p": getattr(item, 'papel', ''), "e": getattr(item, 'email', '')})
+                # 👇 ATUALIZADO: Inclui teams_webhook no INSERT
+                conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email, teams_webhook) VALUES (:n, :p, :e, :t)"), {
+                    "n": item.nome, 
+                    "p": getattr(item, 'papel', ''), 
+                    "e": getattr(item, 'email', ''),
+                    "t": getattr(item, 'teams_webhook', '')
+                })
             else: 
                 conn.execute(text(f"INSERT INTO {table_name} (nome) VALUES (:n)"), {"n": item.nome})
         return {"status": "success"}
@@ -1690,7 +1714,14 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
             nome_antigo = conn.execute(text(f"SELECT nome FROM {table_name} WHERE id=:id"), {"id": item_id}).scalar()
             
             if table_name == 'dbo.nps_gestores': 
-                conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e WHERE id=:id"), {"n": item.nome, "p": getattr(item, 'papel', ''), "e": getattr(item, 'email', ''), "id": item_id})
+                # 👇 ATUALIZADO: Inclui teams_webhook no UPDATE
+                conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e, teams_webhook=:t WHERE id=:id"), {
+                    "n": item.nome, 
+                    "p": getattr(item, 'papel', ''), 
+                    "e": getattr(item, 'email', ''), 
+                    "t": getattr(item, 'teams_webhook', ''),
+                    "id": item_id
+                })
             else: 
                 conn.execute(text(f"UPDATE {table_name} SET nome=:n WHERE id=:id"), {"n": item.nome, "id": item_id})
             
@@ -1733,6 +1764,47 @@ async def get_lista_gestores():
     except Exception as e:
         print(f"❌ Erro ao buscar gestores: {e}")
         return []
+    
+@app.post("/api/gestores/testar-webhook")
+def testar_webhook_teams(payload: TesteWebhookPayload):
+    if not payload.webhook_url:
+        raise HTTPException(status_code=400, detail="URL do Webhook não fornecida.")
+
+    # Um Cartão Adaptativo bonito só para confirmar que a ligação funciona
+    adaptive_card = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": [
+                    {
+                        "type": "TextBlock",
+                        "text": "🚀 Conexão Estabelecida!",
+                        "size": "Large",
+                        "weight": "Bolder",
+                        "color": "Good"
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": "O Hub de NPS da Gauge está agora conectado a este canal. Você receberá os resumos matinais de ações pendentes aqui.",
+                        "wrap": True
+                    }
+                ]
+            }
+        }]
+    }
+
+    try:
+        import requests
+        resp = requests.post(payload.webhook_url, json=adaptive_card, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        return {"status": "success", "message": "Mensagem de teste enviada com sucesso!"}
+    except Exception as e:
+        print(f"Erro ao testar webhook: {e}")
+        raise HTTPException(status_code=500, detail="Falha ao enviar mensagem. Verifique se a URL é válida.")
 
 # 3. Rota para disparar o e-mail
 @app.post("/api/reports/enviar-email")

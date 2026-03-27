@@ -5,6 +5,7 @@ import traceback
 import uuid
 import requests
 from datetime import datetime, timedelta
+from services.teams_svc import enviar_alerta_teams
 
 CATS = ["Promotor", "Neutro", "Detrator"]
 
@@ -172,22 +173,27 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
     engine = get_engine()
     try:
         with engine.begin() as conn:
-            # 3. Roteamento Inteligente (Encontrar o Gestor da Conta)
+            # ==========================================
+            # 3. Roteamento Inteligente (Gestor e Companhia)
+            # ==========================================
             gestor_id_encontrado = None
+            companhia_encontrada = None
             emp_id_real = empresa_id
 
             if emp_id_real and emp_id_real > 0:
-                query_gestor = text("SELECT gestor_id FROM dbo.nps_empresas WHERE id = :eid")
-                res = conn.execute(query_gestor, {"eid": emp_id_real}).fetchone()
+                query_dados = text("SELECT gestor_id, companhia FROM dbo.nps_empresas WHERE id = :eid")
+                res = conn.execute(query_dados, {"eid": emp_id_real}).fetchone()
                 if res: 
                     gestor_id_encontrado = res.gestor_id
+                    companhia_encontrada = getattr(res, 'companhia', None)
 
             elif empresa_nome:
-                query_gestor = text("SELECT id, gestor_id FROM dbo.nps_empresas WHERE nome = :nome")
-                res = conn.execute(query_gestor, {"nome": empresa_nome}).fetchone()
+                query_dados = text("SELECT id, gestor_id, companhia FROM dbo.nps_empresas WHERE nome = :nome")
+                res = conn.execute(query_dados, {"nome": empresa_nome}).fetchone()
                 if res:
                     emp_id_real = res.id
                     gestor_id_encontrado = res.gestor_id
+                    companhia_encontrada = getattr(res, 'companhia', None)
 
             prazo_limite = (datetime.now() + timedelta(days=dias_prazo)).strftime("%Y-%m-%d %H:%M:%S")
             titulo = f"[{categoria} NPS {nota}] Ação Requerida: {empresa_nome or 'Cliente Indefinido'}"
@@ -279,19 +285,20 @@ Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não i
                     descricao_txt += f"\n\n❌ [ERRO NA GAUGE AI]: Falha ao comunicar com a OpenAI. Detalhe: {str(e_ai)}"
 
             # ==========================================
-            # 7. Inserir na Tabela do Kanban
+            # 7. Inserir na Tabela do Kanban (Agora com Companhia)
             # ==========================================
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
+                (resposta_id, empresa_id, gestor_id, companhia, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
                 VALUES 
-                (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                (:rid, :eid, :gid, :comp, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """)
 
             conn.execute(sql_insert, {
                 "rid": resposta_id,
                 "eid": emp_id_real if emp_id_real and emp_id_real > 0 else None,
                 "gid": gestor_id_encontrado,
+                "comp": companhia_encontrada,  # 👈 Injeta a companhia automaticamente!
                 "t": titulo,
                 "d": descricao_txt,
                 "p": prioridade,
@@ -400,7 +407,6 @@ def processar_webhook_fillout(payload: dict):
 
         print(f"✅ Nova Resposta Guardada! Cliente: {nome} | Empresa: {empresa} | Nota: {nota}")
 
-        from services.respostas_svc import processar_acao_automatica
         processar_acao_automatica(
             resposta_id=resposta_id,
             nota=nota,
@@ -449,118 +455,3 @@ def processar_webhook_fillout(payload: dict):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
-
-
-def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str, empresa: str, nota: int, categoria: str, motivo: str, expectativas: str, o_que_faltava: str, form_id: str, submission_id: str):
-    """Monta um Adaptive Card com layout avançado e envia para o Teams"""
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            query_webhook = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
-            webhook_url = conn.execute(query_webhook).scalar()
-            
-            perfil, segmento = "-", "-"
-            if cliente_id:
-                query_cli = text("SELECT perfil_decisor, segmento FROM dbo.nps_clientes WHERE cliente_id = :cid")
-                res_cli = conn.execute(query_cli, {"cid": cliente_id}).fetchone()
-                if res_cli:
-                    perfil = res_cli.perfil_decisor or "-"
-                    segmento = res_cli.segmento or "-"
-
-        if not webhook_url:
-            print("⚠️ Webhook do Teams não configurado. Alerta ignorado.")
-            return
-
-        if categoria == 'Detrator':
-            emoji, cor_nota = '🚨', 'Attention'
-        elif categoria == 'Neutro':
-            emoji, cor_nota = '⚠️', 'Warning'
-        elif categoria == 'Promotor':
-            emoji, cor_nota = '✅', 'Good'
-        else:
-            emoji, cor_nota = '📊', 'Default'
-
-        motivo_txt = motivo if motivo else "Sem comentário."
-        expectativas_txt = expectativas if expectativas else "Não respondido."
-        data_hoje = datetime.now().strftime("%Y-%m-%d")
-
-        url_painel = f"https://build.fillout.com/editor/{form_id}/results"
-        url_resposta = f"https://build.fillout.com/editor/{form_id}/results?sessionId={submission_id}"
-
-        card_body = [
-            {
-                "type": "ColumnSet",
-                "columns": [
-                    {
-                        "type": "Column",
-                        "width": "stretch",
-                        "items": [
-                            { "type": "TextBlock", "text": f"{emoji} NPS Fillout — {categoria}", "weight": "Bolder", "size": "Large", "wrap": True },
-                            { "type": "TextBlock", "text": f"Empresa: {empresa if empresa else '-'}", "wrap": True, "spacing": "None", "isSubtle": True }
-                        ]
-                    },
-                    {
-                        "type": "Column",
-                        "width": "auto",
-                        "items": [
-                            { "type": "TextBlock", "text": f"{nota}/10", "weight": "Bolder", "size": "ExtraLarge", "color": cor_nota, "horizontalAlignment": "Right" }
-                        ]
-                    }
-                ]
-            },
-            {
-                "type": "FactSet",
-                "spacing": "Medium",
-                "facts": [
-                    { "title": "Contato:", "value": nome if nome else "-" },
-                    { "title": "E-mail:", "value": email if email else "-" },
-                    { "title": "Data:", "value": data_hoje },
-                    { "title": "ClienteId:", "value": cliente_id if cliente_id else "-" },
-                    { "title": "Perfil:", "value": perfil },
-                    { "title": "Segmento:", "value": segmento },
-                    { "title": "RespostaId:", "value": resposta_id }
-                ]
-            },
-            { "type": "TextBlock", "text": f"**Motivo da nota:**\n{motivo_txt}", "wrap": True, "spacing": "Medium" },
-            { "type": "TextBlock", "text": f"**Atendeu às expectativas?**\n{expectativas_txt}", "wrap": True, "spacing": "Small" }
-        ]
-
-        if o_que_faltava:
-            card_body.append({ "type": "TextBlock", "text": f"**O que estava faltando?**\n{o_que_faltava}", "wrap": True, "spacing": "Small" })
-
-        card_body.append({
-            "type": "TextBlock", 
-            "text": "🤖 *Enviado automaticamente pelo Hub de NPS*", 
-            "wrap": True, 
-            "spacing": "Large", 
-            "size": "Small", 
-            "isSubtle": True
-        })
-
-        payload_teams = {
-            "type": "message",
-            "attachments": [{
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "contentUrl": None,
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.4",
-                    "body": card_body,
-                    "actions": [
-                        { "type": "Action.OpenUrl", "title": "Ver Painel Geral", "url": url_painel },
-                        { "type": "Action.OpenUrl", "title": "Ver Resposta Específica", "url": url_resposta }
-                    ]
-                }
-            }]
-        }
-
-        resposta = requests.post(webhook_url, json=payload_teams, headers={"Content-Type": "application/json"})
-        
-        if resposta.status_code in (200, 201, 202):
-            print(f"📣 Alerta Teams enviado com sucesso para {nome}!")
-        else:
-            print(f"❌ Falha ao enviar para o Teams. HTTP {resposta.status_code}: {resposta.text}")
-
-    except Exception as e:
-        print(f"❌ Erro interno ao enviar alerta do Teams: {e}")
