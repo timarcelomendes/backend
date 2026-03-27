@@ -33,7 +33,7 @@ from database import get_engine, exec_sql
 from services.auth_utils import hash_password
 from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
-from services.teams_svc import enviar_resumo_matinal_gestores  # 👈 Importação da nova função
+from services.teams_svc import enviar_resumo_matinal_gestores 
 
 # ==========================================
 # ⚙️ 1. CONFIGURAÇÕES E SEGURANÇA
@@ -50,10 +50,22 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 # ==========================================
 # ⏰ 2. LIFESPAN E SCHEDULERS
 # ==========================================
+# 👈 1. O scheduler passa a ser GLOBAL (coloque fora/antes da função lifespan)
+scheduler = BackgroundScheduler()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler = BackgroundScheduler()
-    
+    # 2. Ao iniciar o servidor, vai buscar o horário guardado no banco
+    hora_teams, minuto_teams = 8, 0 # Padrão
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_horario_resumo'")).scalar()
+            if res and ":" in res:
+                hora_teams, minuto_teams = map(int, res.split(":"))
+    except Exception as e:
+        print(f"⚠️ Aviso ao ler horário do Teams (usando padrão 08:00): {e}")
+
     # Job 1: Robô de Disparo de NPS a cada 6 horas
     scheduler.add_job(
         processar_disparos_nps, 
@@ -62,11 +74,11 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
     
-    # Job 2: Robô de Alertas do Teams (Segunda a Sexta às 08h00)
+    # Job 2: Robô de Alertas do Teams (Agora usa as variáveis dinâmicas)
     scheduler.add_job(
         enviar_resumo_matinal_gestores, 
-        CronTrigger(day_of_week='mon-fri', hour=8, minute=0), 
-        id="alerta_matinal_teams_job", 
+        CronTrigger(day_of_week='mon-fri', hour=hora_teams, minute=minuto_teams), 
+        id="alerta_matinal_teams_job", # 👈 ID correto que você já usava
         replace_existing=True
     )
     
@@ -286,6 +298,7 @@ class RegrasNegocioConfig(BaseModel):
     email_agradecimento_detrator: Optional[str] = ""
     lembrete_dias: int = 3
     email_template_lembrete: Optional[str] = ""
+    teams_horario_resumo: str = "08:00"
 
 class TesteTemplatePayload(BaseModel):
     email_destino: str
@@ -388,7 +401,7 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'lembrete_dias', 'email_template_lembrete')")
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'teams_horario_resumo', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'lembrete_dias', 'email_template_lembrete')")
             resultados = conn.execute(query).fetchall()
             
             # Valores padrão de segurança
@@ -404,15 +417,16 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
                 "email_agradecimento_neutro": "",
                 "email_agradecimento_detrator": "",
                 "lembrete_dias": 3,
-                "email_template_lembrete": ""
+                "email_template_lembrete": "",
+                "teams_horario_resumo": "08:00",
                 
             }
             
             for linha in resultados:
                 if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'lembrete_dias']:
                     config[linha.chave] = int(linha.valor) if linha.valor else config[linha.chave]
-                elif linha.chave == 'scheduler_hora_inicio':
-                    config[linha.chave] = linha.valor if linha.valor else "09:00"
+                elif linha.chave in ['scheduler_hora_inicio', 'teams_horario_resumo']:
+                    config[linha.chave] = linha.valor if linha.valor else config[linha.chave]
                 else:
                     config[linha.chave] = linha.valor
                     
@@ -432,10 +446,20 @@ def salvar_regras_negocio(payload: RegrasNegocioConfig, usuario_email: str = Dep
                     INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, SYSUTCDATETIME())
             """)
             
-            # Grava cada chave individualmente no banco
             dados_para_gravar = payload.dict()
             for chave, valor in dados_para_gravar.items():
                 conn.execute(sql_upsert, {"chave": chave, "valor": str(valor)})
+        
+        if payload.teams_horario_resumo and ":" in payload.teams_horario_resumo:
+            h, m = map(int, payload.teams_horario_resumo.split(":"))
+            try:
+                scheduler.reschedule_job(
+                    'alerta_matinal_teams_job', 
+                    trigger=CronTrigger(day_of_week='mon-fri', hour=h, minute=m)
+                )
+                print(f"⏰ Horário do Teams reprogramado em tempo real para as {h}:{m}!")
+            except Exception as e:
+                print(f"Aviso: Não foi possível reagendar em memória: {e}")
                 
         return {"status": "success", "message": "Regras de negócio atualizadas com sucesso!"}
     except Exception as e:
@@ -455,7 +479,6 @@ def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Dep
         if not payload.html_content:
             raise HTTPException(status_code=400, detail="A caixa de texto do HTML está vazia.")
 
-        # Escolher o assunto e injetar dados dependendo do tipo de e-mail
         if payload.categoria == 'convite':
             assunto_teste = "[Gauge Teste] Preview do Convite NPS"
             html_pronto = payload.html_content.replace("{nome}", "Maria (Teste)") \
@@ -475,10 +498,9 @@ def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Dep
                                               .replace("{expectativas}", exp_teste) \
                                               .replace("{o_que_faltava}", falta_teste)
 
-        # Montar a mensagem do Microsoft Graph
         msg_payload = {
             "message": {
-                "subject": assunto_teste, # 👈 USA O ASSUNTO DINÂMICO
+                "subject": assunto_teste, 
                 "body": {"contentType": "HTML", "content": html_pronto},
                 "toRecipients": [{"emailAddress": {"address": payload.email_destino}}]
             },
@@ -648,8 +670,8 @@ def registrar_usuario(requisicao: RegistroRequest):
     return {"mensagem": "Conta criada com sucesso e aguarda aprovação do administrador!"}
 
 
-@app.post("/api/reset-password") # Ou apenas "/reset-password" como ajustámos no frontend
-async def resetar_senha(req: ResetPasswordRequest):
+@app.post("/api/reset-password")
+async def resetar_senha(req: ResetPasswordRequest, background_tasks: BackgroundTasks):
     from database import get_engine 
     engine = get_engine()
     
@@ -680,6 +702,10 @@ async def resetar_senha(req: ResetPasswordRequest):
             if resultado.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
             
+        # 🚀 DISPARA O E-MAIL DE CONFIRMAÇÃO EM SEGUNDO PLANO
+        from services.email_svc import enviar_email_senha_alterada
+        background_tasks.add_task(enviar_email_senha_alterada, email_usuario)
+            
         return {"status": "success", "message": "Palavra-passe alterada com sucesso!"}
             
     except HTTPException:
@@ -691,27 +717,40 @@ async def resetar_senha(req: ResetPasswordRequest):
 @app.post("/api/esqueci-senha")
 async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_tasks: BackgroundTasks):
     engine = get_engine()
+    
+    # 1. BLINDAGEM PYTHON: Remove espaços no início/fim e força tudo para minúsculas
+    email_limpo = requisicao.email.strip().lower()
+    
     try:
         with engine.connect() as conn:
-            query = text("SELECT email FROM dbo.nps_usuarios WHERE email = :email")
-            resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
+            # 2. BLINDAGEM SQL: LTRIM e RTRIM removem espaços no banco, LOWER iguala as letras
+            query = text("""
+                SELECT email 
+                FROM dbo.nps_usuarios 
+                WHERE LOWER(LTRIM(RTRIM(email))) = :email
+            """)
+            
+            # Passamos o email_limpo para a query
+            resultado = conn.execute(query, {"email": email_limpo}).mappings().first()
             
             if not resultado:
-                print(f"ℹ️ Recuperação solicitada para e-mail inexistente: {requisicao.email}")
+                print(f"ℹ️ Recuperação solicitada para e-mail inexistente: '{email_limpo}'")
                 return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
+
+            # Usamos o e-mail exato devolvido pelo banco para garantir consistência
+            email_banco = resultado['email']
 
             expira = datetime.utcnow() + timedelta(minutes=30)
             token = jwt.encode(
-                {"sub": resultado['email'], "exp": expira, "tipo": "reset"}, 
+                {"sub": email_banco, "exp": expira, "tipo": "reset"}, 
                 SECRET_KEY, 
                 algorithm=ALGORITHM
             )
             
-            FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-            link = f"{FRONTEND_URL}/reset-password?token={token}"
+            print(f"📧 A disparar e-mail de recuperação para: {email_banco}")
             
-            print(f"📧 A disparar e-mail de recuperação para: {resultado['email']}")
-            background_tasks.add_task(enviar_email_recuperacao, resultado['email'], link)
+            # 3. Integração com o novo email_svc.py premium (que agora recebe o token)
+            background_tasks.add_task(enviar_email_recuperacao, email_banco, token)
                 
         return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
     
@@ -1697,7 +1736,6 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
     def salvar(item: schema): # type: ignore  
         with get_engine().begin() as conn:
             if table_name == 'dbo.nps_gestores': 
-                # 👇 ATUALIZADO: Inclui teams_webhook no INSERT
                 conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email, teams_webhook) VALUES (:n, :p, :e, :t)"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 
@@ -1714,7 +1752,6 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
             nome_antigo = conn.execute(text(f"SELECT nome FROM {table_name} WHERE id=:id"), {"id": item_id}).scalar()
             
             if table_name == 'dbo.nps_gestores': 
-                # 👇 ATUALIZADO: Inclui teams_webhook no UPDATE
                 conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e, teams_webhook=:t WHERE id=:id"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 

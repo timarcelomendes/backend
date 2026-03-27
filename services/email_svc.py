@@ -82,44 +82,160 @@ def get_valid_access_token():
         return None
     return gerar_access_token(config)
 
-def enviar_email_recuperacao(email_destino, link_recuperacao):
-    """Fluxo principal de disparo usando as configs do banco."""
-    config = obter_configuracoes_email()
-    
-    if not config or not config['refresh_token']:
-        print("⚠️ E-mail não configurado ou não autorizado na aba Configurações.")
-        return False
+import os  # <-- Certifique-se de que tem este import no topo do seu ficheiro email_svc.py
 
-    # 1. Obtém token novo
-    access_token = gerar_access_token(config)
+def enviar_email_recuperacao(email_destino, token):
+    """Envia o e-mail com o link de recuperação de palavra-passe com design premium."""
+    
+    # 1. Obtém o token válido da Graph API
+    access_token = get_valid_access_token()
     
     if not access_token:
-        print("❌ Falha crítica: Não foi possível obter Access Token.")
+        print("❌ Falha crítica: Não foi possível obter Access Token para recuperação de senha.")
         return False
 
-    # 2. Envia via Microsoft Graph 
-    # Usar /me/sendMail é mais seguro do que passar o e-mail na URL
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
     
+    # 🔗 LINK INTELIGENTE (Localhost vs Nuvem)
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    
+    # Limpa uma eventual barra no final do link para evitar erros como "com//redefinir"
+    frontend_url = frontend_url.rstrip('/') 
+    
+    link_recuperacao = f"{frontend_url}/redefinir-senha?token={token}"
+    
+    # 2. Monta o corpo do e-mail de recuperação (Design Premium)
     payload = {
         "message": {
-            "subject": "Recuperação de Senha - NPS Intelligence",
+            "subject": "Recuperação de Palavra-passe - NPS Intelligence",
             "body": {
                 "contentType": "HTML",
                 "content": f"""
-                <div style="font-family: sans-serif; color: #334155; max-width: 500px; padding: 20px; border: 1px solid #e2e8f0; border-radius: 20px;">
-                    <h2 style="color: #f97316;">Olá!</h2>
-                    <p>Recebemos uma solicitação para redefinir a sua senha no <b>NPS Intelligence</b>.</p>
-                    <p>Clique no botão abaixo para prosseguir. Este link é válido por 30 minutos.</p>
-                    <div style="margin: 30px 0; text-align: center;">
-                        <a href="{link_recuperacao}" 
-                           style="background-color: #1e293b; color: white; padding: 14px 30px; text-decoration: none; border-radius: 12px; font-weight: bold; display: inline-block; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                           Redefinir Minha Senha
-                        </a>
+                <!DOCTYPE html>
+                <html>
+                <body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
+                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f8fafc; padding: 40px 20px;">
+                        <tr>
+                            <td align="center">
+                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 20px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; overflow: hidden;">
+                                    
+                                    <tr>
+                                        <td align="center" style="padding: 40px 20px 20px 20px;">
+                                            <span style="font-size: 28px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
+                                                NPS <span style="color: #f97316;">Intelligence</span>
+                                            </span>
+                                        </td>
+                                    </tr>
+                                    
+                                    <tr>
+                                        <td style="padding: 0 40px 30px 40px; text-align: left;">
+                                            <h2 style="color: #0f172a; font-size: 20px; margin-bottom: 15px; font-weight: 800; letter-spacing: -0.5px;">Recuperação de Acesso</h2>
+                                            
+                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin-bottom: 25px;">
+                                                Recebemos um pedido para repor a palavra-passe associada à sua conta corporativa. Clique no botão abaixo para criar uma nova palavra-passe de acesso à plataforma.
+                                            </p>
+                                            
+                                            <table width="100%" cellpadding="0" cellspacing="0">
+                                                <tr>
+                                                    <td align="center" style="padding: 10px 0 30px 0;">
+                                                        <a href="{link_recuperacao}" target="_blank" style="display: inline-block; background-color: #f97316; background-image: linear-gradient(to right, #f97316, #e11d48); color: #ffffff; font-size: 14px; font-weight: bold; text-decoration: none; padding: 16px 32px; border-radius: 12px; text-transform: uppercase; letter-spacing: 2px;">
+                                                            Criar Nova Palavra-passe
+                                                        </a>
+                                                    </td>
+                                                </tr>
+                                            </table>
+                                            
+                                            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin-bottom: 0;">
+                                                <strong>Atenção:</strong> Este link é válido apenas por <strong>1 hora</strong>. Se o prazo expirar, terá de solicitar um novo link de recuperação.
+                                            </p>
+                                        </td>
+                                    </tr>
+                                    
+                                    <tr>
+                                        <td style="background-color: #f1f5f9; padding: 25px 40px; border-top: 1px solid #e2e8f0;">
+                                            <p style="margin: 0; color: #64748b; font-size: 12px; line-height: 1.5; text-align: center;">
+                                                Se não pediu a reposição da palavra-passe, pode ignorar este e-mail com segurança. A sua conta continuará protegida.
+                                            </p>
+                                        </td>
+                                    </tr>
+                                </table>
+                                
+                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px;">
+                                    <tr>
+                                        <td align="center" style="padding: 20px 0;">
+                                            <p style="margin: 0; color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 3px; font-weight: 800;">
+                                                NPS Intelligence © 2026
+                                            </p>
+                                        </td>
+                                    </tr>
+                                </table>
+                                
+                            </td>
+                        </tr>
+                    </table>
+                </body>
+                </html>
+                """
+            },
+            "toRecipients": [{"emailAddress": {"address": email_destino}}]
+        },
+        "saveToSentItems": "true"
+    }
+
+    headers = {
+        'Authorization': f'Bearer {access_token}', 
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        import requests
+        response = requests.post(url_send, json=payload, headers=headers)
+        if response.status_code == 202:
+            print(f"✅ E-mail de recuperação enviado para {email_destino}")
+            return True
+        else:
+            print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Falha no disparo de recuperação: {e}")
+        return False
+    
+def enviar_email_senha_alterada(email_destino):
+    """Envia um e-mail confirmando que a senha foi alterada com sucesso."""
+    # 1. Obtém o token válido
+    access_token = get_valid_access_token()
+    
+    if not access_token:
+        print("❌ Falha crítica: Não foi possível obter Access Token para confirmação de senha.")
+        return False
+
+    url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
+    
+    # 2. Monta o corpo do e-mail de segurança
+    payload = {
+        "message": {
+            "subject": "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence",
+            "body": {
+                "contentType": "HTML",
+                "content": f"""
+                <div style="font-family: sans-serif; color: #334155; max-width: 500px; padding: 25px; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
+                    <div style="text-align: center; margin-bottom: 20px;">
+                        <span style="font-size: 24px; font-weight: 900; color: #0f172a; font-style: italic;">NPS <span style="color: #f97316;">Intelligence</span></span>
                     </div>
-                    <p style="font-size: 11px; color: #94a3b8; line-height: 1.5;">
-                        Se não solicitou esta alteração, pode ignorar este e-mail em segurança. <br>
-                        Este é um e-mail automático, por favor não responda.
+                    <h2 style="color: #10b981; margin-top: 0;">Senha Alterada com Sucesso</h2>
+                    <p>Olá,</p>
+                    <p>Confirmamos que a senha da sua conta foi alterada recentemente.</p>
+                    <p>Se foi você quem fez esta alteração, não é necessária nenhuma ação adicional. Pode aceder à plataforma normalmente.</p>
+                    <div style="margin: 30px 0; padding: 15px; background-color: #fef2f2; border-left: 4px solid #ef4444; border-radius: 4px;">
+                        <p style="margin: 0; color: #991b1b; font-size: 14px;">
+                            <strong>Não foi você?</strong><br>
+                            Se não solicitou esta alteração, contacte imediatamente o administrador do sistema para proteger o seu acesso.
+                        </p>
+                    </div>
+                    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;">
+                    <p style="font-size: 11px; color: #94a3b8; line-height: 1.5; text-align: center;">
+                        Este é um e-mail automático de segurança, por favor não responda. <br>
+                        NPS Intelligence Hub © 2026
                     </p>
                 </div>
                 """
@@ -135,17 +251,16 @@ def enviar_email_recuperacao(email_destino, link_recuperacao):
     }
 
     try:
+        import requests
         response = requests.post(url_send, json=payload, headers=headers)
         if response.status_code == 202:
-            print(f"✅ E-mail enviado para {email_destino}")
+            print(f"✅ E-mail de confirmação de alteração de senha enviado para {email_destino}")
             return True
         else:
-            # 🟢 ISTO É O QUE VAI SALVAR O SEU DIAGNÓSTICO:
-            erro_json = response.json() if response.text else "Sem corpo de resposta"
-            print(f"❌ Erro Graph API ({response.status_code}): {erro_json}")
+            print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
             return False
     except Exception as e:
-        print(f"❌ Falha no disparo: {e}")
+        print(f"❌ Falha no disparo de confirmação de senha: {e}")
         return False
     
 def enviar_email_teste(email_destino):

@@ -120,15 +120,19 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
     except Exception as e:
         print(f"❌ Erro interno ao enviar alerta do Teams: {e}")
 
-# ==========================================
-# ⏰ 2. RESUMO MATINAL DOS GESTORES (CRON)
-# ==========================================
+import os
+import requests
+from datetime import datetime, date
+
 def enviar_resumo_matinal_gestores():
     """
     Função que varre os tickets pendentes e envia um resumo diário para o webhook privado de cada gestor.
     """
     try:
+        from database import get_engine
+        from sqlalchemy import text
         engine = get_engine()
+        
         with engine.begin() as conn:
             # Procura todos os gestores que têm um webhook configurado
             query_gestores = text("""
@@ -141,7 +145,7 @@ def enviar_resumo_matinal_gestores():
             for gestor in gestores:
                 # Busca os tickets pendentes/atrasados deste gestor
                 query_tickets = text("""
-                    SELECT id, empresa_nome, titulo, prioridade, prazo_limite
+                    SELECT id, descricao, prioridade, prazo_limite
                     FROM dbo.nps_acoes
                     WHERE gestor_id = :gid AND status != 'Concluído'
                     ORDER BY prazo_limite ASC
@@ -151,25 +155,39 @@ def enviar_resumo_matinal_gestores():
                 if not tickets:
                     continue # Sem pendências, sem spam!
 
-                atrasados = [t for t in tickets if t.prazo_limite and t.prazo_limite < datetime.now()]
-                
-                # Monta o Cartão Adaptativo do Teams
+                atrasados_count = 0
                 fatos_lista = []
+                
+                # Data de hoje para comparação segura (ignora horas)
+                hoje = date.today()
+
                 for t in tickets[:5]: # Mostra os 5 mais urgentes
-                    status_prazo = "🔴 ATRASADO" if t in atrasados else "🟡 Pendente"
+                    # BLINDAGEM 1: Comparação de datas à prova de crash
+                    atrasado = False
+                    if t.prazo_limite:
+                        try:
+                            prazo = t.prazo_limite.date() if isinstance(t.prazo_limite, datetime) else t.prazo_limite
+                            if prazo < hoje:
+                                atrasado = True
+                                atrasados_count += 1
+                        except:
+                            pass
+
+                    status_prazo = "🔴 ATRASADO" if atrasado else "🟡 Pendente"
+                    
+                    # Corta a descrição para não estragar o layout do cartão se for muito grande
+                    desc_curta = (t.descricao[:30] + '...') if t.descricao and len(t.descricao) > 30 else (t.descricao or 'Ação sem descrição')
+                    
                     fatos_lista.append({
-                        "title": f"#{str(t.id).zfill(3)} - {t.empresa_nome}",
+                        "title": f"#{str(t.id).zfill(3)} - {desc_curta}",
                         "value": f"{t.prioridade} | {status_prazo}"
                     })
 
-                if len(tickets) > 5:
-                    fatos_lista.append({"title": "...", "value": f"+ {len(tickets) - 5} outros tickets a aguardar ação."})
-
                 # A URL que aponta para o seu Frontend na aba de Planos de Ação
-                from os import getenv
-                frontend_url = getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
+                frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/')
                 url_kanban = f"{frontend_url}/acoes"
 
+                # BLINDAGEM 2: Adaptive Card na versão correta para o Teams (1.2)
                 payload = {
                     "type": "message",
                     "attachments": [{
@@ -177,7 +195,7 @@ def enviar_resumo_matinal_gestores():
                         "content": {
                             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                             "type": "AdaptiveCard",
-                            "version": "1.4",
+                            "version": "1.2", # 👈 Muito importante para o Teams!
                             "body": [
                                 {
                                     "type": "TextBlock",
@@ -188,7 +206,7 @@ def enviar_resumo_matinal_gestores():
                                 },
                                 {
                                     "type": "TextBlock",
-                                    "text": f"Tem **{len(tickets)} ações pendentes** no Kanban de NPS ({len(atrasados)} atrasadas).",
+                                    "text": f"Tem **{len(tickets)} ações pendentes** no Kanban de NPS.",
                                     "wrap": True
                                 },
                                 {
@@ -207,9 +225,21 @@ def enviar_resumo_matinal_gestores():
                     }]
                 }
 
-                # Dispara o Webhook do Gestor
-                requests.post(gestor.teams_webhook, json=payload, headers={"Content-Type": "application/json"})
-                print(f"✅ Resumo matinal do Teams enviado para o gestor: {gestor.nome}")
+                # BLINDAGEM 3: Captura exata do erro retornado pelo Teams
+                resposta = requests.post(
+                    gestor.teams_webhook, 
+                    json=payload, 
+                    headers={"Content-Type": "application/json"},
+                    timeout=10
+                )
+                
+                if resposta.status_code in (200, 201, 202):
+                    print(f"✅ Resumo matinal do Teams enviado para: {gestor.nome}")
+                else:
+                    # Agora sim, se o Teams recusar, o console vai "gritar" o motivo!
+                    print(f"❌ Erro Teams ({resposta.status_code}) para {gestor.nome}: {resposta.text}")
 
     except Exception as e:
-        print(f"❌ Erro ao enviar resumos do Teams: {e}")
+        import traceback
+        print(f"❌ Erro CRÍTICO ao enviar resumos do Teams:")
+        traceback.print_exc()
