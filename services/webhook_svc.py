@@ -1,20 +1,24 @@
 import traceback
-
-# Importa a lógica pesada de processamento
 from services.respostas_svc import processar_webhook_fillout
-
-# Importa a nossa nova função de alerta crítico
 from services.teams_svc import enviar_alerta_tecnico_teams
 
-def processar_webhook_background(payload: dict):
+def processar_webhook_background(evento: dict):
     """
-    Processa o payload do webhook em segundo plano.
+    Processa o evento completo do webhook em segundo plano.
     """
     try:
-        print("⏳ [Webhook SVC] A iniciar processamento em background do Fillout...")
+        print("⏳ [Webhook SVC] A iniciar processamento em background...")
         
-        # Executa a regra de negócio pesada
-        processar_webhook_fillout(payload)
+        # 1. Extrai o payload real de dentro do "evento" que o main.py montou
+        payload_real = evento.get("payload")
+        
+        if not payload_real:
+            print("⚠️ [Webhook SVC] O webhook chegou sem payload (corpo vazio). Ignorando.")
+            return
+            
+        # 2. Executa a regra de negócio pesada (Inserção no banco, etc.)
+        # Passamos apenas o payload_real para a função que já estava feita
+        processar_webhook_fillout(payload_real)
         
         print("✅ [Webhook SVC] Sucesso: Webhook processado e salvo no banco.")
         
@@ -22,11 +26,8 @@ def processar_webhook_background(payload: dict):
         err_msg = str(e)
         err_trace = traceback.format_exc()
         
-        print(f"❌ [Webhook SVC] ERRO GRAVE NO BACKGROUND DO WEBHOOK: {err_msg}")
+        print(f"❌ [Webhook SVC] ERRO GRAVE: {err_msg}")
         print(err_trace)
         
-        # Formata a mensagem de erro para o Teams
-        alerta = f"**Falha no Processamento do Webhook (Fillout)**\n\n**Erro:** {err_msg}\n\nVerifique os logs da Azure (Application Insights) para ver o Traceback completo."
-        
-        # Dispara o alerta para a equipa técnica
+        alerta = f"**Falha no Processamento do Webhook**\n\n**Erro:** {err_msg}\n\nVerifique os logs da Azure para ver o Traceback."
         enviar_alerta_tecnico_teams(alerta)
