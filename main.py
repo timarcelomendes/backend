@@ -1360,7 +1360,6 @@ def get_dashboard_detalhes(
             filtros_sql_puro = []
             params = {}
 
-            # 👇 CORREÇÃO: Usar as variáveis corretas para esta rota (filtros_sql_c e params)
             if companhia and companhia != "Todas as Companhias":
                 filtros_sql_c.append("""
                     COALESCE(r.empresa, c.empresa) IN (
@@ -1370,7 +1369,6 @@ def get_dashboard_detalhes(
                         WHERE comp.nome = :companhia
                     )
                 """)
-                # 👇 CORREÇÃO: Adicionado o filtro puro para o cálculo de taxa de resposta (que não tem r.empresa)
                 filtros_sql_puro.append("""
                     empresa IN (
                         SELECT e.nome 
@@ -1411,6 +1409,14 @@ def get_dashboard_detalhes(
                     {coluna_nome} as nome,
                     MAX(e.gestor) as gestor, 
                     COUNT(r.resposta_id) as total,
+                    MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
+                    
+                    -- 👇 BUSCA O ID DA AÇÃO MAIS RECENTE VINCULADA À RESPOSTA
+                    (SELECT TOP 1 a.id 
+                     FROM dbo.nps_acoes a 
+                     WHERE a.resposta_id = MAX(r.resposta_id) 
+                     ORDER BY a.created_at DESC) as acao_id,
+
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
                         (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
@@ -1420,7 +1426,7 @@ def get_dashboard_detalhes(
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome 
                 {str_filtro_c}
                 GROUP BY {coluna_nome}
-                ORDER BY nps DESC;
+                ORDER BY nps ASC, data_ultima_resposta ASC;
             """)
             
             ranking_raw = conn.execute(sql_ranking, params).mappings().all()
