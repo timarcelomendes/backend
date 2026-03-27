@@ -243,3 +243,82 @@ def enviar_resumo_matinal_gestores():
         import traceback
         print(f"❌ Erro CRÍTICO ao enviar resumos do Teams:")
         traceback.print_exc()
+
+def enviar_alerta_tecnico_teams(mensagem_erro: str):
+    """
+    Envia um alerta crítico de sistema para o canal de TI/DevOps no Teams,
+    buscando a URL do webhook dinamicamente na tabela de configurações.
+    """
+    import requests
+    from datetime import datetime
+    from sqlalchemy import text
+    from database import get_engine
+    
+    webhook_url = None
+    
+    # 1. Busca a URL do Webhook na tabela de configurações
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_alerts_webhook'")
+            webhook_url = conn.execute(query).scalar()
+    except Exception as db_err:
+        print(f"❌ Erro ao buscar 'teams_alerts_webhook' no banco de dados: {db_err}")
+        return
+        
+    if not webhook_url:
+        print("⚠️ A chave 'teams_alerts_webhook' não está configurada na tabela nps_configuracoes. Alerta técnico cancelado.")
+        return
+
+    # 2. Monta e envia o payload para o Teams
+    try:
+        data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        
+        payload = {
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.2",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": "🚨 ALERTA CRÍTICO - NPS INTELLIGENCE",
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "color": "Attention" # Deixa o texto vermelho
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": f"**Data/Hora:** {data_hora}",
+                            "wrap": True,
+                            "size": "Small",
+                            "isSubtle": True
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": mensagem_erro,
+                            "wrap": True,
+                            "spacing": "Medium"
+                        }
+                    ]
+                }
+            }]
+        }
+
+        resposta = requests.post(
+            webhook_url, 
+            json=payload, 
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if resposta.status_code not in (200, 201, 202):
+            print(f"❌ Falha ao disparar alerta técnico no Teams: HTTP {resposta.status_code} - {resposta.text}")
+        else:
+            print("📨 [Teams SVC] Alerta técnico enviado com sucesso para a equipa.")
+            
+    except Exception as e:
+        print(f"❌ Erro interno ao tentar enviar alerta técnico para o Teams: {e}")

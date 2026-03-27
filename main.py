@@ -14,7 +14,7 @@ import pandas as pd
 import bcrypt
 import requests
 import openai
-from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request
+from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
@@ -34,6 +34,7 @@ from services.auth_utils import hash_password
 from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
 from services.teams_svc import enviar_resumo_matinal_gestores 
+from services.webhook_svc import processar_webhook_background
 
 # ==========================================
 # ⚙️ 1. CONFIGURAÇÕES E SEGURANÇA
@@ -275,15 +276,9 @@ class EmpresaPayload(BaseModel):
     gestor: Optional[str] = None
     gestor_id: Optional[int] = None
 
-class WebhookN8nPayload(BaseModel):
-    resposta_id: str
-    nota: int
-    empresa_id: Optional[Any] = 0 
-    empresa_nome: Optional[str] = ""
-    motivo: Optional[str] = ""
-
-class IntegracoesConfig(BaseModel):
-    teams_webhook_url: Optional[str] = ""
+class IntegracoesUpdate(BaseModel):
+    webhook_global: Optional[str] = None
+    webhook_tecnico: Optional[str] = None
 
 class RegrasNegocioConfig(BaseModel):
     scheduler_hora_inicio: str = "09:00"
@@ -311,90 +306,95 @@ class TesteWebhookPayload(BaseModel):
 # ==========================================
 # 🤖 WEBHOOKS (Integrações Externas / n8n)
 # ==========================================
-@app.post("/api/webhook/n8n/gatilho-acao")
-def n8n_gatilho_acao(payload: WebhookN8nPayload):
-    try:
-        from services import respostas_svc
-        respostas_svc.processar_acao_automatica(
-            resposta_id=payload.resposta_id,
-            nota=payload.nota,
-            empresa_id=payload.empresa_id,
-            empresa_nome=payload.empresa_nome, # 👈 PASSA O NOME AQUI
-            motivo=payload.motivo
-        )
-        return {"status": "success"}
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-    
-from fastapi import Request, Response
 
 @app.api_route("/api/webhooks/fillout", methods=["POST", "GET", "OPTIONS"])
-async def webhook_receber_fillout(request: Request):
-    """Rota oficial (à prova de bala) para receber webhooks do Fillout"""
+async def webhook_receber_fillout(request: Request, background_tasks: BackgroundTasks):
+    """Rota Enterprise Assíncrona para Webhooks"""
     
+    # 1. Handshake / Preflight de CORS (Para serviços externos)
     if request.method == "OPTIONS":
         return Response(status_code=200)
         
+    # 2. Healthcheck (Para validar pelo navegador se a rota existe)
     if request.method == "GET":
-        return {"status": "success", "message": "🟢 O Webhook está online e pronto para receber dados!"}
+        return {"status": "success", "message": "🟢 Recebedor de Webhooks Online."}
         
     try:
+        # 3. Lê os dados brutos assincronamente (rápido)
         payload = await request.json()
+        print(f"📥 WEBHOOK RECEBIDO! Tamanho: {len(str(payload))} bytes")
         
-        from services.respostas_svc import processar_webhook_fillout
-        resultado = processar_webhook_fillout(payload)
+        # 4. Delega o processamento pesado para o SVC em segundo plano
+        background_tasks.add_task(processar_webhook_background, payload)
         
-        return resultado
+        # 5. Liberta o Fillout imediatamente (Devolve HTTP 200/202 na hora)
+        return {"status": "accepted", "message": "Webhook recebido e na fila de processamento"}
         
     except Exception as e:
-        print(f"❌ Erro crítico no webhook do fillout: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"status": "error", "message": "Erro processado internamente"}
+        # Se falhar aqui, o JSON enviado não era válido (muito raro)
+        print(f"❌ Erro Crítico no Parser do Webhook: {e}")
+        return {"status": "error", "message": "Falha na leitura do payload"}
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
 # ==========================================
 
-@app.get("/api/config/integracoes")
-def obter_configuracoes_integracoes(usuario_email: str = Depends(get_current_user)):
+@app.get("/api/configuracoes/integracoes")
+def get_integracoes(usuario_email: str = Depends(get_current_user)):
+    """Busca as configurações atuais de integração (Protegido)"""
     try:
+        from database import get_engine
+        from sqlalchemy import text
+        
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
-            resultado = conn.execute(query).scalar()
-            return {"teams_webhook_url": resultado or ""}
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('teams_webhook_url', 'teams_alerts_webhook')")
+            rows = conn.execute(query).fetchall()
+            
+            config = {row.chave: row.valor for row in rows}
+            
+            return {
+                "webhook_global": config.get("teams_webhook_url", ""),
+                "webhook_tecnico": config.get("teams_alerts_webhook", "")
+            }
     except Exception as e:
-        print(f"❌ Erro ao obter integrações: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao carregar integrações.")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Erro ao carregar integrações")
 
-@app.post("/api/config/integracoes")
-def salvar_configuracoes_integracoes(payload: IntegracoesConfig, usuario_email: str = Depends(get_current_user)):
+@app.put("/api/configuracoes/integracoes")
+def update_integracoes(config: IntegracoesUpdate, usuario_email: str = Depends(get_current_user)):
+    """Atualiza ou cria as chaves de integração no banco (Protegido)"""
     try:
+        from database import get_engine
+        from sqlalchemy import text
+        
         engine = get_engine()
         with engine.begin() as conn:
-            # Usa a lógica de UPSERT (Se a chave existir atualiza, senão insere)
-            sql = text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url')
-                BEGIN
+            # Lógica de Upsert otimizada (incluindo o updated_at da sua rota antiga)
+            sql_upsert = text("""
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
                     UPDATE dbo.nps_configuracoes 
-                    SET valor = :valor, updated_at = SYSUTCDATETIME() 
-                    WHERE chave = 'teams_webhook_url'
-                END
+                    SET valor = :valor, updated_at = CURRENT_TIMESTAMP 
+                    WHERE chave = :chave
                 ELSE
-                BEGIN
                     INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) 
-                    VALUES ('teams_webhook_url', :valor, SYSUTCDATETIME())
-                END
+                    VALUES (:chave, :valor, CURRENT_TIMESTAMP)
             """)
-            conn.execute(sql, {"valor": payload.teams_webhook_url})
             
+            # Grava o Webhook Global
+            if config.webhook_global is not None:
+                conn.execute(sql_upsert, {"chave": "teams_webhook_url", "valor": config.webhook_global})
+            
+            # Grava o Webhook Técnico
+            if config.webhook_tecnico is not None:
+                conn.execute(sql_upsert, {"chave": "teams_alerts_webhook", "valor": config.webhook_tecnico})
+                
         return {"status": "success", "message": "Integrações atualizadas com sucesso!"}
     except Exception as e:
-        print(f"❌ Erro ao salvar integrações: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao guardar configurações de integração.")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Erro ao gravar integrações")
     
 @app.get("/api/config/regras")
 def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
