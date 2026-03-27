@@ -307,10 +307,9 @@ class TesteWebhookPayload(BaseModel):
 # 🔗 ROTAS DE INTEGRAÇÕES (WEBHOOKS)
 # ==========================================
 
-# 👇 Empilhar decoradores garante que a Azure compreende as permissões
-@app.post("/api/webhooks/fillout")
-@app.get("/api/webhooks/fillout")
-@app.options("/api/webhooks/fillout")
+# 👇 Registamos as duas variações exatas para enganar o redirecionamento
+@app.api_route("/api/webhooks/fillout", methods=["GET", "POST", "OPTIONS"])
+@app.api_route("/api/webhooks/fillout/", methods=["GET", "POST", "OPTIONS"])
 async def webhook_receber_fillout(request: Request, background_tasks: BackgroundTasks):
     """Rota Enterprise Assíncrona para Webhooks do Fillout"""
     
