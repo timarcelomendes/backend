@@ -16,7 +16,7 @@ import requests
 import openai
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -306,36 +306,58 @@ class TesteWebhookPayload(BaseModel):
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (WEBHOOKS)
 # ==========================================
-
-# 👇 Registamos as duas variações exatas para enganar o redirecionamento
-@app.api_route("/api/webhooks/fillout", methods=["GET", "POST", "OPTIONS"])
-@app.api_route("/api/webhooks/fillout/", methods=["GET", "POST", "OPTIONS"])
+@app.api_route("/api/webhooks/fillout", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+@app.api_route("/api/webhooks/fillout/", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def webhook_receber_fillout(request: Request, background_tasks: BackgroundTasks):
-    """Rota Enterprise Assíncrona para Webhooks do Fillout"""
-    
-    # 1. Handshake / Preflight de CORS
     if request.method == "OPTIONS":
         return Response(status_code=200)
-        
-    # 2. Healthcheck
+
     if request.method == "GET":
-        return {"status": "success", "message": "🟢 Recebedor de Webhooks Online e a aceitar POST."}
-        
+        return {"status": "success", "message": "🟢 Recebedor online."}
+
     try:
-        # 3. Lê os dados brutos assincronamente
-        payload = await request.json()
-        print(f"📥 WEBHOOK RECEBIDO! Tamanho: {len(str(payload))} bytes")
-        
-        # 4. Delega o processamento pesado para o SVC em segundo plano
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type", "")
+        query_params = dict(request.query_params)
+
+        payload = None
+
+        if raw_body:
+            if "application/json" in content_type:
+                payload = await request.json()
+            else:
+                payload = {
+                    "raw_body": raw_body.decode("utf-8", errors="replace"),
+                    "content_type": content_type,
+                }
+
+        evento = {
+            "method": request.method,
+            "headers": dict(request.headers),
+            "query_params": query_params,
+            "payload": payload,
+        }
+
+        print("📥 WEBHOOK RECEBIDO")
+        print(f"Method: {request.method}")
+        print(f"Content-Type: {content_type}")
+        print(f"Query: {query_params}")
+        print(f"Body size: {len(raw_body)}")
+
         from services.webhook_svc import processar_webhook_background
-        background_tasks.add_task(processar_webhook_background, payload)
-        
-        # 5. Liberta o serviço externo imediatamente
-        return {"status": "accepted", "message": "Webhook recebido e na fila de processamento"}
-        
+        background_tasks.add_task(processar_webhook_background, evento)
+
+        return JSONResponse(
+            status_code=200,
+            content={"status": "accepted", "message": "Webhook recebido"}
+        )
+
     except Exception as e:
-        print(f"❌ Erro Crítico no Parser do Webhook: {e}")
-        return {"status": "error", "message": "Falha na leitura do payload"}
+        print(f"❌ Erro crítico no webhook: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": str(e)}
+        )
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
