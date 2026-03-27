@@ -118,35 +118,32 @@ app.add_middleware(
 )
 
 # ==========================================
-# 🥇 1. WEBHOOKS (PRIORIDADE MÁXIMA)
+# 🥇 1. WEBHOOKS (PADRÃO OFICIAL)
 # ==========================================
-# Colocamos isto no topo para evitar que outras rotas "roubem" o pedido (Route Shadowing)
 
-@app.post("/api/webhooks/fillout")
-@app.post("/api/webhooks/fillout/")
-async def webhook_receber_fillout_post(request: Request, background_tasks: BackgroundTasks):
-    """Apenas recebe o POST e devolve sucesso imediato"""
+@app.post("/api/webhook/fillout")
+async def receber_webhook_fillout(request: Request, background_tasks: BackgroundTasks):
+    """Rota POST nativa e simples para receber o Fillout"""
     try:
-        # Lê o pacote json do Fillout
+        # 1. Lê os dados brutos como dicionário
         payload = await request.json()
-        print(f"📥 WEBHOOK POST RECEBIDO: {len(str(payload))} bytes")
         
-        # Manda processar no fundo
+        # 2. Manda para a fila de segundo plano
         from services.webhook_svc import processar_webhook_background
-        background_tasks.add_task(processar_webhook_background, {"payload": payload})
+        background_tasks.add_task(processar_webhook_background, payload)
         
-        # Resposta imediata 200 OK
-        return {"status": "accepted", "message": "Recebido com sucesso"}
+        # 3. Responde HTTP 200 OK na hora
+        return {"status": "success", "message": "Recebido"}
+        
     except Exception as e:
-        print(f"❌ Erro no payload: {e}")
-        return {"status": "error", "message": str(e)}
+        print(f"❌ Erro ao receber webhook: {e}")
+        return {"status": "error", "message": "Falha na leitura"}
 
 
-@app.get("/api/webhooks/fillout")
-@app.get("/api/webhooks/fillout/")
-async def webhook_receber_fillout_get():
-    """Para o botão de teste do seu Frontend (Healthcheck)"""
-    return {"status": "success", "message": "🟢 Webhook Online e a escutar POSTs!"}
+@app.get("/api/webhook/fillout")
+async def status_webhook_fillout():
+    """Healthcheck simples para o botão do Frontend"""
+    return {"status": "success", "message": "🟢 Ouvindo POSTs no novo endereço!"}
 
 # ==========================================
 # 🔐 4. DEPENDÊNCIAS DE AUTENTICAÇÃO
