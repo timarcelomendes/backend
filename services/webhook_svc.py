@@ -4,19 +4,30 @@ from services.teams_svc import enviar_alerta_tecnico_teams
 
 def processar_webhook_background(payload: dict):
     """
-    Processa os dados do Fillout em segundo plano.
+    Processa o payload nativo do webhook em segundo plano.
     """
     try:
-        print("⏳ [Webhook] A processar dados do Fillout...")
+        print("⏳ [Webhook SVC] A iniciar processamento em background...")
         
-        # Chama a função que insere no banco
+        # Como o main.py envia o payload direto, já não precisamos de extrair nada
+        if not payload:
+            print("⚠️ [Webhook SVC] O webhook chegou sem payload (corpo vazio). Ignorando.")
+            return
+            
+        # Executa a regra de negócio pesada (Inserção no banco, etc.)
         processar_webhook_fillout(payload)
         
-        print("✅ [Webhook] Gravado no banco com sucesso.")
+        print("✅ [Webhook SVC] Sucesso: Webhook processado e salvo no banco.")
         
     except Exception as e:
         err_msg = str(e)
-        print(f"❌ [Webhook] ERRO GRAVE: {err_msg}\n{traceback.format_exc()}")
+        err_trace = traceback.format_exc()
         
-        # Alerta a equipa técnica
-        enviar_alerta_tecnico_teams(f"**Falha no Webhook (Fillout)**\n\nErro: {err_msg}")
+        print(f"❌ [Webhook SVC] ERRO GRAVE: {err_msg}")
+        print(err_trace)
+        
+        alerta = f"**Falha no Processamento do Webhook**\n\n**Erro:** {err_msg}\n\nVerifique os logs da Azure para ver o Traceback."
+        try:
+            enviar_alerta_tecnico_teams(alerta)
+        except:
+            pass

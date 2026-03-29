@@ -183,7 +183,6 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             gestor_id_encontrado = None
             emp_id_real = empresa_id
 
-            # CORREÇÃO: Removida a busca pela coluna "companhia" que não existia nesta tabela
             if emp_id_real and emp_id_real > 0:
                 query_dados = text("SELECT gestor_id FROM dbo.nps_empresas WHERE id = :eid")
                 res = conn.execute(query_dados, {"eid": emp_id_real}).fetchone()
@@ -275,9 +274,8 @@ Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não i
                     descricao_txt += f"\n\n❌ [ERRO NA GAUGE AI]: Falha ao comunicar com a OpenAI. Detalhe: {str(e_ai)}"
 
             # ==========================================
-            # 7. Inserir na Tabela do Kanban 
+            # 7. Inserir na Tabela do Kanban (Sem a coluna companhia)
             # ==========================================
-            # CORREÇÃO: Removido o campo "companhia" do INSERT para evitar erros de SQL
             sql_insert = text("""
                 INSERT INTO dbo.nps_acoes 
                 (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
