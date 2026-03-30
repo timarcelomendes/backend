@@ -348,6 +348,10 @@ class TesteTemplatePayload(BaseModel):
 
 class TesteWebhookPayload(BaseModel):
     webhook_url: str
+
+class PermissaoUpdate(BaseModel):
+    perfil: str
+    chaves: List[str]
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -641,23 +645,28 @@ async def login(requisicao: LoginRequest, request: Request):
         conn.commit() 
 
         expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=tempo_minutos)
-        expire = agora_utc + expires_delta
 
+        expire = datetime.utcnow() + timedelta(hours=8)
         to_encode = {
             "sub": resultado["email"],
             "exp": expire,
             "tipo": resultado["tipo"]
         }
-        
         access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+        # 7. Buscar as permissões dinâmicas do banco de dados
+        sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
+        res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
+        
+        lista_permissoes = [row.chave for row in res_perm]
+
+        # 8. Devolver os dados + permissões para o Frontend
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "usuario_id": resultado["usuario_id"],
             "nome": resultado["nome"],
-            "cargo": resultado["cargo"],
-            "tipo": resultado["tipo"]
+            "tipo": resultado["tipo"],
+            "permissoes": lista_permissoes
         }
     
 @app.post("/api/register")
@@ -811,6 +820,53 @@ async def reset_manual_senha(usuario_id: str):
             conn.commit()
         return {"senha_provisoria": senha_provisoria}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 🔐 GESTÃO DE PERMISSÕES (RBAC/PBAC)
+# ==========================================
+
+@app.get("/api/permissoes")
+def listar_permissoes(usuario = Depends(exigir_admin)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            res = conn.execute(text("SELECT perfil, chave FROM dbo.nps_permissoes")).fetchall()
+            
+            # Inicializa a estrutura
+            permissoes = {"Viewer": [], "Manager": []}
+            
+            for row in res:
+                # O Admin não vem do banco porque tem acesso total '*' por defeito
+                if row.perfil in permissoes and row.chave != '*':
+                    permissoes[row.perfil].append(row.chave)
+                    
+        return {"status": "success", "permissoes": permissoes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/permissoes")
+def atualizar_permissoes(payload: List[PermissaoUpdate], usuario = Depends(exigir_admin)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            for item in payload:
+                # Ignoramos o Admin, pois o Admin tem sempre acesso '*' nativamente no código
+                if item.perfil == 'Admin':
+                    continue
+                    
+                # 1. Apaga as permissões antigas do perfil
+                conn.execute(text("DELETE FROM dbo.nps_permissoes WHERE perfil = :p"), {"p": item.perfil})
+                
+                # 2. Insere as novas opções selecionadas
+                if item.chaves and len(item.chaves) > 0:
+                    sql_insert = text("INSERT INTO dbo.nps_permissoes (perfil, chave) VALUES (:p, :c)")
+                    for chave in item.chaves:
+                        conn.execute(sql_insert, {"p": item.perfil, "c": chave})
+                        
+        return {"status": "success", "message": "Matriz de permissões atualizada com sucesso!"}
+    except Exception as e:
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
