@@ -33,7 +33,7 @@ from database import get_engine, exec_sql
 from services.auth_utils import hash_password
 from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
-from services.teams_svc import enviar_resumo_matinal_gestores 
+from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams 
 from services.webhook_svc import processar_webhook_background
 
 # ==========================================
@@ -125,17 +125,14 @@ app.add_middleware(
 async def receber_webhook_fillout(request: Request, background_tasks: BackgroundTasks):
     """Rota POST nativa e simples para receber o Fillout"""
     try:
-        # 1. Lê os dados brutos como dicionário
         payload = await request.json()
-        
-        # 2. Manda para a fila de segundo plano
         from services.webhook_svc import processar_webhook_background
         background_tasks.add_task(processar_webhook_background, payload)
-        
-        # 3. Responde HTTP 200 OK na hora
         return {"status": "success", "message": "Recebido"}
         
     except Exception as e:
+        # 🚨 ALERTA TI: Falha ao receber payload (Erro de conversão JSON ou rede)
+        enviar_alerta_tecnico_teams(f"Falha de Recepção no Webhook (Fillout): {str(e)}")
         print(f"❌ Erro ao receber webhook: {e}")
         return {"status": "error", "message": "Falha na leitura"}
 
@@ -545,129 +542,144 @@ def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Dep
 # ==========================================
 @app.post("/api/login")
 async def login(requisicao: LoginRequest, request: Request):
-    engine = get_engine()
-    with engine.connect() as conn:
-        query = text("""
-            SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
-            FROM dbo.nps_usuarios 
-            WHERE email = :email
-        """)
-        resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("""
+                SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
+                FROM dbo.nps_usuarios 
+                WHERE email = :email
+            """)
+            resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
 
-        if not resultado:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="Este e-mail não está registado na plataforma."
-            )
+            if not resultado:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, 
+                    detail="Este e-mail não está registado na plataforma."
+                )
 
-        ativo_val = str(resultado["ativo"]).strip().lower()
-        if ativo_val not in ['1', 'true']:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, 
-                detail="A sua conta está inativa ou aguarda aprovação do administrador."
-            )
+            ativo_val = str(resultado["ativo"]).strip().lower()
+            if ativo_val not in ['1', 'true']:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, 
+                    detail="A sua conta está inativa ou aguarda aprovação do administrador."
+                )
 
-        try:
-            senha_correta = bcrypt.checkpw(
-                requisicao.password.encode('utf-8'), 
-                resultado["senha_hash"].encode('utf-8')
-            )
-        except Exception as e:
-            print(f"Erro Bcrypt: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                detail="Erro na encriptação. Contacte o suporte técnico."
-            )
+            try:
+                senha_correta = bcrypt.checkpw(
+                    requisicao.password.encode('utf-8'), 
+                    resultado["senha_hash"].encode('utf-8')
+                )
+            except Exception as e:
+                # 🚨 ALERTA TI: Falha no sistema de encriptação
+                enviar_alerta_tecnico_teams(f"Erro Crítico no Bcrypt durante o Login: {str(e)}")
+                print(f"Erro Bcrypt: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                    detail="Erro na encriptação. Contacte o suporte técnico."
+                )
 
-        if not senha_correta:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="A palavra-passe digitada está incorreta."
-            )
+            if not senha_correta:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, 
+                    detail="A palavra-passe digitada está incorreta."
+                )
 
-        user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
-        ip_address = request.client.host if request.client else "IP Desconhecido"
-        
-        tipo_disp = "Desktop/Browser"
-        if any(x in user_agent for x in ["Mobile", "iPhone", "Android"]):
-            tipo_disp = "Mobile"
-        elif "Mac OS" in user_agent:
-            tipo_disp = "Mac/Apple"
-        elif "Windows" in user_agent:
-            tipo_disp = "Windows/PC"
+            user_agent = request.headers.get("user-agent", "Dispositivo Desconhecido")
+            ip_address = request.client.host if request.client else "IP Desconhecido"
             
-        dispositivo_amigavel = f"{tipo_disp} • {user_agent[:30]}..."
+            tipo_disp = "Desktop/Browser"
+            if any(x in user_agent for x in ["Mobile", "iPhone", "Android"]):
+                tipo_disp = "Mobile"
+            elif "Mac OS" in user_agent:
+                tipo_disp = "Mac/Apple"
+            elif "Windows" in user_agent:
+                tipo_disp = "Windows/PC"
+                
+            dispositivo_amigavel = f"{tipo_disp} • {user_agent[:30]}..."
 
-        check_sessao = conn.execute(text("""
-            SELECT id FROM dbo.nps_sessoes_ativas 
-            WHERE usuario_id = :uid AND ip_address = :ip AND dispositivo = :disp AND revogado = 0
-        """), {
-            "uid": resultado["usuario_id"],
-            "ip": ip_address,
-            "disp": dispositivo_amigavel
-        }).fetchone()
-
-        agora_utc = datetime.now(timezone.utc)
-
-        if check_sessao:
-            conn.execute(text("""
-                UPDATE dbo.nps_sessoes_ativas 
-                SET criado_em = :agora 
-                WHERE id = :sid
-            """), {"agora": agora_utc, "sid": check_sessao.id})
-        else:
-            conn.execute(text("""
-                INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
-                VALUES (:uid, :disp, :ip, 'Detetado Automaticamente', :agora, 0)
+            check_sessao = conn.execute(text("""
+                SELECT id FROM dbo.nps_sessoes_ativas 
+                WHERE usuario_id = :uid AND ip_address = :ip AND dispositivo = :disp AND revogado = 0
             """), {
                 "uid": resultado["usuario_id"],
-                "disp": dispositivo_amigavel,
                 "ip": ip_address,
-                "agora": agora_utc
+                "disp": dispositivo_amigavel
+            }).fetchone()
+
+            agora_utc = datetime.now(timezone.utc)
+
+            if check_sessao:
+                conn.execute(text("""
+                    UPDATE dbo.nps_sessoes_ativas 
+                    SET criado_em = :agora 
+                    WHERE id = :sid
+                """), {"agora": agora_utc, "sid": check_sessao.id})
+            else:
+                conn.execute(text("""
+                    INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
+                    VALUES (:uid, :disp, :ip, 'Detetado Automaticamente', :agora, 0)
+                """), {
+                    "uid": resultado["usuario_id"],
+                    "disp": dispositivo_amigavel,
+                    "ip": ip_address,
+                    "agora": agora_utc
+                })
+            
+            # 6. Atualiza último acesso do utilizador
+            conn.execute(text("""
+                UPDATE dbo.nps_usuarios 
+                SET ultimo_acesso = :agora
+                WHERE usuario_id = :uid
+            """), {
+                "agora": agora_utc,
+                "uid": resultado["usuario_id"]
             })
-        
-        # 6. Atualiza último acesso do utilizador
-        conn.execute(text("""
-            UPDATE dbo.nps_usuarios 
-            SET ultimo_acesso = :agora
-            WHERE usuario_id = :uid
-        """), {
-            "agora": agora_utc,
-            "uid": resultado["usuario_id"]
-        })
-        
-        resultado_tempo = conn.execute(text(
-            "SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'"
-        )).scalar()
-        
-        tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
+            
+            resultado_tempo = conn.execute(text(
+                "SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'"
+            )).scalar()
+            
+            tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
 
-        conn.commit() 
+            conn.commit() 
 
-        expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=tempo_minutos)
+            expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=tempo_minutos)
 
-        expire = datetime.utcnow() + timedelta(hours=8)
-        to_encode = {
-            "sub": resultado["email"],
-            "exp": expire,
-            "tipo": resultado["tipo"]
-        }
-        access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+            expire = datetime.utcnow() + timedelta(hours=8)
+            to_encode = {
+                "sub": resultado["email"],
+                "exp": expire,
+                "tipo": resultado["tipo"]
+            }
+            access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-        # 7. Buscar as permissões dinâmicas do banco de dados
-        sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
-        res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
-        
-        lista_permissoes = [row.chave for row in res_perm]
+            # 7. Buscar as permissões dinâmicas do banco de dados
+            sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
+            res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
+            
+            lista_permissoes = [row.chave for row in res_perm]
 
-        # 8. Devolver os dados + permissões para o Frontend
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "nome": resultado["nome"],
-            "tipo": resultado["tipo"],
-            "permissoes": lista_permissoes
-        }
+            # 8. Devolver os dados + permissões para o Frontend
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "nome": resultado["nome"],
+                "tipo": resultado["tipo"],
+                "permissoes": lista_permissoes
+            }
+
+    except HTTPException:
+        # Repassa os erros de senha errada, conta inativa, etc, sem alertar o Teams (pois é culpa do utilizador)
+        raise
+    except Exception as e:
+        # 🚨 ALERTA TI: O banco de dados caiu, a rede falhou, etc.
+        enviar_alerta_tecnico_teams(f"Falha Crítica no Login (Banco Offline?): {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="Erro interno no servidor. A equipa técnica já foi notificada."
+        )
     
 @app.post("/api/register")
 def registrar_usuario(requisicao: RegistroRequest):
@@ -735,6 +747,8 @@ async def resetar_senha(req: ResetPasswordRequest, background_tasks: BackgroundT
     except HTTPException:
         raise
     except Exception as e:
+        # 🚨 ALERTA TI: Falha ao escrever a nova senha na base de dados
+        enviar_alerta_tecnico_teams(f"Falha ao atualizar a Hash de Palavra-passe no BD: {str(e)}")
         print(f"❌ Erro ao redefinir a palavra-passe no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao guardar a nova palavra-passe.")
 
@@ -779,6 +793,8 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
         return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
     
     except Exception as e:
+        # 🚨 ALERTA TI: Falha ao gerar o token JWT ou conectar à Base de Dados
+        enviar_alerta_tecnico_teams(f"Falha ao gerar E-mail de Recuperação de Senha: {str(e)}")
         print(f"❌ ERRO CRÍTICO NO FORGOT PASSWORD: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Erro interno ao processar recuperação.")
