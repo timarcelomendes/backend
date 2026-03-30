@@ -163,6 +163,24 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except (ExpiredSignatureError, JWTError):
         raise credentials_exception
 
+async def get_current_user_token_data(token: str = Depends(oauth2_scheme)):
+    """Descodifica o token e devolve os dados (incluindo o tipo)"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Sessão inválida.")
+
+def exigir_admin(token_data: dict = Depends(get_current_user_token_data)):
+    if token_data.get("tipo") != "Admin":
+        raise HTTPException(status_code=403, detail="Acesso negado. Apenas Administradores.")
+    return token_data.get("sub")
+
+def exigir_manager(token_data: dict = Depends(get_current_user_token_data)):
+    if token_data.get("tipo") not in ["Admin", "Manager"]:
+        raise HTTPException(status_code=403, detail="Acesso negado. Requer nível Manager ou superior.")
+    return token_data.get("sub")
+
 # ==========================================
 # 📦 5. SCHEMAS (Pydantic Models)
 # Validam os dados que chegam do Frontend
@@ -627,7 +645,8 @@ async def login(requisicao: LoginRequest, request: Request):
 
         to_encode = {
             "sub": resultado["email"],
-            "exp": expire
+            "exp": expire,
+            "tipo": resultado["tipo"]
         }
         
         access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
