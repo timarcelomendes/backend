@@ -665,6 +665,7 @@ async def login(requisicao: LoginRequest, request: Request):
                 "access_token": access_token,
                 "token_type": "bearer",
                 "nome": resultado["nome"],
+                "cargo": resultado["cargo"], # 👈 ADICIONE ESTA LINHA
                 "tipo": resultado["tipo"],
                 "permissoes": lista_permissoes
             }
