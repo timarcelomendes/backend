@@ -9,12 +9,13 @@ def processar_webhook_background(payload: dict):
     try:
         print("⏳ [Webhook SVC] A iniciar processamento em background...")
         
-        # Como o main.py envia o payload direto, já não precisamos de extrair nada
+        # 👇 ADICIONE ESTA LINHA PARA SIMULAR O ERRO
+        raise Exception("ERRO SIMULADO: Teste de integração com Microsoft Teams")
+
         if not payload:
             print("⚠️ [Webhook SVC] O webhook chegou sem payload (corpo vazio). Ignorando.")
             return
             
-        # Executa a regra de negócio pesada (Inserção no banco, etc.)
         processar_webhook_fillout(payload)
         
         print("✅ [Webhook SVC] Sucesso: Webhook processado e salvo no banco.")

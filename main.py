@@ -131,7 +131,6 @@ async def receber_webhook_fillout(request: Request, background_tasks: Background
         return {"status": "success", "message": "Recebido"}
         
     except Exception as e:
-        # 🚨 ALERTA TI: Falha ao receber payload (Erro de conversão JSON ou rede)
         enviar_alerta_tecnico_teams(f"Falha de Recepção no Webhook (Fillout): {str(e)}")
         print(f"❌ Erro ao receber webhook: {e}")
         return {"status": "error", "message": "Falha na leitura"}
@@ -355,6 +354,12 @@ class TesteWebhookPayload(BaseModel):
 class PermissaoUpdate(BaseModel):
     perfil: str
     chaves: List[str]
+
+class RespostaManual(BaseModel):
+    cliente_id: str
+    nota: int
+    motivo: Optional[str] = ""
+    canal: str = "Manual"
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -2367,6 +2372,71 @@ async def restore_resposta_route(resposta_id: str):
         return {"status": "success", "detail": "Restaurado com sucesso"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/respostas/manual")
+def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            
+            # 1. Obter o nome da empresa associada a este cliente
+            sql_cliente = text("SELECT empresa FROM dbo.nps_clientes WHERE cliente_id = :cliente_id")
+            resultado_cliente = conn.execute(sql_cliente, {"cliente_id": resp.cliente_id}).fetchone()
+            
+            if not resultado_cliente:
+                raise HTTPException(status_code=404, detail="Cliente não encontrado.")
+            
+            empresa_nome = resultado_cliente.empresa
+
+            # 2. Inserir a resposta na tabela principal
+            sql_insert = text("""
+                INSERT INTO dbo.nps_respostas 
+                (cliente_id, empresa, nota, motivo, canal, data_resposta) 
+                VALUES (:cliente_id, :empresa, :nota, :motivo, :canal, GETDATE())
+            """)
+            conn.execute(sql_insert, {
+                "cliente_id": resp.cliente_id,
+                "empresa": empresa_nome,
+                "nota": resp.nota,
+                "motivo": resp.motivo,
+                "canal": resp.canal
+            })
+
+            # 3. INTERROMPER A RÉGUA DE LEMBRETES (Mudar status para Respondido)
+            sql_update_disparo = text("""
+                UPDATE dbo.nps_disparos 
+                SET status = 'Respondido', data_resposta = GETDATE() 
+                WHERE cliente_id = :cliente_id
+            """)
+            conn.execute(sql_update_disparo, {"cliente_id": resp.cliente_id})
+            
+            # Atualizar também na tabela de clientes por segurança
+            sql_update_cliente = text("""
+                UPDATE dbo.nps_clientes 
+                SET status_envio = 'Respondido' 
+                WHERE cliente_id = :cliente_id
+            """)
+            conn.execute(sql_update_cliente, {"cliente_id": resp.cliente_id})
+
+            # 4. CRIAR AÇÃO AUTOMÁTICA SE FOR DETRATOR (Notas 0 a 6)
+            if resp.nota <= 6:
+                # Obter o ID da empresa para associar a ação
+                sql_empresa_id = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
+                res_emp = conn.execute(sql_empresa_id, {"nome": empresa_nome}).fetchone()
+                
+                if res_emp:
+                    sql_acao = text("""
+                        INSERT INTO dbo.nps_acoes (empresa_id, descricao, prioridade, status, data_criacao)
+                        VALUES (:empresa_id, :descricao, 'Alta', 'Pendente', GETDATE())
+                    """)
+                    desc = f"Tratar Detrator (Nota {resp.nota}). Feedback inserido manualmente via {resp.canal}."
+                    conn.execute(sql_acao, {"empresa_id": res_emp.id, "descricao": desc})
+
+        return {"status": "success", "message": "Resposta inserida com sucesso!"}
+    
+    except Exception as e:
+        print(f"Erro ao inserir resposta manual: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # 📥 ROTAS: IMPORTAÇÃO
@@ -3215,7 +3285,69 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
             "resumoParetoIA": "Analisando os filtros aplicados, identificamos uma falha de conexão com o motor cognitivo.",
             "recomendacaoIA": "Por favor, tente gerar a análise novamente."
         }
-    
+
+# --- ROTA PARA A ABA JORNADA (HISTÓRICO POR EMPRESA/CLIENTE) ---
+@app.get("/api/reports/jornada")
+def obter_jornada_cliente(empresa: str, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Busca todas as respostas da empresa em ordem cronológica
+            sql = text("""
+                SELECT 
+                    r.nota, 
+                    r.motivo, 
+                    r.canal, 
+                    COALESCE(r.data_resposta, r.created_at) as data,
+                    c.nome as cliente_nome,
+                    c.cargo
+                FROM dbo.nps_respostas r
+                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                WHERE c.empresa = :empresa
+                ORDER BY data DESC
+            """)
+            result = conn.execute(sql, {"empresa": empresa}).mappings().all()
+            
+            jornada = []
+            for r in result:
+                item = dict(r)
+                # Formatação amigável para a timeline
+                item["data_formatada"] = r["data"].strftime("%d/%m/%Y %H:%M")
+                jornada.append(item)
+                
+            return jornada
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- ROTA PARA A ABA OPERACIONAL (KPIs DE EXECUÇÃO) ---
+@app.get("/api/reports/operacional")
+def obter_dados_operacionais(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 1. Taxa de Resposta Global
+            sql_taxa = text("""
+                SELECT 
+                    (SELECT COUNT(*) FROM dbo.nps_clientes WHERE ativo = 1) as total_base,
+                    (SELECT COUNT(DISTINCT cliente_id) FROM dbo.nps_respostas) as total_respostas
+            """)
+            res_taxa = conn.execute(sql_taxa).mappings().first()
+            
+            # 2. SLA Médio de Fechamento de Ações (dias)
+            sql_sla = text("""
+                SELECT AVG(DATEDIFF(day, created_at, updated_at)) as sla_medio
+                FROM dbo.nps_acoes 
+                WHERE status = 'Concluído'
+            """)
+            res_sla = conn.execute(sql_sla).scalar() or 0
+
+            return {
+                "taxa_resposta": round((res_taxa['total_respostas'] / res_taxa['total_base'] * 100), 1) if res_taxa['total_base'] > 0 else 0,
+                "sla_medio_dias": round(res_sla, 1)
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ==========================================
 # 🎯 ROTAS: PLANOS DE AÇÃO (Close the Loop)
 # ==========================================
