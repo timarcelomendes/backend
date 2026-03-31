@@ -79,7 +79,7 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
-    # Query Corrigida: Busca o ID da empresa através do JOIN para verificar ações
+    # Busca o ID da empresa através do JOIN e cruza com a Fila de Disparos
     sql = f"""
     SELECT TOP ({int(topn)})
         c.cliente_id, 
@@ -91,8 +91,13 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.empresa, 
         c.perfil_decisor, 
         c.segmento,
-        c.status_envio,      
-        c.ultimo_envio, 
+        
+        -- 👇 1. MÁGICA: Cruzamento com a nova tabela de Disparos (Fila)
+        COALESCE(d.status, c.status_envio, 'Não Iniciado') as status_envio,
+        d.data_envio_inicial as data_envio_inicial,
+        COALESCE(d.lembretes_enviados, 0) as lembretes_enviados,
+        COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) as ultimo_envio,
+        
         c.proximo_envio, 
         c.ativo, 
         c.updated_at,
@@ -113,6 +118,10 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         
     FROM dbo.nps_clientes c
     LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
+    
+    -- 👇 2. O JOIN CRUCIAL COM A TABELA DE DISPAROS
+    LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+    
     {where_sql}
     ORDER BY c.updated_at DESC;
     """

@@ -335,9 +335,14 @@ class RegrasNegocioConfig(BaseModel):
     email_agradecimento_promotor: Optional[str] = ""
     email_agradecimento_neutro: Optional[str] = ""
     email_agradecimento_detrator: Optional[str] = ""
-    lembrete_dias: int = 3
-    email_template_lembrete: Optional[str] = ""
+    email_template_lembrete_1: Optional[str] = ""
+    email_template_lembrete_2: Optional[str] = ""
+    email_template_lembrete_3: Optional[str] = ""
     teams_horario_resumo: str = "08:00"
+    lembrete_qtd_maxima: int = 3
+    lembrete_dias_1: int = 3
+    lembrete_dias_2: int = 7
+    lembrete_dias_3: int = 15
 
 class TesteTemplatePayload(BaseModel):
     email_destino: str
@@ -417,10 +422,12 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'teams_horario_resumo', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'lembrete_dias', 'email_template_lembrete')")
+            # 1. Adicionámos as novas chaves à busca
+            # 1. Adicionámos as novas chaves à busca
+            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'teams_horario_resumo', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'email_template_lembrete_1', 'email_template_lembrete_2', 'email_template_lembrete_3', 'lembrete_qtd_maxima', 'lembrete_dias_1', 'lembrete_dias_2', 'lembrete_dias_3')")
             resultados = conn.execute(query).fetchall()
             
-            # Valores padrão de segurança
+            # 2. Defaults com as novas chaves
             config = {
                 "scheduler_hora_inicio": "09:00",
                 "scheduler_horas": 6,
@@ -432,14 +439,19 @@ def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
                 "email_agradecimento_promotor": "",
                 "email_agradecimento_neutro": "",
                 "email_agradecimento_detrator": "",
-                "lembrete_dias": 3,
-                "email_template_lembrete": "",
+                "email_template_lembrete_1": "",
+                "email_template_lembrete_2": "",
+                "email_template_lembrete_3": "",
                 "teams_horario_resumo": "08:00",
-                
+                "lembrete_qtd_maxima": 3,
+                "lembrete_dias_1": 3,
+                "lembrete_dias_2": 7,
+                "lembrete_dias_3": 15
             }
             
             for linha in resultados:
-                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'lembrete_dias']:
+                # 3. Força a conversão para inteiro nas chaves numéricas novas
+                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'lembrete_qtd_maxima', 'lembrete_dias_1', 'lembrete_dias_2', 'lembrete_dias_3']:
                     config[linha.chave] = int(linha.valor) if linha.valor else config[linha.chave]
                 elif linha.chave in ['scheduler_hora_inicio', 'teams_horario_resumo']:
                     config[linha.chave] = linha.valor if linha.valor else config[linha.chave]
