@@ -299,6 +299,7 @@ class GestorSchema(BaseModel):
     papel: Optional[str] = ""
     email: Optional[str] = ""
     teams_webhook: Optional[str] = ""
+    avatar: Optional[str] = None
 
 class AlertaGestorRequest(BaseModel):
     empresa: str
@@ -1496,6 +1497,7 @@ def get_dashboard_detalhes(
                 SELECT 
                     {coluna_nome} as nome,
                     MAX(e.gestor) as gestor, 
+                    MAX(g.avatar) as gestor_avatar,
                     COUNT(r.resposta_id) as total,
                     MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
                     
@@ -1512,6 +1514,7 @@ def get_dashboard_detalhes(
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome 
+                LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id -- 👈 ADICIONADO
                 {str_filtro_c}
                 GROUP BY {coluna_nome}
                 ORDER BY nps ASC, data_ultima_resposta ASC;
@@ -1830,11 +1833,12 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
     def salvar(item: schema): # type: ignore  
         with get_engine().begin() as conn:
             if table_name == 'dbo.nps_gestores': 
-                conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email, teams_webhook) VALUES (:n, :p, :e, :t)"), {
+                conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email, teams_webhook, avatar) VALUES (:n, :p, :e, :t, :a)"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 
                     "e": getattr(item, 'email', ''),
-                    "t": getattr(item, 'teams_webhook', '')
+                    "t": getattr(item, 'teams_webhook', ''),
+                    "a": getattr(item, 'avatar', None)
                 })
             else: 
                 conn.execute(text(f"INSERT INTO {table_name} (nome) VALUES (:n)"), {"n": item.nome})
@@ -1846,17 +1850,17 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
             nome_antigo = conn.execute(text(f"SELECT nome FROM {table_name} WHERE id=:id"), {"id": item_id}).scalar()
             
             if table_name == 'dbo.nps_gestores': 
-                conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e, teams_webhook=:t WHERE id=:id"), {
+                conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e, teams_webhook=:t, avatar=:a WHERE id=:id"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 
                     "e": getattr(item, 'email', ''), 
                     "t": getattr(item, 'teams_webhook', ''),
+                    "a": getattr(item, 'avatar', None),
                     "id": item_id
                 })
             else: 
                 conn.execute(text(f"UPDATE {table_name} SET nome=:n WHERE id=:id"), {"n": item.nome, "id": item_id})
             
-            # 🟢 EFEITO CASCATA
             if nome_antigo and str(nome_antigo) != str(item.nome):
                 if table_name == 'dbo.nps_segmentos':
                     conn.execute(text("UPDATE dbo.nps_empresas SET segmento=:novo WHERE segmento=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
@@ -3241,15 +3245,13 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
                 
             condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
 
-            # O segredo está no LEFT JOIN e no COALESCE para garantir que a query não quebre
-            condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
-
-            # Adicionámos JOINs para garantir que o Kanban exibe o nome, mesmo se o ID for Nulo
+            # 👇 A QUERY DEFINITIVA: Traz a foto e dá prioridade ao gestor da ação!
             sql = text(f"""
                 SELECT 
                     a.*,
                     COALESCE(e.nome, r.empresa, c.empresa, 'Conta Geral') as empresa_nome,
-                    COALESCE(e.gestor, g.nome, 'Sem Gestor') as gestor_nome,
+                    COALESCE(g.nome, e.gestor, 'Sem Gestor') as gestor_nome,
+                    g.avatar as gestor_avatar,
                     r.nota as resposta_nota
                 FROM dbo.nps_acoes a
                 LEFT JOIN dbo.nps_empresas e ON a.empresa_id = e.id
