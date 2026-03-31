@@ -2040,7 +2040,6 @@ def list_clientes(
 ):
     try:
         engine = get_engine()
-        engine.dispose() 
         
         df = clientes_svc.load_clientes(q, ativo, perfil, topn)
         return df.fillna("").to_dict(orient="records")

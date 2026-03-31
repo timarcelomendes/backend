@@ -49,8 +49,10 @@ def get_engine():
     
     _engine_instance = create_engine(
         conn_url,
+        pool_size=10,
+        max_overflow=20,
         pool_pre_ping=True,
-        pool_recycle=1800, # Evita que a ligação "adormeça"
+        pool_recycle=1800,
         future=True,
     )
     return _engine_instance
