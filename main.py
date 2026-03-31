@@ -1958,109 +1958,6 @@ def testar_webhook_teams(payload: TesteWebhookPayload):
         print(f"Erro ao testar webhook: {e}")
         raise HTTPException(status_code=500, detail="Falha ao enviar mensagem. Verifique se a URL é válida.")
 
-# 3. Rota para disparar o e-mail
-@app.post("/api/reports/enviar-email")
-async def enviar_report_email(payload: ReportEmailPayload):
-    try:
-        # Define a cor da tag de prioridade dinamicamente (Vermelho se for ALTA/CRÍTICA, senão Azul)
-        cor_prioridade = "#e11d48" if payload.prioridade in ["ALTA", "CRÍTICA"] else "#0ea5e9"
-        url_dashboard = os.getenv("FRONTEND_URL", "http://localhost:5173") + "/relatorios"
-
-        # Assunto de E-mail Estratégico
-        assunto = f"📊 Relatório Estratégico NPS - {payload.periodo} (Foco: {payload.foco})"
-        
-        # Template de E-mail Premium Corporativo
-        corpo_html = f"""
-        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #334155; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
-            
-            <div style="background-color: #0f172a; padding: 24px; text-align: center;">
-                <h2 style="color: #ffffff; margin: 0; font-style: italic; font-size: 24px;">Gauge <span style="color: #818cf8;">AI</span></h2>
-                <p style="color: #94a3b8; margin: 6px 0 0 0; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 2px;">Intelligence Reports</p>
-            </div>
-            
-            <div style="padding: 32px 24px;">
-                <h3 style="margin-top: 0; color: #0f172a; font-size: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 12px; margin-bottom: 24px;">Resumo Executivo</h3>
-                
-                <table style="width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 14px;">
-                    <tr>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Período Analisado</strong></td>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right; color: #0f172a; font-weight: 600;">{payload.periodo}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Foco de Ação</strong></td>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right;">
-                            <span style="background-color: #e0e7ff; color: #4338ca; padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;">{payload.foco}</span>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; color: #64748b;"><strong>Nível de Prioridade</strong></td>
-                        <td style="padding: 10px 0; border-bottom: 1px solid #f1f5f9; text-align: right;">
-                            <span style="color: {cor_prioridade}; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;">{payload.prioridade}</span>
-                        </td>
-                    </tr>
-                </table>
-                
-                <div style="background-color: #f8fafc; border-left: 4px solid #818cf8; padding: 16px 20px; margin-bottom: 32px; border-radius: 0 8px 8px 0;">
-                    <p style="margin: 0; font-style: italic; line-height: 1.6; color: #334155; font-size: 14px;">
-                        "{payload.resumo_ia}"
-                    </p>
-                </div>
-                
-                <div style="text-align: center;">
-                    <a href="{url_dashboard}" style="background-color: #f97316; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: 800; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; display: inline-block;">
-                        Acessar Dashboard Completo
-                    </a>
-                </div>
-            </div>
-            
-            <div style="background-color: #f8fafc; padding: 16px; text-align: center; border-top: 1px solid #e2e8f0;">
-                <p style="margin: 0; font-size: 11px; color: #94a3b8;">
-                    Mensagem gerada e enviada automaticamente pelo módulo de Inteligência Artificial.
-                </p>
-            </div>
-        </div>
-        """
-        
-        # --- INTEGRAÇÃO COM O SEU SERVIÇO DE E-MAIL (email_svc) ---
-        # Tenta carregar o seu disparador nativo de e-mail de forma segura
-        try:
-            # Ajuste esta importação de acordo com o nome real da sua função de envio no `email_svc`
-            from services.email_svc import enviar_email_padrao # (ou 'enviar_email', verifique o nome exato no seu projeto)
-            
-            emails_enviados_com_sucesso = 0
-            
-            # Loop que envia um e-mail separado (para manter privacidade de dados/BCC) a cada gestor
-            for email_destino in payload.emails:
-                try:
-                    # Envia!
-                    enviar_email_padrao(
-                        destinatario=email_destino, 
-                        assunto=assunto, 
-                        corpo_html=corpo_html
-                    )
-                    emails_enviados_com_sucesso += 1
-                except Exception as mail_err:
-                    print(f"⚠️ Falha ao tentar disparar para {email_destino}: {mail_err}")
-            
-            print(f"✅ E-mail de Report IA enviado com sucesso para {emails_enviados_com_sucesso} gestores.")
-
-        except ImportError:
-            # Caso a função de e-mail ainda não esteja perfeitamente ligada, ele finge o envio
-            # para não travar o frontend durante os testes!
-            print("⚠️ SERVIÇO DE E-MAIL NÃO ENCONTRADO/CONFIGURADO.")
-            print("---- MODO SIMULAÇÃO DE ENVIO ATIVADO ----")
-            print(f"Destinatários: {payload.emails}")
-            print(f"Assunto: {assunto}")
-            print("-----------------------------------------")
-
-        return {"sucesso": True, "mensagem": f"Relatório enviado com sucesso para {len(payload.emails)} gestor(es)!"}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"❌ Erro global ao processar envio de e-mail de report: {e}")
-        return {"sucesso": False, "mensagem": "Ocorreu um erro interno. Contacte o suporte técnico."}
-    
 # ==========================================
 # 🚀 SALVAR NOVOS CADASTROS
 # ==========================================
@@ -3088,6 +2985,63 @@ def build_bi_filters(periodo: str, segmento: str, arr: str, safra: str):
 # 📊 LABORATÓRIO ANALÍTICO (BI ENGINE)
 # ==========================================
 
+# --- 2. ROTA DE PERFORMANCE DO GESTOR ---
+@app.get("/api/reports/gestor")
+def obter_performance_gestor(gestor_id: int, usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 1. Indicadores Gerais com COALESCE para evitar NoneType
+            sql_nps = text("""
+                SELECT 
+                    COUNT(r.resposta_id) as total,
+                    COALESCE(SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END), 0) as promotores,
+                    COALESCE(SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END), 0) as detratores
+                FROM dbo.nps_respostas r
+                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                INNER JOIN dbo.nps_empresas e ON c.empresa = e.nome
+                WHERE e.gestor_id = :gestor_id
+            """)
+            res = conn.execute(sql_nps, {"gestor_id": gestor_id}).mappings().first()
+            
+            total = res['total'] or 0
+            promotores = res['promotores']
+            detratores = res['detratores']
+            neutros = total - (promotores + detratores)
+
+            # 2. Cálculo do NPS seguro
+            nps = 0
+            if total > 0:
+                nps = ((promotores - detratores) / total) * 100
+
+            # 3. Ranking de empresas da carteira
+            sql_empresas = text("""
+                SELECT 
+                    e.nome,
+                    COALESCE(AVG(CAST(r.nota AS FLOAT)), 0) as media_nota,
+                    COUNT(r.resposta_id) as qtd_respostas
+                FROM dbo.nps_empresas e
+                LEFT JOIN dbo.nps_respostas r ON e.nome = r.empresa
+                WHERE e.gestor_id = :gestor_id
+                GROUP BY e.nome
+                ORDER BY media_nota DESC
+            """)
+            empresas_perf = conn.execute(sql_empresas, {"gestor_id": gestor_id}).mappings().all()
+
+            return {
+                "nps": round(nps, 1),
+                "total_respostas": total,
+                "distribuicao": {
+                    "promotores": promotores,
+                    "detratores": detratores,
+                    "neutros": neutros
+                },
+                "ranking_empresas": [dict(row) for row in empresas_perf]
+            }
+    except Exception as e:
+        print(f"Erro na performance do gestor: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 # 1. MATRIZ DE PRIORIZAÇÃO (SCATTER CHART)
 @app.get("/api/reports/bi-scatter")
 async def get_bi_scatter(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
@@ -3347,6 +3301,45 @@ def obter_dados_operacionais(usuario_email: str = Depends(get_current_user)):
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# --- 1. ROTA PARA LISTAR OS GESTORES (PARA O DROPDOWN) ---
+@app.get("/api/reports/lista-gestores")
+def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # JOIN com a tabela correta: dbo.nps_gestores
+            sql = text("""
+                SELECT DISTINCT g.id, g.nome 
+                FROM dbo.nps_empresas e
+                INNER JOIN dbo.nps_gestores g ON e.gestor_id = g.id
+                WHERE e.gestor_id IS NOT NULL
+                ORDER BY g.nome
+            """)
+            result = conn.execute(sql).fetchall()
+            return [{"id": linha[0], "nome": linha[1]} for linha in result]
+    except Exception as e:
+        print(f"Erro ao listar gestores: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 1. ROTA PARA LISTAR OS GESTORES (PARA O DROPDOWN) ---
+@app.get("/api/reports/lista-gestores")
+def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            sql = text("""
+                SELECT g.resposta_id, g.nome 
+                FROM dbo.nps_gestores g
+                WHERE EXISTS (SELECT 1 FROM dbo.nps_empresas e WHERE e.gestor_id = g.resposta_id)
+                ORDER BY g.nome
+            """)
+            result = conn.execute(sql).fetchall()
+            # O dicionário agora usa 'id': linha[0] onde linha[0] é o resposta_id
+            return [{"id": linha[0], "nome": linha[1]} for linha in result]
+    except Exception as e:
+        print(f"Erro ao listar gestores: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro de coluna: {str(e)}")
 
 # ==========================================
 # 🎯 ROTAS: PLANOS DE AÇÃO (Close the Loop)

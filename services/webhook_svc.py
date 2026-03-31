@@ -9,9 +9,6 @@ def processar_webhook_background(payload: dict):
     try:
         print("⏳ [Webhook SVC] A iniciar processamento em background...")
         
-        # 👇 ADICIONE ESTA LINHA PARA SIMULAR O ERRO
-        raise Exception("ERRO SIMULADO: Teste de integração com Microsoft Teams")
-
         if not payload:
             print("⚠️ [Webhook SVC] O webhook chegou sem payload (corpo vazio). Ignorando.")
             return
