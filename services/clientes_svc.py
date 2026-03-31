@@ -92,36 +92,49 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.perfil_decisor, 
         c.segmento,
         
-        -- 👇 1. MÁGICA: Cruzamento com a nova tabela de Disparos (Fila)
-        COALESCE(d.status, c.status_envio, 'Não Iniciado') as status_envio,
-        d.data_envio_inicial as data_envio_inicial,
-        COALESCE(d.lembretes_enviados, 0) as lembretes_enviados,
+        -- 1. DATA DO ÚLTIMO ENVIO
         COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) as ultimo_envio,
         
-        c.proximo_envio, 
+        -- 2. DATA DO PRÓXIMO ENVIO (Baseada na regra dinámica)
+        DATEADD(day, 
+            ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
+            COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
+        ) AS proximo_envio,
+
+        -- 👇 3. A NOVA MÁGICA DO STATUS AUTOMÁTICO
+        CASE 
+            -- Se nunca foi enviado na vida, está Pendente
+            WHEN COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL THEN 'Pendente'
+            
+            -- Se a data de HOJE já passou da data calculada para o próximo envio, vira Pendente!
+            WHEN GETDATE() >= DATEADD(day, 
+                ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
+                COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
+            ) THEN 'Pendente'
+            
+            -- Caso contrário, mantém o status atual (Respondido, Enviado, etc)
+            ELSE COALESCE(d.status, c.status_envio, 'Não Iniciado')
+        END AS status_envio,
+        
+        d.data_envio_inicial as data_envio_inicial,
+        COALESCE(d.lembretes_enviados, 0) as lembretes_enviados,
         c.ativo, 
         c.updated_at,
         
-        -- IDs e Contadores
         e.id AS empresa_id,
         (SELECT COUNT(1) FROM dbo.nps_respostas r WHERE r.cliente_id = c.cliente_id) AS respostas_cliente,
         (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa = c.empresa) AS respostas_empresa,
         
-        -- Verificação de Ação Pendente vinculando o ID da empresa encontrada no JOIN
         CAST(CASE 
             WHEN EXISTS (
                 SELECT 1 FROM dbo.nps_acoes a 
-                WHERE a.empresa_id = e.id 
-                  AND a.status != 'Concluído'
+                WHERE a.empresa_id = e.id AND a.status != 'Concluído'
             ) THEN 1 ELSE 0 
         END AS BIT) AS tem_acao_pendente
         
     FROM dbo.nps_clientes c
     LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
-    
-    -- 👇 2. O JOIN CRUCIAL COM A TABELA DE DISPAROS
     LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
-    
     {where_sql}
     ORDER BY c.updated_at DESC;
     """

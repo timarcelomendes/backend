@@ -329,6 +329,7 @@ class RegrasNegocioConfig(BaseModel):
     sla_detrator_dias: int = 2
     sla_neutro_dias: int = 5
     sla_promotor_dias: int = 7
+    recorrencia_dias: int = 90
     fillout_campos: str = "clienteid,email,nome,empresa,empresa_id"
     email_template_html: Optional[str] = ""
     email_agradecimento_promotor: Optional[str] = ""
@@ -423,80 +424,48 @@ def update_integracoes(config: IntegracoesUpdate, usuario_email: str = Depends(g
         raise HTTPException(status_code=500, detail="Erro ao gravar integrações")
     
 @app.get("/api/config/regras")
-def obter_regras_negocio(usuario_email: str = Depends(get_current_user)):
+def obter_regras(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. Adicionámos as novas chaves à busca
-            # 1. Adicionámos as novas chaves à busca
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('scheduler_horas', 'teams_horario_resumo', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator', 'email_template_lembrete_1', 'email_template_lembrete_2', 'email_template_lembrete_3', 'lembrete_qtd_maxima', 'lembrete_dias_1', 'lembrete_dias_2', 'lembrete_dias_3')")
-            resultados = conn.execute(query).fetchall()
+            sql = text("SELECT chave, valor FROM dbo.nps_configuracoes")
+            result = conn.execute(sql).fetchall()
             
-            # 2. Defaults com as novas chaves
-            config = {
-                "scheduler_hora_inicio": "09:00",
-                "scheduler_horas": 6,
-                "sla_detrator_dias": 2,
-                "sla_neutro_dias": 5,
-                "sla_promotor_dias": 7,
-                "fillout_campos": "clienteId,email,nome,empresa,empresa_id",
-                "email_template_html": "",
-                "email_agradecimento_promotor": "",
-                "email_agradecimento_neutro": "",
-                "email_agradecimento_detrator": "",
-                "email_template_lembrete_1": "",
-                "email_template_lembrete_2": "",
-                "email_template_lembrete_3": "",
-                "teams_horario_resumo": "08:00",
-                "lembrete_qtd_maxima": 3,
-                "lembrete_dias_1": 3,
-                "lembrete_dias_2": 7,
-                "lembrete_dias_3": 15
-            }
+            configuracoes = {linha[0]: linha[1] for linha in result}
             
-            for linha in resultados:
-                # 3. Força a conversão para inteiro nas chaves numéricas novas
-                if linha.chave in ['scheduler_horas', 'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'lembrete_qtd_maxima', 'lembrete_dias_1', 'lembrete_dias_2', 'lembrete_dias_3']:
-                    config[linha.chave] = int(linha.valor) if linha.valor else config[linha.chave]
-                elif linha.chave in ['scheduler_hora_inicio', 'teams_horario_resumo']:
-                    config[linha.chave] = linha.valor if linha.valor else config[linha.chave]
-                else:
-                    config[linha.chave] = linha.valor
-                    
-            return config
+            if not configuracoes:
+                return {"recorrencia_dias": 90}
+                
+            return configuracoes
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Erro ao ler regras de negócio.")
+        print(f"Erro ao carregar regras: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao carregar configurações.")
 
 @app.post("/api/config/regras")
-def salvar_regras_negocio(payload: RegrasNegocioConfig, usuario_email: str = Depends(get_current_user)):
+def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            sql_upsert = text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = SYSUTCDATETIME() WHERE chave = :chave
-                ELSE
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, SYSUTCDATETIME())
+            
+            configuracoes = payload.dict()
+            
+            sql = text("""
+                UPDATE dbo.nps_configuracoes 
+                SET valor = :valor 
+                WHERE chave = :chave
             """)
             
-            dados_para_gravar = payload.dict()
-            for chave, valor in dados_para_gravar.items():
-                conn.execute(sql_upsert, {"chave": chave, "valor": str(valor)})
-        
-        if payload.teams_horario_resumo and ":" in payload.teams_horario_resumo:
-            h, m = map(int, payload.teams_horario_resumo.split(":"))
-            try:
-                scheduler.reschedule_job(
-                    'alerta_matinal_teams_job', 
-                    trigger=CronTrigger(day_of_week='mon-fri', hour=h, minute=m)
-                )
-                print(f"⏰ Horário do Teams reprogramado em tempo real para as {h}:{m}!")
-            except Exception as e:
-                print(f"Aviso: Não foi possível reagendar em memória: {e}")
+            for chave, valor in configuracoes.items():
+
+                valor_string = str(valor) if valor is not None else ""
                 
-        return {"status": "success", "message": "Regras de negócio atualizadas com sucesso!"}
+                conn.execute(sql, {"chave": chave, "valor": valor_string})
+            
+        return {"message": "Regras de negócio guardadas com sucesso!"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Erro ao gravar regras de negócio.")
+        print(f"Erro ao salvar regras chave-valor: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     
 @app.post("/api/config/testar-template")
 def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Depends(get_current_user)):
@@ -2145,75 +2114,6 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/api/audiencia/plano-acao")
-def gerar_plano_acao_empresa(empresa: str):
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            # 1. BUSCAR CONFIGURAÇÕES DA MAGIC AI (API KEY E MODELO)
-            sql_ai = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('openai_api_key', 'openai_model')")
-            configs = {row.chave: row.valor for row in conn.execute(sql_ai)}
-            
-            api_key = configs.get('openai_api_key')
-            modelo = configs.get('openai_model', 'gpt-4o-mini')
-
-            if not api_key:
-                return {"plano": "Configuração de IA não encontrada. Verifique a chave da OpenAI nas definições."}
-
-            # 2. BUSCAR COMENTÁRIOS DA EMPRESA
-            sql_comentarios = text("""
-                SELECT CAST(r.motivo AS NVARCHAR(MAX)) as comentario, r.nota
-                FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE c.empresa = :empresa 
-                  AND r.motivo IS NOT NULL 
-                  AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 5
-            """)
-            resultados = conn.execute(sql_comentarios, {"empresa": empresa}).mappings().all()
-            
-            if not resultados:
-                return {"plano": f"A empresa {empresa} ainda não possui comentários qualitativos suficientes para uma análise de IA."}
-
-            # 3. PREPARAR O CONTEXTO PARA O GPT
-            feedbacks_texto = "\n".join([f"Nota {r['nota']}: {r['comentario']}" for r in resultados])
-            
-            prompt_sistema = "Você é um consultor especialista em Customer Success e retenção de clientes (NPS)."
-            prompt_usuario = f"""
-            Analise estes feedbacks reais dos clientes da empresa '{empresa}':
-            
-            {feedbacks_texto}
-            
-            Com base nisso, gere um PLANO DE ACÇÃO ESTRATÉGICO para evitar cancelamentos (Churn).
-            REGRAS:
-            1. Seja direto e use linguagem executiva.
-            2. Divida em 3 pontos práticos de ação.
-            3. Identifique o maior 'ponto de dor' recorrente.
-            4. Sugira uma ação para os próximos 7 dias.
-            """
-
-            # 4. CHAMADA À OPENAI
-            client = openai.OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=modelo,
-                messages=[
-                    {"role": "system", "content": prompt_sistema},
-                    {"role": "user", "content": prompt_usuario}
-                ],
-                temperature=0.7
-            )
-
-            plano_gerado = response.choices[0].message.content
-
-            return {
-                "status": "success",
-                "empresa": empresa,
-                "plano": plano_gerado
-            }
-
-    except Exception as e:
-        print(f"Erro na IA: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao processar plano de IA: {str(e)}")
 
 # ==========================================
 # 📋 LISTAR E ATUALIZAR FEEDBACKS (Respostas)
@@ -2839,11 +2739,22 @@ def contar_elegiveis_nps():
         engine = get_engine()
         with engine.connect() as conn:
             sql = text("""
-                SELECT COUNT(*) as total
-                FROM dbo.nps_clientes 
-                WHERE ativo = 1 
-                  AND status_envio IN ('Pendente', 'Erro') 
-                  AND (proximo_envio IS NULL OR proximo_envio <= CAST(GETDATE() AS DATE))
+                SELECT c.cliente_id, c.nome, c.email
+                FROM dbo.nps_clientes c
+                LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+                WHERE c.ativo = 1 
+                AND (
+                    -- 1. Clientes que NUNCA receberam a pesquisa
+                    COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL 
+                    
+                    OR 
+                    
+                    -- 2. Clientes cuja data de carência (recorrencia_dias) já foi ultrapassada!
+                    GETDATE() >= DATEADD(day, 
+                        ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
+                        COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
+                    )
+                )
             """)
             total = conn.execute(sql).scalar()
         return {"total": total}
@@ -3308,38 +3219,72 @@ def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_u
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # JOIN com a tabela correta: dbo.nps_gestores
             sql = text("""
-                SELECT DISTINCT g.id, g.nome 
-                FROM dbo.nps_empresas e
-                INNER JOIN dbo.nps_gestores g ON e.gestor_id = g.id
-                WHERE e.gestor_id IS NOT NULL
+                SELECT g.id, g.nome 
+                FROM dbo.nps_gestores g
+                WHERE EXISTS (
+                    SELECT 1 
+                    FROM dbo.nps_empresas e 
+                    WHERE e.gestor_id = g.id
+                )
                 ORDER BY g.nome
             """)
             result = conn.execute(sql).fetchall()
+            
+            # Retorna no formato exato que o Vue.js espera: [{ "id": 1, "nome": "Marcelo" }]
             return [{"id": linha[0], "nome": linha[1]} for linha in result]
+            
     except Exception as e:
         print(f"Erro ao listar gestores: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --- 1. ROTA PARA LISTAR OS GESTORES (PARA O DROPDOWN) ---
-@app.get("/api/reports/lista-gestores")
-def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_user)):
+        raise HTTPException(status_code=500, detail="Erro ao processar lista de gestores")
+    
+@app.get("/api/reports/operacional/inativos")
+def relatorio_clientes_inativos(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
+            # 1. Puxa a regra de recorrência atual
+            sql_regra = text("SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'")
+            recorrencia_dias = conn.execute(sql_regra).scalar()
+            recorrencia_dias = recorrencia_dias if recorrencia_dias is not None else 90
+
+            # 2. Busca os clientes "Vencidos" (Disparados, não respondidos e que ultrapassaram a data limite)
             sql = text("""
-                SELECT g.resposta_id, g.nome 
-                FROM dbo.nps_gestores g
-                WHERE EXISTS (SELECT 1 FROM dbo.nps_empresas e WHERE e.gestor_id = g.resposta_id)
-                ORDER BY g.nome
+                SELECT 
+                    c.empresa, 
+                    c.nome AS cliente_nome, 
+                    c.email AS cliente_email, 
+                    COALESCE(d.data_envio_inicial, c.ultimo_envio) AS data_envio,
+                    DATEDIFF(day, COALESCE(d.data_envio_inicial, c.ultimo_envio), GETDATE()) AS dias_sem_resposta
+                FROM dbo.nps_clientes c
+                LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+                WHERE 
+                    -- Apenas status de quem recebeu mas não finalizou a pesquisa
+                    COALESCE(d.status, c.status_envio) IN ('Enviado', 'Pendente')
+                    AND COALESCE(d.data_envio_inicial, c.ultimo_envio) IS NOT NULL
+                    -- A MÁGICA: Apenas tempo de espera MAIOR que a regra de recorrência
+                    AND DATEDIFF(day, COALESCE(d.data_envio_inicial, c.ultimo_envio), GETDATE()) > :recorrencia
+                ORDER BY dias_sem_resposta DESC
             """)
-            result = conn.execute(sql).fetchall()
-            # O dicionário agora usa 'id': linha[0] onde linha[0] é o resposta_id
-            return [{"id": linha[0], "nome": linha[1]} for linha in result]
+            
+            result = conn.execute(sql, {"recorrencia": recorrencia_dias}).fetchall()
+            
+            lista = [
+                {
+                    "empresa": r[0] or "Sem Empresa",
+                    "cliente_nome": r[1],
+                    "cliente_email": r[2],
+                    "data_envio": r[3].isoformat() if r[3] else None,
+                    "dias_sem_resposta": r[4]
+                }
+                for r in result
+            ]
+            
+            return {"recorrencia_dias": recorrencia_dias, "lista": lista}
+            
     except Exception as e:
-        print(f"Erro ao listar gestores: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro de coluna: {str(e)}")
+        print(f"Erro no relatorio inativos: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao buscar clientes inativos.")
 
 # ==========================================
 # 🎯 ROTAS: PLANOS DE AÇÃO (Close the Loop)
