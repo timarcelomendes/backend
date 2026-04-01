@@ -5,6 +5,7 @@ import traceback
 import re
 import secrets
 import string
+import random
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any
@@ -22,6 +23,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from jose import jwt, JWTError, ExpiredSignatureError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 # Importações do Agendador (Scheduler)
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -2110,7 +2112,18 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
             payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo
         )
         return {"status": "success", "message": "Cliente atualizado."}
+        
+    except IntegrityError as e:
+        error_msg = str(e)
+        if "UQ_nps_clientes_email" in error_msg or "duplicate key" in error_msg.lower():
+            raise HTTPException(
+                status_code=400, 
+                detail="Este e-mail já está registado para outro cliente. Utilize um e-mail diferente."
+            )
+        raise HTTPException(status_code=400, detail="Erro de restrição no banco de dados.")
+        
     except Exception as e:
+        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2241,307 +2254,325 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 @app.post("/api/importar/preview")
 async def preview_importacao(file: UploadFile = File(...)):
     try:
-        df = pd.read_excel(file.file) if file.filename.endswith(('.xlsx', '.xls')) else pd.read_csv(file.file)
+        contents = await file.read()
+        if file.filename.lower().endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(io.BytesIO(contents))
+        else:
+            try:
+                df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='utf-8')
+            except UnicodeDecodeError:
+                df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='latin1')
         
+        # Força todos os cabeçalhos a ficarem minúsculos e sem espaços extra
+        df.columns = df.columns.str.strip().str.lower()
+        
+        df = df.fillna("")
+        for col in df.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+            df[col] = df[col].astype(str)
+
         dados = df.to_dict(orient='records')
-        
         return dados
+        
     except Exception as e:
+        print(f"🚨 ERRO REAL NO PYTHON: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Erro ao ler arquivo: {str(e)}")
 
-@app.post("/api/importar/clientes")
-async def importar_clientes_planilha(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        df_imp = importacao_svc.read_import_file_bytes(contents, file.filename)
-        
-        issues = importacao_svc.validate_clientes_df(df_imp)
-        if not issues["invalid_email"].empty or not issues["invalid_perfil"].empty:
-            raise HTTPException(status_code=400, detail="Planilha contém e-mails ou perfis inválidos.")
-            
-        res = importacao_svc.import_clientes_df(df_imp)
-        return {"status": "success", "resultado": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+# 👇 A NOVA ROTA UNIFICADA E ROBUSTA QUE O FRONTEND ESTÁ CHAMANDO
+@app.post("/api/importar/processar")
+async def processar_importacao(payload: dict):
+    tipo = payload.get("tipo")
+    dados = payload.get("dados", [])
+    chaves_cliente = payload.get("chaves_cliente", [])
+    chaves_resposta = payload.get("chaves_resposta", [])
     
-@app.post("/api/importar/confirmar")
-async def confirmar_importacao_final(payload: dict):
+    configuracao = payload.get("configuracao", {})
+    overwrite = configuracao.get("overwrite", True)
+
+    if not dados:
+        raise HTTPException(status_code=400, detail="Nenhum dado válido recebido.")
+    if not chaves_cliente:
+        raise HTTPException(status_code=400, detail="Defina pelo menos uma chave para identificar o cliente.")
+
+    engine = get_engine()
+    inserted_count = 0
+    updated_count = 0
+    ignored_count = 0
+
     try:
-        # Lê a escolha de overwrite e os dados (usando "dados" que é o novo padrão do Vue)
-        overwrite = payload.get("overwrite", True)
-        dados_clientes = payload.get("dados", [])
-        
-        # Lê as chaves que o utilizador escolheu no ecrã (Padrão fallback: email)
-        chaves_cliente = payload.get("chaves_cliente") or ["email"]
-        
-        if not dados_clientes:
-            raise HTTPException(status_code=400, detail="Nenhum dado enviado.")
-        if not chaves_cliente:
-            raise HTTPException(status_code=400, detail="É necessário definir pelo menos uma chave para identificar o cliente.")
-        
-        engine = get_engine()
-        inserted_count = 0
-        updated_count = 0
-        ignored_count = 0
+        with engine.begin() as conn:
+            
+            # ==========================================
+            # 🏢 1. GARANTIR EMPRESAS, CARGOS E SEGMENTOS
+            # ==========================================
+            # Extrai os nomes únicos do ficheiro para não fazer consultas repetidas
+            empresas_unicas = set()
+            cargos_unicos = set()
+            segmentos_unicos = set()
 
-        # Mapa para uniformizar os nomes das colunas com a Base de Dados
-        mapa_db = {
-            "e-mail": "email", "email_cliente": "email",
-            "cliente_id": "cliente_id", "id_cliente": "cliente_id",
-            "perfil": "perfil_decisor"
-        }
-
-        with engine.begin() as conn: 
-            for c in dados_clientes:
-                # ---------------------------------------------------------
-                # 1. ENCONTRAR O CLIENTE PELA CHAVE DINÂMICA
-                # ---------------------------------------------------------
-                where_clauses = []
-                params_busca = {}
-                has_null = False
+            for row in dados:
+                emp_nome = str(row.get("empresa", "")).strip()
+                if emp_nome: empresas_unicas.add(emp_nome)
                 
-                for idx, col_arq in enumerate(chaves_cliente):
-                    val = str(c.get(col_arq, "")).strip()
-                    if not val:
-                        has_null = True
-                        break
+                # Extrai Cargo e Segmento (apenas se for importação de clientes)
+                if tipo == 'clientes':
+                    cargo_nome = str(row.get("cargo", "")).strip()
+                    if cargo_nome: cargos_unicos.add(cargo_nome)
                     
-                    col_db = mapa_db.get(col_arq.lower(), col_arq.lower())
-                    param_name = f"c_param_{idx}"
-                    where_clauses.append(f"{col_db} = :{param_name}")
-                    params_busca[param_name] = val
-                
-                # Se faltar um dado obrigatório da chave escolhida, ignora a linha
-                if has_null or not where_clauses:
-                    ignored_count += 1
-                    continue
-                    
-                where_sql = " AND ".join(where_clauses)
-                check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
-                existente = conn.execute(check_query, params_busca).fetchone()
+                    seg_nome = str(row.get("segmento", "")).strip()
+                    if seg_nome: segmentos_unicos.add(seg_nome)
+            
+            # 1.1 Verifica e insere as EMPRESAS
+            for emp_nome in empresas_unicas:
+                check_emp_sql = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
+                if not conn.execute(check_emp_sql, {"nome": emp_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_empresas (nome, created_at) VALUES (:nome, CURRENT_TIMESTAMP)"), {"nome": emp_nome})
 
-                # ---------------------------------------------------------
-                # 2. PREPARAR DADOS DO CLIENTE
-                # ---------------------------------------------------------
-                email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
-                
-                params_save = {
-                    "nome": str(c.get("nome", "")).strip(),
-                    "email": email,
-                    "empresa": str(c.get("empresa", "")).strip(),
-                    "perfil": str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip(),
-                    "segmento": str(c.get("segmento", "")).strip()
+            # 1.2 Verifica e insere os CARGOS
+            for cargo_nome in cargos_unicos:
+                check_cargo_sql = text("SELECT id FROM dbo.nps_cargos WHERE nome = :nome")
+                if not conn.execute(check_cargo_sql, {"nome": cargo_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)"), {"nome": cargo_nome})
+
+            # 1.3 Verifica e insere os SEGMENTOS
+            for seg_nome in segmentos_unicos:
+                check_seg_sql = text("SELECT id FROM dbo.nps_segmentos WHERE nome = :nome")
+                if not conn.execute(check_seg_sql, {"nome": seg_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": seg_nome})
+            
+            # ==========================================
+            # 🧑‍💼 2. IMPORTAÇÃO DE BASE DE CLIENTES
+            # ==========================================
+            if tipo == 'clientes':
+                mapa_db = {
+                    "e-mail": "email", "email_cliente": "email",
+                    "cliente_id": "cliente_id", "id_cliente": "cliente_id",
+                    "perfil": "perfil_decisor"
                 }
 
-                # ---------------------------------------------------------
-                # 3. INSERT OU UPDATE
-                # ---------------------------------------------------------
-                if existente:
-                    if overwrite:
-                        # UPDATE inteligente (Atualiza só o que vier preenchido - COALESCE)
-                        params_save["cid"] = existente.cliente_id
-                        update_sql = text("""
-                            UPDATE dbo.nps_clientes 
-                            SET nome = COALESCE(NULLIF(:nome, ''), nome), 
-                                email = COALESCE(NULLIF(:email, ''), email),
-                                empresa = COALESCE(NULLIF(:empresa, ''), empresa), 
-                                perfil_decisor = COALESCE(NULLIF(:perfil, ''), perfil_decisor), 
-                                segmento = COALESCE(NULLIF(:segmento, ''), segmento),
-                                ativo = 1
-                            WHERE cliente_id = :cid
-                        """)
-                        conn.execute(update_sql, params_save)
-                        updated_count += 1
-                    else:
+                for c in dados:
+                    where_clauses = []
+                    params_busca = {}
+                    has_null = False
+
+                    for idx, col_arq in enumerate(chaves_cliente):
+                        val = str(c.get(col_arq, "")).strip()
+                        if not val:
+                            has_null = True
+                            break
+                        col_db = mapa_db.get(col_arq.lower(), col_arq.lower())
+                        param_name = f"c_param_{idx}"
+                        where_clauses.append(f"{col_db} = :{param_name}")
+                        params_busca[param_name] = val
+
+                    if has_null or not where_clauses:
                         ignored_count += 1
-                else:
-                    # INSERT Novo Cliente
-                    params_save["cliente_id"] = "C" + secrets.token_hex(8)
-                    insert_sql = text("""
-                        INSERT INTO dbo.nps_clientes (cliente_id, nome, email, empresa, perfil_decisor, segmento, ativo)
-                        VALUES (:cliente_id, :nome, :email, :empresa, :perfil, :segmento, 1)
-                    """)
-                    conn.execute(insert_sql, params_save)
-                    inserted_count += 1
-        
-        return {
-            "status": "success", 
-            "resultado": {
-                "inserted": inserted_count, 
-                "updated": updated_count,
-                "ignored": ignored_count,
-                "total": inserted_count + updated_count + ignored_count
-            }
-        }
-    
-    except Exception as e:
-        import traceback
-        print(f"🔥 Erro na confirmação de Clientes: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.post("/api/importar/respostas")
-async def confirmar_importacao_respostas(payload: dict):
-    try:
-        dados_respostas = payload.get("dados", [])
-        # 👇 Recebe as chaves dinâmicas do Vue.js
-        chaves_cliente = payload.get("chaves_cliente", ["email_cliente"])
-        chaves_resposta = payload.get("chaves_resposta", [])
-        overwrite = payload.get("overwrite", True)
-        
-        if not dados_respostas:
-            raise HTTPException(status_code=400, detail="Nenhum dado de resposta enviado.")
-        if not chaves_cliente:
-            raise HTTPException(status_code=400, detail="É necessário definir pelo menos uma chave para identificar o cliente.")
-        
-        engine = get_engine()
-        inserted_count = 0
-        updated_count = 0
-        ignored_count = 0
+                        continue
 
-        # Mapa inteligente para traduzir colunas comuns do Excel para o Banco
-        mapa_clientes = {
-            "email_cliente": "email", "email": "email", "e-mail": "email",
-            "cliente_id": "cliente_id", "id_cliente": "cliente_id",
-            "empresa": "empresa", "nome": "nome"
-        }
-        mapa_respostas = {
-            "data_resposta": "CAST(data_resposta AS DATE)",
-            "data": "CAST(data_resposta AS DATE)",
-            "resposta_id": "resposta_id", "id_resposta": "resposta_id"
-        }
+                    where_sql = " AND ".join(where_clauses)
+                    check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
+                    existente = conn.execute(check_query, params_busca).fetchone()
 
-        with engine.begin() as conn: 
-            for r in dados_respostas:
-                nota_str = str(r.get("nota", "")).strip()
-                try:
-                    nota = int(nota_str)
-                except ValueError:
-                    ignored_count += 1
-                    continue
+                    email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
+                    
+                    # 👇 AQUI ADICIONAMOS O CARGO NO PAYLOAD PARA SALVAR NO CLIENTE
+                    params_save = {
+                        "nome": str(c.get("nome", "")).strip(),
+                        "email": email,
+                        "empresa": str(c.get("empresa", "")).strip(),
+                        "cargo": str(c.get("cargo", "")).strip(),
+                        "perfil": str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip(),
+                        "segmento": str(c.get("segmento", "")).strip()
+                    }
 
-                if nota >= 9: categoria_nps = "Promotor"
-                elif nota >= 7: categoria_nps = "Neutro"
-                else: categoria_nps = "Detrator"
-                
-                # ---------------------------------------------------------
-                # 1. ENCONTRAR O CLIENTE (Query Dinâmica Baseada na Seleção)
-                # ---------------------------------------------------------
-                where_clauses = []
-                params_cliente = {}
-                has_null = False
-                
-                for idx, col_arq in enumerate(chaves_cliente):
-                    val = str(r.get(col_arq, "")).strip()
-                    if not val:
-                        has_null = True
-                        break
-                    
-                    col_db = mapa_clientes.get(col_arq.lower(), col_arq.lower())
-                    param_name = f"c_param_{idx}"
-                    where_clauses.append(f"{col_db} = :{param_name}")
-                    params_cliente[param_name] = val
-                    
-                if has_null or not where_clauses:
-                    ignored_count += 1
-                    continue
-                    
-                where_sql = " AND ".join(where_clauses)
-                check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
-                cliente_existente = conn.execute(check_query, params_cliente).fetchone()
+                    if existente:
+                        if overwrite:
+                            params_save["cid"] = existente.cliente_id
+                            # 👇 AQUI ATUALIZAMOS O CARGO NO UPDATE
+                            update_sql = text("""
+                                UPDATE dbo.nps_clientes 
+                                SET nome = COALESCE(NULLIF(:nome, ''), nome), 
+                                    email = COALESCE(NULLIF(:email, ''), email),
+                                    empresa = COALESCE(NULLIF(:empresa, ''), empresa), 
+                                    cargo = COALESCE(NULLIF(:cargo, ''), cargo),
+                                    perfil_decisor = COALESCE(NULLIF(:perfil, ''), perfil_decisor), 
+                                    segmento = COALESCE(NULLIF(:segmento, ''), segmento),
+                                    ativo = 1
+                                WHERE cliente_id = :cid
+                            """)
+                            conn.execute(update_sql, params_save)
+                            updated_count += 1
+                        else:
+                            ignored_count += 1
+                    else:
+                        params_save["cliente_id"] = str(random.randint(100000000, 999999999))
+                        # 👇 AQUI INSERIMOS O CARGO NO NOVO CLIENTE
+                        insert_sql = text("""
+                            INSERT INTO dbo.nps_clientes (cliente_id, nome, email, empresa, cargo, perfil_decisor, segmento, ativo)
+                            VALUES (:cliente_id, :nome, :email, :empresa, :cargo, :perfil, :segmento, 1)
+                        """)
+                        conn.execute(insert_sql, params_save)
+                        inserted_count += 1
 
-                if not cliente_existente:
-                    ignored_count += 1 
-                    continue
-                
-                cliente_id = cliente_existente.cliente_id
-                
-                # ---------------------------------------------------------
-                # 2. VERIFICAR DUPLICIDADE DA RESPOSTA (Deduplicação Dinâmica)
-                # ---------------------------------------------------------
-                resposta_existente_id = None
-                if chaves_resposta:
-                    where_resp = ["cliente_id = :cid"]
-                    params_resp = {"cid": cliente_id}
-                    has_null_resp = False
-                    
-                    for idx, col_arq in enumerate(chaves_resposta):
+            # ==========================================
+            # 📊 3. IMPORTAÇÃO DE HISTÓRICO DE RESPOSTAS
+            # ==========================================
+            elif tipo == 'respostas':
+                mapa_clientes = {
+                    "email_cliente": "email", "email": "email", "e-mail": "email",
+                    "cliente_id": "cliente_id", "id_cliente": "cliente_id",
+                    "empresa": "empresa", "nome": "nome"
+                }
+                mapa_respostas = {
+                    "data_resposta": "CAST(data_resposta AS DATE)",
+                    "data": "CAST(data_resposta AS DATE)",
+                    "resposta_id": "resposta_id", "id_resposta": "resposta_id"
+                }
+
+                for r in dados:
+                    nota_str = str(r.get("nota", "")).strip()
+                    try:
+                        nota = int(nota_str)
+                    except ValueError:
+                        ignored_count += 1
+                        continue
+
+                    if nota >= 9: categoria_nps = "Promotor"
+                    elif nota >= 7: categoria_nps = "Neutro"
+                    else: categoria_nps = "Detrator"
+
+                    where_clauses = []
+                    params_cliente = {}
+                    has_null = False
+
+                    for idx, col_arq in enumerate(chaves_cliente):
                         val = str(r.get(col_arq, "")).strip()
                         if not val:
-                            has_null_resp = True
+                            has_null = True
                             break
+                        col_db = mapa_clientes.get(col_arq.lower(), col_arq.lower())
+                        param_name = f"c_param_{idx}"
+                        where_clauses.append(f"{col_db} = :{param_name}")
+                        params_cliente[param_name] = val
                         
-                        col_db = mapa_respostas.get(col_arq.lower(), col_arq.lower())
-                        param_name = f"r_param_{idx}"
-                        
-                        if "DATE" in col_db:
-                            where_resp.append(f"{col_db} = CAST(:{param_name} AS DATE)")
-                            params_resp[param_name] = val[:10] # Força captura apenas da data AAAA-MM-DD
-                        else:
-                            where_resp.append(f"{col_db} = :{param_name}")
-                            params_resp[param_name] = val
-                            
-                    if not has_null_resp:
-                        resp_sql = " AND ".join(where_resp)
-                        check_resp_query = text(f"SELECT resposta_id FROM dbo.nps_respostas WHERE {resp_sql}")
-                        resp_existente = conn.execute(check_resp_query, params_resp).fetchone()
-                        if resp_existente:
-                            resposta_existente_id = resp_existente.resposta_id
-
-                dt_resposta = r.get("data_resposta")
-                if not dt_resposta or str(dt_resposta).strip() == "":
-                    dt_resposta = None
-                motivo = str(r.get("motivo", "")).strip()
-
-                # ---------------------------------------------------------
-                # 3. INSERT OU UPDATE
-                # ---------------------------------------------------------
-                if resposta_existente_id:
-                    if overwrite:
-                        update_sql = text("""
-                            UPDATE dbo.nps_respostas
-                            SET nota = :nota, motivo = :motivo, categoria = :categoria,
-                                data_resposta = COALESCE(:dt_resp, data_resposta),
-                                excluido = 0
-                            WHERE resposta_id = :rid
-                        """)
-                        conn.execute(update_sql, {
-                            "nota": nota, "motivo": motivo, "categoria": categoria_nps,
-                            "dt_resp": dt_resposta, "rid": resposta_existente_id
-                        })
-                        updated_count += 1
-                    else:
+                    if has_null or not where_clauses:
                         ignored_count += 1
-                else:
-                    resposta_id = "R" + secrets.token_hex(8)
-                    insert_sql = text("""
-                        INSERT INTO dbo.nps_respostas (
-                            resposta_id, cliente_id, nota, motivo, categoria, 
-                            canal, excluido, data_resposta, created_at
-                        )
-                        VALUES (
-                            :rid, :cid, :nota, :motivo, :categoria, 
-                            'Importacao_Manual', 0, :dt_resp, SYSUTCDATETIME()
-                        )
-                    """)
-                    conn.execute(insert_sql, {
-                        "rid": resposta_id, "cid": cliente_id, "nota": nota,
-                        "motivo": motivo, "categoria": categoria_nps, "dt_resp": dt_resposta
-                    })
-                    inserted_count += 1
+                        continue
+                        
+                    where_sql = " AND ".join(where_clauses)
+                    check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
+                    cliente_existente = conn.execute(check_query, params_cliente).fetchone()
+
+                    if not cliente_existente:
+                        ignored_count += 1 
+                        continue
+                    
+                    cliente_id = cliente_existente.cliente_id
+                    
+                    resposta_existente_id = None
+                    if chaves_resposta:
+                        where_resp = ["cliente_id = :cid"]
+                        params_resp = {"cid": cliente_id}
+                        has_null_resp = False
+                        
+                        for idx, col_arq in enumerate(chaves_resposta):
+                            val = str(r.get(col_arq, "")).strip()
+                            if not val:
+                                has_null_resp = True
+                                break
+                            col_db = mapa_respostas.get(col_arq.lower(), col_arq.lower())
+                            param_name = f"r_param_{idx}"
+                            
+                            if "DATE" in col_db:
+                                where_resp.append(f"{col_db} = CAST(:{param_name} AS DATE)")
+                                params_resp[param_name] = val[:10] 
+                            else:
+                                where_resp.append(f"{col_db} = :{param_name}")
+                                params_resp[param_name] = val
+                                
+                        if not has_null_resp:
+                            resp_sql = " AND ".join(where_resp)
+                            check_resp_query = text(f"SELECT resposta_id FROM dbo.nps_respostas WHERE {resp_sql}")
+                            resp_existente = conn.execute(check_resp_query, params_resp).fetchone()
+                            if resp_existente:
+                                resposta_existente_id = resp_existente.resposta_id
+
+                    dt_resposta = r.get("data_resposta")
+                    if not dt_resposta or str(dt_resposta).strip() == "":
+                        dt_resposta = None
+                    motivo = str(r.get("comentario", r.get("motivo", ""))).strip()
+
+                    if resposta_existente_id:
+                        if overwrite:
+                            update_sql = text("""
+                                UPDATE dbo.nps_respostas
+                                SET nota = :nota, motivo = :motivo, categoria = :categoria,
+                                    data_resposta = COALESCE(:dt_resp, data_resposta),
+                                    excluido = 0
+                                WHERE resposta_id = :rid
+                            """)
+                            conn.execute(update_sql, {
+                                "nota": nota, "motivo": motivo, "categoria": categoria_nps,
+                                "dt_resp": dt_resposta, "rid": resposta_existente_id
+                            })
+                            updated_count += 1
+                        else:
+                            ignored_count += 1
+                    else:
+                        resposta_id = str(random.randint(100000000, 999999999))
+                        insert_sql = text("""
+                            INSERT INTO dbo.nps_respostas (
+                                resposta_id, cliente_id, nota, motivo, categoria, 
+                                canal, excluido, data_resposta, created_at
+                            )
+                            VALUES (
+                                :rid, :cid, :nota, :motivo, :categoria, 
+                                'Importacao_Manual', 0, :dt_resp, SYSUTCDATETIME()
+                            )
+                        """)
+                        conn.execute(insert_sql, {
+                            "rid": resposta_id, "cid": cliente_id, "nota": nota,
+                            "motivo": motivo, "categoria": categoria_nps, "dt_resp": dt_resposta
+                        })
+                        inserted_count += 1
 
         return {
             "status": "success", 
-            "resultado": {
-                "inserted": inserted_count, 
-                "updated": updated_count,
-                "ignored": ignored_count,
-                "total": inserted_count + updated_count + ignored_count
-            }
+            "inseridos": inserted_count + updated_count,
+            "erros": ignored_count,
+            "detalhes": []
         }
+
     except Exception as e:
         import traceback
-        print(f"🔥 Erro na importação de respostas: {traceback.format_exc()}")
+        print(f"🔥 Erro na importação: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.delete("/api/admin/limpar-dados")
+def limpar_dados_em_massa(tipo: str, usuario = Depends(get_current_user)):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            if tipo == 'respostas':
+                # Apaga apenas as respostas (mantém os clientes intactos)
+                conn.execute(text("DELETE FROM dbo.nps_respostas"))
+                msg = "Todas as respostas (NPS) foram apagadas com sucesso."
+                
+            elif tipo == 'clientes':
+                # Para apagar clientes, OBRIGATORIAMENTE temos de apagar as respostas deles primeiro
+                conn.execute(text("DELETE FROM dbo.nps_respostas"))
+                conn.execute(text("DELETE FROM dbo.nps_clientes"))
+                msg = "Todos os clientes e respostas foram apagados com sucesso."
+                
+            else:
+                raise HTTPException(status_code=400, detail="Comando de limpeza inválido.")
+                
+        return {"status": "success", "message": msg}
+        
+    except Exception as e:
+        import traceback
+        print(f"Erro ao limpar banco: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Erro interno ao limpar dados: {str(e)}")
 
 # ==========================================
 # 🔂 ROTAS: STATUS DE CONEXÃO
