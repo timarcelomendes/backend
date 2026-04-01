@@ -2110,8 +2110,15 @@ def create_cliente_route(payload: ClienteCreate):
 def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     try:
         clientes_svc.update_cliente(
-            cliente_id, payload.nome, payload.email, payload.telefone, 
-            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo
+            cliente_id, 
+            payload.nome, 
+            payload.email, 
+            payload.telefone, 
+            payload.empresa, 
+            payload.perfil_decisor, 
+            payload.segmento, 
+            payload.cargo,
+            payload.ativo 
         )
         return {"status": "success", "message": "Cliente atualizado."}
         
@@ -2127,6 +2134,41 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
     except Exception as e:
         import traceback
         traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 🛑 ROTAS PARA ATIVAR / INATIVAR PESSOAS E EMPRESAS
+# ==========================================
+
+@app.put("/api/clientes/{cliente_id}/status")
+def alterar_status_cliente(cliente_id: str, payload: dict):
+    try:
+        # Pega o valor (True/False ou 1/0) e converte para Inteiro do SQL (1 ou 0)
+        ativo = 1 if payload.get("ativo") else 0
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE dbo.nps_clientes 
+                SET ativo = :a, updated_at = CURRENT_TIMESTAMP 
+                WHERE cliente_id = :id
+            """), {"a": ativo, "id": cliente_id})
+        return {"status": "success", "message": "Status atualizado."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/empresas/{empresa_id}/status")
+def alterar_status_empresa(empresa_id: int, payload: dict):
+    try:
+        ativo = 1 if payload.get("ativo") else 0
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE dbo.nps_empresas 
+                SET ativo = :a 
+                WHERE id = :id
+            """), {"a": ativo, "id": empresa_id})
+        return {"status": "success", "message": "Status atualizado."}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
@@ -2342,6 +2384,13 @@ async def processar_importacao(payload: dict):
                 if not conn.execute(check_seg_sql, {"nome": seg_nome}).fetchone():
                     conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": seg_nome})
             
+            # 1.4 Data de envio (aceita 'ultimo_envio' ou 'data_ultimo_envio')
+            raw_dt_envio = str(r.get("ultimo_envio", r.get("data_ultimo_envio", ""))).strip()
+            dt_envio = None
+            if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', '']:
+                dt_envio = raw_dt_envio
+            params_save["ultimo_envio"] = dt_envio
+            
             # ==========================================
             # 🧑‍💼 2. IMPORTAÇÃO DE BASE DE CLIENTES
             # ==========================================
@@ -2377,20 +2426,28 @@ async def processar_importacao(payload: dict):
 
                     email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
                     
-                    # 👇 AQUI ADICIONAMOS O CARGO NO PAYLOAD PARA SALVAR NO CLIENTE
+                    # 👇 1. CAPTURAMOS A DATA AQUI (dentro do loop, lendo a variável 'c')
+                    raw_dt_envio = str(c.get("ultimo_envio", c.get("data_ultimo_envio", ""))).strip()
+                    dt_envio = None
+                    if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', '']:
+                        dt_envio = raw_dt_envio
+                    
+                    # 👇 2. ADICIONAMOS A DATA AO PACOTE DE DADOS DO CLIENTE
                     params_save = {
                         "nome": str(c.get("nome", "")).strip(),
                         "email": email,
                         "empresa": str(c.get("empresa", "")).strip(),
                         "cargo": str(c.get("cargo", "")).strip(),
                         "perfil": str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip(),
-                        "segmento": str(c.get("segmento", "")).strip()
+                        "segmento": str(c.get("segmento", "")).strip(),
+                        "ultimo_envio": dt_envio # <--- A data entra aqui
                     }
 
                     if existente:
                         if overwrite:
                             params_save["cid"] = existente.cliente_id
-                            # 👇 AQUI ATUALIZAMOS O CARGO NO UPDATE
+                            
+                            # 👇 3. ADICIONAMOS A DATA AO UPDATE COM COALESCE
                             update_sql = text("""
                                 UPDATE dbo.nps_clientes 
                                 SET nome = COALESCE(NULLIF(:nome, ''), nome), 
@@ -2399,7 +2456,9 @@ async def processar_importacao(payload: dict):
                                     cargo = COALESCE(NULLIF(:cargo, ''), cargo),
                                     perfil_decisor = COALESCE(NULLIF(:perfil, ''), perfil_decisor), 
                                     segmento = COALESCE(NULLIF(:segmento, ''), segmento),
-                                    ativo = 1
+                                    ativo = 1,
+                                    ultimo_envio = COALESCE(:ultimo_envio, ultimo_envio),
+                                    updated_at = CURRENT_TIMESTAMP
                                 WHERE cliente_id = :cid
                             """)
                             conn.execute(update_sql, params_save)
@@ -2408,10 +2467,17 @@ async def processar_importacao(payload: dict):
                             ignored_count += 1
                     else:
                         params_save["cliente_id"] = str(random.randint(100000000, 999999999))
-                        # 👇 AQUI INSERIMOS O CARGO NO NOVO CLIENTE
+                        
+                        # 👇 4. ADICIONAMOS A DATA AO INSERT
                         insert_sql = text("""
-                            INSERT INTO dbo.nps_clientes (cliente_id, nome, email, empresa, cargo, perfil_decisor, segmento, ativo)
-                            VALUES (:cliente_id, :nome, :email, :empresa, :cargo, :perfil, :segmento, 1)
+                            INSERT INTO dbo.nps_clientes (
+                                cliente_id, nome, email, empresa, cargo, 
+                                perfil_decisor, segmento, ativo, ultimo_envio
+                            )
+                            VALUES (
+                                :cliente_id, :nome, :email, :empresa, :cargo, 
+                                :perfil, :segmento, 1, :ultimo_envio
+                            )
                         """)
                         conn.execute(insert_sql, params_save)
                         inserted_count += 1

@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import random
 import hashlib
 import requests
 import pandas as pd
@@ -141,9 +142,12 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     return read_df(sql, params)
 
-def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str):
-    cliente_id = make_cliente_id(email, empresa)
+def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, cargo: str, segmento: str, ultimo_envio: str = None):
+    
+    # 👇 1. GERA O ID NUMÉRICO (Aleatório de 9 dígitos)
+    cliente_id = str(random.randint(100000000, 999999999))
 
+    # 👇 2. SQL ATUALIZADO (Substituímos o NULL pelo :ultimo_envio)
     sql = """
     INSERT INTO dbo.nps_clientes
       (cliente_id, nome, email, telefone, cargo, empresa, perfil_decisor, segmento,
@@ -151,7 +155,7 @@ def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_de
        created_at, updated_at)
     VALUES
       (:cliente_id, :nome, :email, :telefone, :cargo, :empresa, :perfil_decisor, :segmento,
-       1, 'Pendente', NULL, CAST(GETDATE() AS DATE), NULL,
+       1, 'Pendente', :ultimo_envio, CAST(GETDATE() AS DATE), NULL,
        SYSUTCDATETIME(), SYSUTCDATETIME());
     """
 
@@ -168,12 +172,15 @@ def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_de
                 "empresa": (empresa or "").strip(),
                 "perfil_decisor": perfil_decisor,
                 "segmento": (segmento or "").strip() or None,
+                "ultimo_envio": ultimo_envio # 👈 Passamos a data (ou None) para a query
             }
         )
 
     return cliente_id
 
-def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str):
+def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str, ativo: bool = True):
+    ativo_sql = 1 if ativo else 0
+    
     sql = """
     UPDATE dbo.nps_clientes 
     SET 
@@ -184,6 +191,7 @@ def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empres
         perfil_decisor = :perfil_decisor, 
         segmento = :segmento, 
         cargo = :cargo,
+        ativo = :ativo, -- 👈 Agora gravamos o status!
         updated_at = SYSUTCDATETIME()
     WHERE cliente_id = :cliente_id;
     """
@@ -196,7 +204,8 @@ def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empres
         "empresa": (empresa or "").strip() or None,
         "perfil_decisor": (perfil_decisor or "").strip() or None,
         "segmento": (segmento or "").strip() or None,
-        "cargo": (cargo or "").strip() or None
+        "cargo": (cargo or "").strip() or None,
+        "ativo": ativo_sql # 👈 Injetamos o 1 ou 0 na base de dados
     })
 
 def set_ativo(cliente_id: str, ativo: int):
