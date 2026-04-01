@@ -226,6 +226,8 @@ class ConfigEmailSchema(BaseModel):
     client_secret: str
     email_remetente: EmailStr
     base_url_frontend: Optional[str] = "http://localhost:5173"
+    envios_ativos: Optional[bool] = True
+
 
 class RegistroRequest(BaseModel):
     nome: str
@@ -2667,38 +2669,56 @@ async def buscar_config_email():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # Busca a configuração
+            # 1. Busca as credenciais de e-mail
             query = text("SELECT TOP 1 * FROM dbo.nps_configuracoes_email")
             res = conn.execute(query).fetchone()
             
-            if not res:
-                # 💡 Se não houver dados, devolvemos um objeto vazio em vez de erro
-                return {}
+            dados = dict(res._mapping) if res else {}
             
-            # Converte a linha do SQL para um dicionário
-            return dict(res._mapping)
+            # 2. Busca o estado da Chave Mestra (Kill Switch)
+            query_ks = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")
+            res_ks = conn.execute(query_ks).scalar()
+            
+            # Se a chave existir, converte para booleano. Se não existir, assume True (Ligado).
+            if res_ks is not None:
+                dados["envios_ativos"] = str(res_ks).lower() == 'true'
+            else:
+                dados["envios_ativos"] = True
+                
+            return dados
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/config/email")
-async def salvar_config_email(config: ConfigEmailSchema): # Assume que criaste o Schema
+async def salvar_config_email(config: ConfigEmailSchema):
     engine = get_engine()
-    with engine.connect() as conn:
-        # Limpamos e inserimos (ou fazemos UPDATE)
+    # Usamos begin() para garantir que tudo salva junto (Transação)
+    with engine.begin() as conn: 
+        # 1. Limpamos e inserimos as credenciais de e-mail (Microsoft)
         conn.execute(text("DELETE FROM dbo.nps_configuracoes_email"))
-        query = text("""
+        query_email = text("""
             INSERT INTO dbo.nps_configuracoes_email 
             (tenant_id, client_id, client_secret, email_remetente, base_url_frontend)
             VALUES (:t, :c, :s, :e, :b)
         """)
-        conn.execute(query, {
+        conn.execute(query_email, {
             "t": config.tenant_id, 
             "c": config.client_id, 
             "s": config.client_secret, 
             "e": config.email_remetente,
-            "b": config.base_url_frontend # 👈 Grava o valor vindo da interface
+            "b": config.base_url_frontend 
         })
-        conn.commit()
+        
+        # 2. Salva o status do Botão de Pânico na tabela global (como texto 'true' ou 'false')
+        valor_kill_switch = 'true' if config.envios_ativos else 'false'
+        query_ks = text("""
+            IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos')
+                UPDATE dbo.nps_configuracoes SET valor = :v WHERE chave = 'envios_ativos'
+            ELSE
+                INSERT INTO dbo.nps_configuracoes (chave, valor) VALUES ('envios_ativos', :v)
+        """)
+        conn.execute(query_ks, {"v": valor_kill_switch})
+
     return {"status": "sucesso"}
 
 @app.post("/api/config/email/autorizar")
