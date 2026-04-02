@@ -10,6 +10,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Any
 from contextlib import asynccontextmanager
+import shutil
+from fastapi.staticfiles import StaticFiles
 
 import pandas as pd
 import bcrypt
@@ -2341,6 +2343,31 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
     except Exception as e:
         print(f"Erro ao inserir resposta manual: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 🗑️ EXCLUSÃO DEFINITIVA DE FEEDBACKS (ADMIN)
+# ==========================================
+@app.delete("/api/respostas/{resposta_id}")
+def excluir_resposta_definitiva(resposta_id: str, usuario = Depends(exigir_admin)):
+    """Exclui permanentemente uma resposta do banco de dados (Apenas Admins)"""
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            check = conn.execute(text("SELECT resposta_id FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id}).fetchone()
+            if not check:
+                raise HTTPException(status_code=404, detail="Resposta não encontrada.")
+            
+            conn.execute(text("DELETE FROM dbo.nps_acoes WHERE resposta_id = :id"), {"id": resposta_id})
+                
+            conn.execute(text("DELETE FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id})
+            
+        return {"status": "success", "message": "Feedback e ações vinculadas foram excluídos permanentemente."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Erro ao excluir resposta: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Erro interno ao excluir a resposta.")
 
 # ==========================================
 # 📥 ROTAS: IMPORTAÇÃO
@@ -2990,6 +3017,62 @@ def forcar_disparo_nps(background_tasks: BackgroundTasks):
         # Adiciona a tarefa ao background para responder ao Frontend imediatamente
         background_tasks.add_task(processar_disparos_nps)
         return {"status": "success", "message": "Disparo iniciado com sucesso! A enviar em segundo plano."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# 🖼️ GESTOR DE IMAGENS (E-MAIL TEMPLATES)
+# ==========================================
+
+# 1. Garante que a pasta "uploads" existe fisicamente no servidor
+os.makedirs("uploads", exist_ok=True)
+
+# 2. Transforma a pasta "uploads" numa pasta pública, para que os e-mails consigam aceder
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+@app.post("/api/upload-imagem")
+async def upload_imagem_email(file: UploadFile = File(...), request: Request = None):
+    try:
+        # Salva o ficheiro na pasta local
+        file_location = f"uploads/{file.filename}"
+        with open(file_location, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+        
+        # Gera a URL completa pública baseada no domínio do seu backend
+        base_url = str(request.base_url).rstrip("/")
+        file_url = f"{base_url}/uploads/{file.filename}"
+        
+        return {"nome": file.filename, "url": file_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+@app.get("/api/config/imagens")
+def listar_imagens(request: Request):
+    """Devolve a lista de todas as imagens já hospedadas no servidor"""
+    try:
+        base_url = str(request.base_url).rstrip("/")
+        imagens = []
+        if os.path.exists("uploads"):
+            for filename in os.listdir("uploads"):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                    imagens.append({
+                        "nome": filename,
+                        "url": f"{base_url}/uploads/{filename}"
+                    })
+        # Ordena para as mais recentes aparecerem primeiro
+        imagens.sort(key=lambda x: os.path.getmtime(f"uploads/{x['nome']}"), reverse=True)
+        return imagens
+    except Exception as e:
+        return []
+
+@app.delete("/api/config/imagens/{nome_arquivo}")
+def remover_imagem(nome_arquivo: str):
+    try:
+        file_path = f"uploads/{nome_arquivo}"
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return {"status": "success"}
+        raise HTTPException(status_code=404, detail="Imagem não encontrada.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
