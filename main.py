@@ -2982,32 +2982,37 @@ async def testar_envio_email(usuario_email: str = Depends(get_current_user)):
     
 @app.get("/api/config/nps/elegiveis")
 def contar_elegiveis_nps():
-    """Conta quantos clientes estão prontos para receber o NPS hoje"""
+    """Conta corretamente quantos clientes estão prontos para receber o NPS hoje"""
     try:
         engine = get_engine()
         with engine.connect() as conn:
             sql = text("""
-                SELECT c.cliente_id, c.nome, c.email
+                SELECT COUNT(*) 
                 FROM dbo.nps_clientes c
                 LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
                 WHERE c.ativo = 1 
                 AND (
-                    -- 1. Clientes que NUNCA receberam a pesquisa
+                    -- 1. Clientes que NUNCA receberam a pesquisa (campos de data nulos)
                     COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL 
                     
                     OR 
                     
-                    -- 2. Clientes cuja data de carência (recorrencia_dias) já foi ultrapassada!
+                    -- 2. Clientes que já cumpriram o tempo de carência (recorrencia_dias)
                     GETDATE() >= DATEADD(day, 
                         ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
                         COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
                     )
                 )
             """)
-            total = conn.execute(sql).scalar()
+            
+            resultado = conn.execute(sql).scalar()
+            
+            total = int(resultado) if resultado is not None else 0
+            
         return {"total": total}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Erro ao contar elegíveis: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao calcular fila de disparos.")
 
 @app.post("/api/config/nps/forcar-disparo")
 def forcar_disparo_nps(background_tasks: BackgroundTasks):
