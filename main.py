@@ -289,6 +289,7 @@ class ClienteUpdate(BaseModel):
     segmento: Optional[str] = ""
     cargo: str
     gestor: Optional[str] = ""
+    ativo: Optional[bool] = True
 
 class StatusUpdate(BaseModel):
     ativo: bool
@@ -1943,7 +1944,8 @@ async def listar_empresas():
             SELECT 
                 e.id, e.nome, e.segmento, e.valor_contrato as arr_total, 
                 g.nome as gestor, e.gestor_id,
-                comp.nome as companhia, e.companhia_id
+                comp.nome as companhia, e.companhia_id,
+                e.ativo -- 👈 ADICIONADO AQUI!
             FROM dbo.nps_empresas e
             LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
             LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
@@ -2038,7 +2040,7 @@ def list_clientes(
     q: str = "", 
     ativo: str = "Ativos", 
     perfil: str = "Todos", 
-    topn: int = 200,
+    topn: int = 100000,
     _t: str = None,
     usuario_email: str = Depends(get_current_user)
 ):
@@ -2182,7 +2184,7 @@ async def listar_respostas(
     categoria: str = "Todas",
     perfil: str = "Todos",
     incluir_excluidas: bool = False,
-    topn: int = 300
+    topn: int = 100000
 ):
     try:
         from services import respostas_svc
@@ -2299,15 +2301,20 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 async def preview_importacao(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        
         if file.filename.lower().endswith(('.xlsx', '.xls')):
             df = pd.read_excel(io.BytesIO(contents))
         else:
             try:
-                df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='utf-8')
+                conteudo_texto = contents.decode('utf-8-sig').strip()
             except UnicodeDecodeError:
-                df = pd.read_csv(io.BytesIO(contents), sep=None, engine='python', encoding='latin1')
+                conteudo_texto = contents.decode('latin1').strip()
+                
+            if not conteudo_texto:
+                raise ValueError("O ficheiro está vazio ou só contém linhas em branco.")
+
+            df = pd.read_csv(io.StringIO(conteudo_texto), sep=None, engine='python')
         
-        # Força todos os cabeçalhos a ficarem minúsculos e sem espaços extra
         df.columns = df.columns.str.strip().str.lower()
         
         df = df.fillna("")
@@ -2322,7 +2329,7 @@ async def preview_importacao(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Erro ao ler arquivo: {str(e)}")
 
 
-# 👇 A NOVA ROTA UNIFICADA E ROBUSTA QUE O FRONTEND ESTÁ CHAMANDO
+# A NOVA ROTA UNIFICADA E ROBUSTA QUE O FRONTEND ESTÁ CHAMANDO
 @app.post("/api/importar/processar")
 async def processar_importacao(payload: dict):
     tipo = payload.get("tipo")
@@ -2330,8 +2337,10 @@ async def processar_importacao(payload: dict):
     chaves_cliente = payload.get("chaves_cliente", [])
     chaves_resposta = payload.get("chaves_resposta", [])
     
+    # 👇 1. CAPTURAMOS A COMPANHIA SELECIONADA NO FRONTEND
     configuracao = payload.get("configuracao", {})
     overwrite = configuracao.get("overwrite", True)
+    companhia_id_selecionada = configuracao.get("companhia_id") # Pode ser None
 
     if not dados:
         raise HTTPException(status_code=400, detail="Nenhum dado válido recebido.")
@@ -2343,22 +2352,23 @@ async def processar_importacao(payload: dict):
     updated_count = 0
     ignored_count = 0
 
+    detalhes_erros = [] 
+
     try:
         with engine.begin() as conn:
             
             # ==========================================
-            # 🏢 1. GARANTIR EMPRESAS, CARGOS E SEGMENTOS
+            # 🏢 1. GARANTIR EMPRESAS COM A COMPANHIA DO DROPDOWN
             # ==========================================
-            # Extrai os nomes únicos do ficheiro para não fazer consultas repetidas
             empresas_unicas = set()
             cargos_unicos = set()
             segmentos_unicos = set()
 
             for row in dados:
                 emp_nome = str(row.get("empresa", "")).strip()
-                if emp_nome: empresas_unicas.add(emp_nome)
+                if emp_nome: 
+                    empresas_unicas.add(emp_nome)
                 
-                # Extrai Cargo e Segmento (apenas se for importação de clientes)
                 if tipo == 'clientes':
                     cargo_nome = str(row.get("cargo", "")).strip()
                     if cargo_nome: cargos_unicos.add(cargo_nome)
@@ -2366,11 +2376,25 @@ async def processar_importacao(payload: dict):
                     seg_nome = str(row.get("segmento", "")).strip()
                     if seg_nome: segmentos_unicos.add(seg_nome)
             
-            # 1.1 Verifica e insere as EMPRESAS
+            # 1.1 Insere ou Atualiza as EMPRESAS
             for emp_nome in empresas_unicas:
                 check_emp_sql = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
-                if not conn.execute(check_emp_sql, {"nome": emp_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_empresas (nome, created_at) VALUES (:nome, CURRENT_TIMESTAMP)"), {"nome": emp_nome})
+                emp_existente = conn.execute(check_emp_sql, {"nome": emp_nome}).fetchone()
+
+                if not emp_existente:
+                    # Cria a empresa nova já com a Companhia selecionada no UI (mesmo que seja None)
+                    conn.execute(text("""
+                        INSERT INTO dbo.nps_empresas (nome, companhia_id, created_at) 
+                        VALUES (:nome, :comp_id, CURRENT_TIMESTAMP)
+                    """), {"nome": emp_nome, "comp_id": companhia_id_selecionada})
+                else:
+                    # Se a empresa já existe e o utilizador escolheu uma Companhia no UI, atualiza o vínculo
+                    if overwrite and companhia_id_selecionada:
+                        conn.execute(text("""
+                            UPDATE dbo.nps_empresas 
+                            SET companhia_id = :comp_id 
+                            WHERE id = :id
+                        """), {"comp_id": companhia_id_selecionada, "id": emp_existente.id})
 
             # 1.2 Verifica e insere os CARGOS
             for cargo_nome in cargos_unicos:
@@ -2383,13 +2407,6 @@ async def processar_importacao(payload: dict):
                 check_seg_sql = text("SELECT id FROM dbo.nps_segmentos WHERE nome = :nome")
                 if not conn.execute(check_seg_sql, {"nome": seg_nome}).fetchone():
                     conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": seg_nome})
-            
-            # 1.4 Data de envio (aceita 'ultimo_envio' ou 'data_ultimo_envio')
-            raw_dt_envio = str(r.get("ultimo_envio", r.get("data_ultimo_envio", ""))).strip()
-            dt_envio = None
-            if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', '']:
-                dt_envio = raw_dt_envio
-            params_save["ultimo_envio"] = dt_envio
             
             # ==========================================
             # 🧑‍💼 2. IMPORTAÇÃO DE BASE DE CLIENTES
@@ -2426,13 +2443,14 @@ async def processar_importacao(payload: dict):
 
                     email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
                     
-                    # 👇 1. CAPTURAMOS A DATA AQUI (dentro do loop, lendo a variável 'c')
                     raw_dt_envio = str(c.get("ultimo_envio", c.get("data_ultimo_envio", ""))).strip()
                     dt_envio = None
                     if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', '']:
                         dt_envio = raw_dt_envio
                     
-                    # 👇 2. ADICIONAMOS A DATA AO PACOTE DE DADOS DO CLIENTE
+                    raw_ativo = str(c.get("ativo", "True")).strip().lower()
+                    status_ativo = 0 if raw_ativo in ['false', '0', 'falso', 'nao', 'não', 'f'] else 1
+
                     params_save = {
                         "nome": str(c.get("nome", "")).strip(),
                         "email": email,
@@ -2440,14 +2458,14 @@ async def processar_importacao(payload: dict):
                         "cargo": str(c.get("cargo", "")).strip(),
                         "perfil": str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip(),
                         "segmento": str(c.get("segmento", "")).strip(),
-                        "ultimo_envio": dt_envio # <--- A data entra aqui
+                        "ultimo_envio": dt_envio,
+                        "ativo": status_ativo 
                     }
 
                     if existente:
                         if overwrite:
                             params_save["cid"] = existente.cliente_id
                             
-                            # 👇 3. ADICIONAMOS A DATA AO UPDATE COM COALESCE
                             update_sql = text("""
                                 UPDATE dbo.nps_clientes 
                                 SET nome = COALESCE(NULLIF(:nome, ''), nome), 
@@ -2456,7 +2474,7 @@ async def processar_importacao(payload: dict):
                                     cargo = COALESCE(NULLIF(:cargo, ''), cargo),
                                     perfil_decisor = COALESCE(NULLIF(:perfil, ''), perfil_decisor), 
                                     segmento = COALESCE(NULLIF(:segmento, ''), segmento),
-                                    ativo = 1,
+                                    ativo = :ativo,
                                     ultimo_envio = COALESCE(:ultimo_envio, ultimo_envio),
                                     updated_at = CURRENT_TIMESTAMP
                                 WHERE cliente_id = :cid
@@ -2468,7 +2486,6 @@ async def processar_importacao(payload: dict):
                     else:
                         params_save["cliente_id"] = str(random.randint(100000000, 999999999))
                         
-                        # 👇 4. ADICIONAMOS A DATA AO INSERT
                         insert_sql = text("""
                             INSERT INTO dbo.nps_clientes (
                                 cliente_id, nome, email, empresa, cargo, 
@@ -2476,7 +2493,7 @@ async def processar_importacao(payload: dict):
                             )
                             VALUES (
                                 :cliente_id, :nome, :email, :empresa, :cargo, 
-                                :perfil, :segmento, 1, :ultimo_envio
+                                :perfil, :segmento, :ativo, :ultimo_envio
                             )
                         """)
                         conn.execute(insert_sql, params_save)
@@ -2486,6 +2503,7 @@ async def processar_importacao(payload: dict):
             # 📊 3. IMPORTAÇÃO DE HISTÓRICO DE RESPOSTAS
             # ==========================================
             elif tipo == 'respostas':
+                
                 mapa_clientes = {
                     "email_cliente": "email", "email": "email", "e-mail": "email",
                     "cliente_id": "cliente_id", "id_cliente": "cliente_id",
@@ -2498,11 +2516,14 @@ async def processar_importacao(payload: dict):
                 }
 
                 for r in dados:
+                    email_atual = str(r.get("email", r.get("e-mail", "Desconhecido")))
+                    
                     nota_str = str(r.get("nota", "")).strip()
                     try:
                         nota = int(nota_str)
                     except ValueError:
                         ignored_count += 1
+                        detalhes_erros.append({"email": email_atual, "motivo": f"Nota inválida ou vazia: '{nota_str}'"})
                         continue
 
                     if nota >= 9: categoria_nps = "Promotor"
@@ -2525,6 +2546,7 @@ async def processar_importacao(payload: dict):
                         
                     if has_null or not where_clauses:
                         ignored_count += 1
+                        detalhes_erros.append({"email": email_atual, "motivo": "Coluna de identificação do cliente está vazia."})
                         continue
                         
                     where_sql = " AND ".join(where_clauses)
@@ -2533,6 +2555,7 @@ async def processar_importacao(payload: dict):
 
                     if not cliente_existente:
                         ignored_count += 1 
+                        detalhes_erros.append({"email": email_atual, "motivo": "Pessoa não encontrada na base de clientes."})
                         continue
                     
                     cliente_id = cliente_existente.cliente_id
@@ -2586,6 +2609,7 @@ async def processar_importacao(payload: dict):
                             updated_count += 1
                         else:
                             ignored_count += 1
+                            detalhes_erros.append({"email": email_atual, "motivo": "Resposta já existe e overwrite=False."})
                     else:
                         resposta_id = str(random.randint(100000000, 999999999))
                         insert_sql = text("""
@@ -2608,7 +2632,7 @@ async def processar_importacao(payload: dict):
             "status": "success", 
             "inseridos": inserted_count + updated_count,
             "erros": ignored_count,
-            "detalhes": []
+            "detalhes": detalhes_erros
         }
 
     except Exception as e:
@@ -2622,7 +2646,7 @@ def limpar_dados_em_massa(tipo: str, usuario = Depends(get_current_user)):
         engine = get_engine()
         with engine.begin() as conn:
             if tipo == 'respostas':
-                # Apaga apenas as respostas (mantém os clientes intactos)
+                # Apaga apenas as respostas (mantém os clientes e empresas intactos)
                 conn.execute(text("DELETE FROM dbo.nps_respostas"))
                 msg = "Todas as respostas (NPS) foram apagadas com sucesso."
                 
@@ -2632,6 +2656,13 @@ def limpar_dados_em_massa(tipo: str, usuario = Depends(get_current_user)):
                 conn.execute(text("DELETE FROM dbo.nps_clientes"))
                 msg = "Todos os clientes e respostas foram apagados com sucesso."
                 
+            elif tipo == 'empresas':
+                # 👇 NOVA OPÇÃO: Para apagar empresas, apagamos a cadeia inteira
+                conn.execute(text("DELETE FROM dbo.nps_respostas"))
+                conn.execute(text("DELETE FROM dbo.nps_clientes"))
+                conn.execute(text("DELETE FROM dbo.nps_empresas"))
+                msg = "Toda a base (Empresas, Clientes e Respostas) foi limpa com sucesso."
+                
             else:
                 raise HTTPException(status_code=400, detail="Comando de limpeza inválido.")
                 
@@ -2639,8 +2670,16 @@ def limpar_dados_em_massa(tipo: str, usuario = Depends(get_current_user)):
         
     except Exception as e:
         import traceback
+        error_msg = str(e)
         print(f"Erro ao limpar banco: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Erro interno ao limpar dados: {str(e)}")
+        
+        if "REFERENCE constraint" in error_msg or "FOREIGN KEY" in error_msg:
+            raise HTTPException(
+                status_code=400, 
+                detail="Bloqueio de segurança: Ainda existem dados vinculados a estas empresas."
+            )
+            
+        raise HTTPException(status_code=500, detail=f"Erro interno ao limpar dados: {error_msg}")
 
 # ==========================================
 # 🔂 ROTAS: STATUS DE CONEXÃO
@@ -3267,91 +3306,147 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
             "recomendacaoIA": "Por favor, tente gerar a análise novamente."
         }
 
-# --- ROTA PARA A ABA JORNADA (HISTÓRICO POR EMPRESA/CLIENTE) ---
 @app.get("/api/reports/jornada")
-def obter_jornada_cliente(empresa: str, usuario_email: str = Depends(get_current_user)):
+def obter_jornada_cliente(
+    empresa: str, 
+    data_inicio: Optional[str] = Query(None), 
+    data_fim: Optional[str] = Query(None),
+    usuario_email: str = Depends(get_current_user)
+):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # Busca todas as respostas da empresa em ordem cronológica
-            sql = text("""
+            params = {
+                "empresa": empresa,
+                "inicio": data_inicio,
+                "fim": data_fim
+            }
+
+            # 1. Cálculo do NPS com conversão para FLOAT para evitar arredondamento zero
+            sql_nps = text("""
                 SELECT 
-                    r.nota, 
-                    r.motivo, 
-                    r.canal, 
-                    COALESCE(r.data_resposta, r.created_at) as data,
-                    c.nome as cliente_nome,
-                    c.cargo
+                    COUNT(r.resposta_id) as total,
+                    SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0.0 END) as promotores,
+                    SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0.0 END) as detratores
                 FROM dbo.nps_respostas r
                 INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE c.empresa = :empresa
+                WHERE c.empresa = :empresa 
+                AND (r.excluido = 0 OR r.excluido IS NULL)
+                AND (:inicio IS NULL OR r.data_resposta >= :inicio)
+                AND (:fim IS NULL OR r.data_resposta <= :fim)
+            """)
+            
+            res_nps = conn.execute(sql_nps, params).mappings().first()
+            
+            total = res_nps['total'] or 0
+            nps_calculado = 0
+            
+            if total > 0:
+                # Cálculo: ((Promotores - Detratores) / Total) * 100
+                promotores = res_nps['promotores'] or 0
+                detratores = res_nps['detratores'] or 0
+                nps_calculado = round(((promotores - detratores) / total) * 100)
+
+            # 3. SQL do Histórico (Timeline)
+            sql_hist = text("""
+                SELECT 
+                    r.nota, r.motivo, r.canal, 
+                    COALESCE(r.data_resposta, r.created_at) as data,
+                    c.nome as cliente_nome, c.cargo
+                FROM dbo.nps_respostas r
+                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                WHERE c.empresa = :empresa 
+                AND (r.excluido = 0 OR r.excluido IS NULL)
+                AND (:inicio IS NULL OR r.data_resposta >= :inicio)
+                AND (:fim IS NULL OR r.data_resposta <= :fim)
                 ORDER BY data DESC
             """)
-            result = conn.execute(sql, {"empresa": empresa}).mappings().all()
+            result = conn.execute(sql_hist, params).mappings().all()
             
-            jornada = []
+            historico = []
             for r in result:
                 item = dict(r)
-                # Formatação amigável para a timeline
-                item["data_formatada"] = r["data"].strftime("%d/%m/%Y %H:%M")
-                jornada.append(item)
+                item["data_formatada"] = r["data"].strftime("%d/%m/%Y %H:%M") if r["data"] else "S/D"
+                historico.append(item)
                 
-            return jornada
+            return {
+                "nps_atual": nps_calculado,
+                "total_respostas": res_nps['total'] or 0,
+                "historico": historico
+            }
     except Exception as e:
+        print(f"Erro na Rota Jornada: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- ROTA PARA A ABA OPERACIONAL (KPIs DE EXECUÇÃO) ---
 @app.get("/api/reports/operacional")
-def obter_dados_operacionais(usuario_email: str = Depends(get_current_user)):
+def obter_dados_operacionais(
+    data_inicio: Optional[str] = Query(None), 
+    data_fim: Optional[str] = Query(None),
+    usuario_email: str = Depends(get_current_user)
+):
+    # Preparação de parâmetros para evitar SQL Injection e tratar valores nulos
+    params = {
+        "inicio": f"{data_inicio} 00:00:00" if data_inicio else None,
+        "fim": f"{data_fim} 23:59:59" if data_fim else None
+    }
+    
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. Taxa de Resposta Global
+            # 1. Taxa de Resposta (Injetando o filtro de data no numerador)
             sql_taxa = text("""
                 SELECT 
+                    -- Denominador: Todos os clientes ativos (Base Real)
                     (SELECT COUNT(*) FROM dbo.nps_clientes WHERE ativo = 1) as total_base,
-                    (SELECT COUNT(DISTINCT cliente_id) FROM dbo.nps_respostas) as total_respostas
+                    
+                    -- Numerador: Respondentes únicos que estão ativos e dentro do período
+                    (SELECT COUNT(DISTINCT r.cliente_id) 
+                     FROM dbo.nps_respostas r
+                     INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                     WHERE c.ativo = 1 
+                       AND r.excluido = 0
+                       AND (:inicio IS NULL OR r.data_resposta >= :inicio)
+                       AND (:fim IS NULL OR r.data_resposta <= :fim)
+                    ) as total_respostas
             """)
-            res_taxa = conn.execute(sql_taxa).mappings().first()
+            res_taxa = conn.execute(sql_taxa, params).mappings().first()
             
-            # 2. SLA Médio de Fechamento de Ações (dias)
+            # 2. SLA Médio de Fechamento (Ajustado para usar os params corretamente)
             sql_sla = text("""
-                SELECT AVG(DATEDIFF(day, created_at, updated_at)) as sla_medio
+                SELECT 
+                    AVG(CAST(DATEDIFF(minute, created_at, updated_at) AS FLOAT) / 60.0 / 24.0) as sla_real_dias
                 FROM dbo.nps_acoes 
-                WHERE status = 'Concluído'
+                WHERE status = 'Concluído' 
+                  AND updated_at IS NOT NULL 
+                  AND updated_at >= created_at
+                  AND (:inicio IS NULL OR updated_at >= :inicio)
+                  AND (:fim IS NULL OR updated_at <= :fim)
             """)
-            res_sla = conn.execute(sql_sla).scalar() or 0
+            res_sla = conn.execute(sql_sla, params).scalar() or 0
 
             return {
                 "taxa_resposta": round((res_taxa['total_respostas'] / res_taxa['total_base'] * 100), 1) if res_taxa['total_base'] > 0 else 0,
                 "sla_medio_dias": round(res_sla, 1)
             }
     except Exception as e:
+        print(f"Erro Operacional: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-# --- 1. ROTA PARA LISTAR OS GESTORES (PARA O DROPDOWN) ---
 @app.get("/api/reports/lista-gestores")
 def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
+            # Removemos o WHERE EXISTS para listar todos os cadastrados
             sql = text("""
-                SELECT g.id, g.nome 
-                FROM dbo.nps_gestores g
-                WHERE EXISTS (
-                    SELECT 1 
-                    FROM dbo.nps_empresas e 
-                    WHERE e.gestor_id = g.id
-                )
-                ORDER BY g.nome
+                SELECT id, nome 
+                FROM dbo.nps_gestores 
+                ORDER BY nome
             """)
             result = conn.execute(sql).fetchall()
-            
-            # Retorna no formato exato que o Vue.js espera: [{ "id": 1, "nome": "Marcelo" }]
             return [{"id": linha[0], "nome": linha[1]} for linha in result]
-            
     except Exception as e:
-        print(f"Erro ao listar gestores: {e}")
         raise HTTPException(status_code=500, detail="Erro ao processar lista de gestores")
     
 @app.get("/api/reports/operacional/inativos")
