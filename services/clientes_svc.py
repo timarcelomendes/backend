@@ -87,33 +87,19 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.nome, 
         c.email, 
         c.telefone,          
-        c.cargo,             
-        e.gestor,            
-        c.empresa, 
-        c.perfil_decisor, 
-        c.segmento,
         
-        -- 1. DATA DO ÚLTIMO ENVIO
+        -- 👇 Traz o ID e o Nome de cada relação
+        c.cargo_id, cg.nome as cargo,             
+        c.empresa_id, e.nome as empresa, e.gestor,            
+        c.perfil_id, p.nome as perfil_decisor, 
+        c.segmento_id, s.nome as segmento,
+        
         COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) as ultimo_envio,
-        
-        -- 2. DATA DO PRÓXIMO ENVIO (Baseada na regra dinámica)
-        DATEADD(day, 
-            ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
-            COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
-        ) AS proximo_envio,
+        DATEADD(day, ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) AS proximo_envio,
 
-        -- 👇 3. A NOVA MÁGICA DO STATUS AUTOMÁTICO
         CASE 
-            -- Se nunca foi enviado na vida, está Pendente
             WHEN COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL THEN 'Pendente'
-            
-            -- Se a data de HOJE já passou da data calculada para o próximo envio, vira Pendente!
-            WHEN GETDATE() >= DATEADD(day, 
-                ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
-                COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
-            ) THEN 'Pendente'
-            
-            -- Caso contrário, mantém o status atual (Respondido, Enviado, etc)
+            WHEN GETDATE() >= DATEADD(day, ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) THEN 'Pendente'
             ELSE COALESCE(d.status, c.status_envio, 'Não Iniciado')
         END AS status_envio,
         
@@ -122,19 +108,17 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.ativo, 
         c.updated_at,
         
-        e.id AS empresa_id,
         (SELECT COUNT(1) FROM dbo.nps_respostas r WHERE r.cliente_id = c.cliente_id) AS respostas_cliente,
-        (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa = c.empresa) AS respostas_empresa,
+        (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.empresa_id = c.empresa_id) AS respostas_empresa,
         
-        CAST(CASE 
-            WHEN EXISTS (
-                SELECT 1 FROM dbo.nps_acoes a 
-                WHERE a.empresa_id = e.id AND a.status != 'Concluído'
-            ) THEN 1 ELSE 0 
-        END AS BIT) AS tem_acao_pendente
+        CAST(CASE WHEN EXISTS (SELECT 1 FROM dbo.nps_acoes a WHERE a.empresa_id = e.id AND a.status != 'Concluído') THEN 1 ELSE 0 END AS BIT) AS tem_acao_pendente
         
     FROM dbo.nps_clientes c
-    LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
+    -- 👇 OS NOVOS JOINS PELO ID
+    LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+    LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
+    LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id
+    LEFT JOIN dbo.nps_cargos cg ON c.cargo_id = cg.id
     LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
     {where_sql}
     ORDER BY c.updated_at DESC;
@@ -142,56 +126,51 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     return read_df(sql, params)
 
-def insert_cliente(nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, cargo: str, segmento: str, ultimo_envio: str = None):
-    
-    # 👇 1. GERA O ID NUMÉRICO (Aleatório de 9 dígitos)
+def insert_cliente(nome: str, email: str, telefone: str, empresa_id: int, perfil_id: int, segmento_id: int, cargo_id: int, ultimo_envio: str = None):
     cliente_id = str(random.randint(100000000, 999999999))
 
-    # 👇 2. SQL ATUALIZADO (Substituímos o NULL pelo :ultimo_envio)
     sql = """
     INSERT INTO dbo.nps_clientes
-      (cliente_id, nome, email, telefone, cargo, empresa, perfil_decisor, segmento,
+      (cliente_id, nome, email, telefone, empresa_id, perfil_id, segmento_id, cargo_id,
        ativo, status_envio, ultimo_envio, proximo_envio, ultimo_erro,
        created_at, updated_at)
     VALUES
-      (:cliente_id, :nome, :email, :telefone, :cargo, :empresa, :perfil_decisor, :segmento,
+      (:cliente_id, :nome, :email, :telefone, :empresa_id, :perfil_id, :segmento_id, :cargo_id,
        1, 'Pendente', :ultimo_envio, CAST(GETDATE() AS DATE), NULL,
        SYSUTCDATETIME(), SYSUTCDATETIME());
     """
 
     engine = get_engine()
     with engine.begin() as conn:
-        conn.execute(
-            text(sql),
-            {
-                "cliente_id": cliente_id,
-                "nome": (nome or "").strip(),
-                "email": (email or "").strip(),
-                "telefone": (telefone or "").strip() or None,
-                "cargo": (cargo or "").strip() or None,
-                "empresa": (empresa or "").strip(),
-                "perfil_decisor": perfil_decisor,
-                "segmento": (segmento or "").strip() or None,
-                "ultimo_envio": ultimo_envio # 👈 Passamos a data (ou None) para a query
-            }
-        )
+        conn.execute(text(sql), {
+            "cliente_id": cliente_id,
+            "nome": (nome or "").strip(),
+            "email": (email or "").strip(),
+            "telefone": (telefone or "").strip() or None,
+            "empresa_id": empresa_id,
+            "perfil_id": perfil_id,
+            "segmento_id": segmento_id,
+            "cargo_id": cargo_id,
+            "ultimo_envio": ultimo_envio
+        })
 
     return cliente_id
 
-def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empresa: str, perfil_decisor: str, segmento: str, cargo: str, ativo: bool = True):
+def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empresa_id: int, perfil_id: int, segmento_id: int, cargo_id: int, ativo: bool = True):
     ativo_sql = 1 if ativo else 0
     
+    # 1. Salva a edição do cliente atual
     sql = """
     UPDATE dbo.nps_clientes 
     SET 
         nome = :nome, 
         email = :email, 
         telefone = :telefone, 
-        empresa = :empresa, 
-        perfil_decisor = :perfil_decisor, 
-        segmento = :segmento, 
-        cargo = :cargo,
-        ativo = :ativo, -- 👈 Agora gravamos o status!
+        empresa_id = :empresa_id, 
+        perfil_id = :perfil_id, 
+        segmento_id = :segmento_id, 
+        cargo_id = :cargo_id,
+        ativo = :ativo,
         updated_at = SYSUTCDATETIME()
     WHERE cliente_id = :cliente_id;
     """
@@ -201,12 +180,24 @@ def update_cliente(cliente_id: str, nome: str, email: str, telefone: str, empres
         "nome": (nome or "").strip() or None,
         "email": (email or "").strip().lower(),
         "telefone": (telefone or "").strip() or None,
-        "empresa": (empresa or "").strip() or None,
-        "perfil_decisor": (perfil_decisor or "").strip() or None,
-        "segmento": (segmento or "").strip() or None,
-        "cargo": (cargo or "").strip() or None,
-        "ativo": ativo_sql # 👈 Injetamos o 1 ou 0 na base de dados
+        "empresa_id": empresa_id,
+        "perfil_id": perfil_id,
+        "segmento_id": segmento_id,
+        "cargo_id": cargo_id,
+        "ativo": ativo_sql
     })
+
+    # 2. 🔥 A MÁGICA DA CASCATA: Se tem empresa e segmento, padroniza todos os "irmãos"!
+    if empresa_id and segmento_id:
+        sql_cascata = """
+        UPDATE dbo.nps_clientes 
+        SET segmento_id = :segmento_id 
+        WHERE empresa_id = :empresa_id;
+        """
+        exec_sql(sql_cascata, {
+            "segmento_id": segmento_id,
+            "empresa_id": empresa_id
+        })
 
 def set_ativo(cliente_id: str, ativo: int):
     sql = "UPDATE dbo.nps_clientes SET ativo = :ativo, updated_at = SYSUTCDATETIME() WHERE cliente_id = :cliente_id;"

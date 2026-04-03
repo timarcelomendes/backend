@@ -230,6 +230,7 @@ class ConfigEmailSchema(BaseModel):
     email_remetente: EmailStr
     base_url_frontend: Optional[str] = "http://localhost:5173"
     envios_ativos: Optional[bool] = True
+    sso_ativo: Optional[bool] = False
 
 
 class RegistroRequest(BaseModel):
@@ -277,20 +278,20 @@ class ClienteCreate(BaseModel):
     nome: str
     email: str
     telefone: Optional[str] = ""
-    empresa: Optional[str] = ""
-    perfil_decisor: Optional[str] = ""
-    segmento: Optional[str] = ""
-    cargo: str
+    empresa_id: Optional[int] = None 
+    perfil_id: Optional[int] = None 
+    segmento_id: Optional[int] = None 
+    cargo_id: Optional[int] = None 
     gestor: Optional[str] = ""
 
 class ClienteUpdate(BaseModel):
     nome: str
     email: str
     telefone: Optional[str] = ""
-    empresa: Optional[str] = ""
-    perfil_decisor: Optional[str] = ""
-    segmento: Optional[str] = ""
-    cargo: str
+    empresa_id: Optional[int] = None 
+    perfil_id: Optional[int] = None 
+    segmento_id: Optional[int] = None 
+    cargo_id: Optional[int] = None 
     gestor: Optional[str] = ""
     ativo: Optional[bool] = True
 
@@ -369,6 +370,9 @@ class RespostaManual(BaseModel):
     nota: int
     motivo: Optional[str] = ""
     canal: str = "Manual"
+
+class MicrosoftAuthPayload(BaseModel):
+    access_token: str
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -676,6 +680,112 @@ async def login(requisicao: LoginRequest, request: Request):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Erro interno no servidor. A equipa técnica já foi notificada."
         )
+
+@app.post("/api/auth/microsoft")
+async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
+    try:
+        # 1. Verifica se o SSO está ligado nas configurações
+        engine = get_engine()
+        with engine.connect() as conn:
+            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
+            if not sso_check or str(sso_check).lower() != 'true':
+                raise HTTPException(status_code=403, detail="O Login com Microsoft está desativado pelo administrador.")
+
+            # 2. Vai à Microsoft verificar de quem é este token
+            headers = {'Authorization': f'Bearer {payload.access_token}'}
+            graph_response = requests.get('https://graph.microsoft.com/v1.0/me', headers=headers)
+            
+            if graph_response.status_code != 200:
+                raise HTTPException(status_code=401, detail="Token da Microsoft inválido ou expirado.")
+                
+            microsoft_user = graph_response.json()
+            
+            # O email principal pode vir no mail ou no userPrincipalName
+            user_email = (microsoft_user.get('mail') or microsoft_user.get('userPrincipalName') or "").lower()
+
+            # 3. Verifica se a pessoa existe na NOSSA base de dados
+            user_db = conn.execute(text("""
+                SELECT usuario_id, nome, email, cargo, tipo, ativo 
+                FROM dbo.nps_usuarios 
+                WHERE email = :email
+            """), {"email": user_email}).mappings().first()
+            
+            if not user_db:
+                raise HTTPException(
+                    status_code=403, 
+                    detail=f"O e-mail corporativo '{user_email}' não está cadastrado. Solicite a criação da sua conta ao administrador do sistema."
+                )
+                
+            if not user_db["ativo"]:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="A sua conta está temporariamente desativada."
+                )
+
+            # 4. Regista a Sessão e Gera o Token JWT nativo (mesma lógica do login normal)
+            agora_utc = datetime.now(timezone.utc)
+            
+            # Gera JWT Token
+            resultado_tempo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
+            tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
+            
+            expire = datetime.utcnow() + timedelta(minutes=tempo_minutos)
+            to_encode = {
+                "sub": user_db["email"],
+                "exp": expire,
+                "tipo": user_db["tipo"]
+            }
+            access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+            # Regista Permissões
+            sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
+            res_perm = conn.execute(sql_perm, {"perfil": user_db["tipo"]}).fetchall()
+            lista_permissoes = [row.chave for row in res_perm]
+            
+            # Atualiza último acesso
+            conn.execute(text("UPDATE dbo.nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
+            conn.commit()
+
+            return {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "nome": user_db["nome"],
+                "cargo": user_db["cargo"],
+                "tipo": user_db["tipo"],
+                "permissoes": lista_permissoes
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro Auth Microsoft: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno no servidor de autenticação.")
+    
+@app.get("/api/auth/sso-config")
+def get_sso_config():
+    """Rota pública para alimentar o botão de Login da Microsoft no Frontend"""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Verifica se o Administrador ativou o botão no painel
+            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
+            
+            if not sso_check or str(sso_check).lower() != 'true':
+                return {"sso_ativo": False}
+                
+            # Vai buscar apenas os IDs públicos
+            email_cfg = conn.execute(text("SELECT tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
+            if not email_cfg:
+                return {"sso_ativo": False}
+                
+            return {
+                "sso_ativo": True,
+                "tenant_id": email_cfg["tenant_id"],
+                "client_id": email_cfg["client_id"]
+            }
+    except Exception as e:
+        print(f"Erro ao ler SSO config: {e}")
+        return {"sso_ativo": False}
     
 @app.post("/api/register")
 def registrar_usuario(requisicao: RegistroRequest):
@@ -1138,7 +1248,7 @@ def get_dashboard_kpis(
     companhia: Optional[str] = Query(None),
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None),
-    apenas_ativos: bool = Query(True) # 👈 1. Parâmetro Adicionado
+    apenas_ativos: bool = Query(True)
 ):
     try:
         engine = get_engine()
@@ -1150,27 +1260,18 @@ def get_dashboard_kpis(
             filtros_sql = []
             parametros = {}
             
-            # 👇 2. Injeção do Parâmetro na Base
             parametros["apenas_ativos"] = 1 if apenas_ativos else 0
-            # 🛡️ Adiciona a regra de Inativos logo de base
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT emp.nome 
-                        FROM dbo.nps_empresas emp 
-                        INNER JOIN dbo.nps_companhias comp ON emp.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
             
             if empresa:
                 if empresa == "Não Identificado":
-                    filtros_sql.append("c.empresa IS NULL")
+                    filtros_sql.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
                 else:
-                    filtros_sql.append("c.empresa = :empresa")
+                    filtros_sql.append("e.nome = :empresa")
                     parametros["empresa"] = empresa
                     
             if data_inicio and data_fim:
@@ -1188,7 +1289,7 @@ def get_dashboard_kpis(
                 SELECT CAST(r.motivo AS NVARCHAR(MAX)) as comentario
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 O JOIN OBRIGATÓRIO
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_filtro} 
                 { "AND" if condicao_filtro else "WHERE" } r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 3
             """)
@@ -1214,12 +1315,13 @@ def get_dashboard_kpis(
                     SUM(CASE WHEN r.nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) as neutros,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores,
                     
-                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' AND r.nota >= 9 THEN 1 ELSE 0 END) as decisor_promotores,
-                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
-                    SUM(CASE WHEN LOWER(c.perfil_decisor) LIKE '%decisor%' THEN 1 ELSE 0 END) as decisor_total
+                    SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' AND r.nota >= 9 THEN 1 ELSE 0 END) as decisor_promotores,
+                    SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
+                    SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' THEN 1 ELSE 0 END) as decisor_total
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
                 {condicao_filtro};
             """)
                     
@@ -1244,11 +1346,11 @@ def get_dashboard_kpis(
             sql_rev = text(f"""
                 SELECT SUM(emp_out.valor_contrato) as risco
                 FROM dbo.nps_empresas emp_out
-                WHERE emp_out.nome IN (
-                    SELECT DISTINCT COALESCE(r.empresa, c.empresa)
+                WHERE emp_out.id IN (
+                    SELECT DISTINCT COALESCE(r.empresa_id, c.empresa_id)
                     FROM dbo.nps_respostas r
                     INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN
+                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                     WHERE r.nota <= 6 {filtro_sub}
                 )
             """)
@@ -1259,10 +1361,11 @@ def get_dashboard_kpis(
                 SELECT TOP 10 
                     r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario, 
                     r.created_at, r.jira_issue_url,
-                    c.nome as cliente, COALESCE(r.empresa, c.empresa) as empresa, c.perfil_decisor
+                    c.nome as cliente, e.nome as empresa, p.nome as perfil_decisor
                 FROM dbo.nps_respostas r
                 INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
                 WHERE r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
                 {condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""} 
                 ORDER BY r.created_at DESC;
@@ -1291,7 +1394,7 @@ def get_dashboard_kpis(
                 
             query_resgates = text(f"""
                 WITH Historico AS (
-                    SELECT cliente_id, nota, data_resposta, created_at, empresa,
+                    SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
                            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
                     FROM dbo.nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
@@ -1300,7 +1403,7 @@ def get_dashboard_kpis(
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
                 {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1 
                   AND anterior.nota <= 8  
                   AND atual.nota >= 9     
@@ -1317,21 +1420,14 @@ def get_dashboard_kpis(
             filtros_sql_ant.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql_ant.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT emp.nome 
-                        FROM dbo.nps_empresas emp 
-                        INNER JOIN dbo.nps_companhias comp ON emp.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql_ant.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 params_ant["companhia"] = companhia
             
             if empresa:
                 if empresa == "Não Identificado":
-                    filtros_sql_ant.append("c.empresa IS NULL")
+                    filtros_sql_ant.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
                 else:
-                    filtros_sql_ant.append("c.empresa = :empresa")
+                    filtros_sql_ant.append("e.nome = :empresa")
                     params_ant["empresa"] = empresa
                     
             if data_inicio and data_fim:
@@ -1359,7 +1455,7 @@ def get_dashboard_kpis(
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detr
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_ant};
             """)
             
@@ -1370,36 +1466,46 @@ def get_dashboard_kpis(
                 
             variacao_nps = nps_score - nps_anterior
 
-            # --- 7. TÓPICOS CRÍTICOS ---
-            sql_topicos = text(f"""
-                SELECT TOP 5
-                    COALESCE(r.motivo, 'Sem Classificação') as tema,
-                    COUNT(r.resposta_id) as mencoes,
-                    AVG(CAST(r.nota AS FLOAT)) as notaMedia
+            # 7. TÓPICOS CRÍTICOS ---
+            sql_todos_comentarios = text(f"""
+                SELECT r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario
                 FROM dbo.nps_respostas r
                 {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_filtro}
                 { "AND" if condicao_filtro else "WHERE" } 
                     r.motivo IS NOT NULL 
-                    AND r.motivo != '' 
-                    AND r.motivo NOT IN ('Promotor', 'Detrator', 'Neutro', 'Passivo')
+                    AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0 
                     AND r.excluido = 0
-                GROUP BY COALESCE(r.motivo, 'Sem Classificação')
-                ORDER BY mencoes DESC, notaMedia ASC
             """)
             
-            topicos_raw = conn.execute(sql_topicos, parametros).mappings().all()
+            todos_comentarios = conn.execute(sql_todos_comentarios, parametros).mappings().all()
             
-            topicos_criticos = [
-                {"tema": r['tema'], "mencoes": r['mencoes'], "notaMedia": float(r['notaMedia'])} 
-                for r in topicos_raw if r['tema'] != 'Sem Classificação'
-            ]
+            topicos_agg = {k: {"mencoes": 0, "soma_notas": 0} for k in regras_tags.keys()}
+            
+            for row in todos_comentarios:
+                texto = str(row["comentario"]).lower()
+                nota = float(row["nota"])
+                for tema, keywords in regras_tags.items():
+                    if any(k in texto for k in keywords):
+                        topicos_agg[tema]["mencoes"] += 1
+                        topicos_agg[tema]["soma_notas"] += nota
+                        
+            topicos_criticos = []
+            for tema, dados_tema in topicos_agg.items():
+                if dados_tema["mencoes"] > 0:
+                    topicos_criticos.append({
+                        "tema": tema,
+                        "mencoes": dados_tema["mencoes"],
+                        "notaMedia": round(dados_tema["soma_notas"] / dados_tema["mencoes"], 1)
+                    })
+                    
+            topicos_criticos = sorted(topicos_criticos, key=lambda x: (-x["mencoes"], x["notaMedia"]))[:5]
 
             # --- CÁLCULO DE PROMOTORES PERDIDOS / EM RISCO ---
             query_perdidos = text(f"""
                 WITH Historico AS (
-                    SELECT cliente_id, nota, data_resposta, created_at, empresa,
+                    SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
                            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
                     FROM dbo.nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
@@ -1410,7 +1516,7 @@ def get_dashboard_kpis(
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
                 {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa, c.empresa) = e.nome -- 👈 JOIN
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1      
                   {condicao_resgate}      
             """)
@@ -1465,32 +1571,18 @@ def get_dashboard_detalhes(
             params["apenas_ativos"] = 1 if apenas_ativos else 0
 
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql_c.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT e.nome 
-                        FROM dbo.nps_empresas e 
-                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
-                filtros_sql_puro.append("""
-                    empresa IN (
-                        SELECT e.nome 
-                        FROM dbo.nps_empresas e 
-                        INNER JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql_c.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql_puro.append("empresa_id IN (SELECT id FROM dbo.nps_empresas WHERE companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia))")
                 params["companhia"] = companhia
 
             if empresa:
                 params["empresa"] = empresa
                 if empresa == "Não Identificado":
-                    filtros_sql_c.append("c.empresa IS NULL")
-                    filtros_sql_puro.append("empresa IS NULL")
+                    filtros_sql_c.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
+                    filtros_sql_puro.append("empresa_id IS NULL")
                 else:
-                    filtros_sql_c.append("c.empresa = :empresa")
-                    filtros_sql_puro.append("empresa = :empresa")
+                    filtros_sql_c.append("e.nome = :empresa")
+                    filtros_sql_puro.append("empresa_id = (SELECT id FROM dbo.nps_empresas WHERE nome = :empresa)")
 
             if data_inicio and data_fim:
                 filtros_sql_c.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
@@ -1498,37 +1590,29 @@ def get_dashboard_detalhes(
                 params["data_inicio"] = f"{data_inicio} 00:00:00"
                 params["data_fim"] = f"{data_fim} 23:59:59"
 
+            # Se não há empresa selecionada, agrupa pelas empresas. Se há empresa, agrupa pelos segmentos.
+            coluna_nome = "COALESCE(e.nome, 'Não Identificado')" if not empresa else "COALESCE(s.nome, 'Sem Segmento')"
+            
             str_filtro_c = "WHERE 1=1"
             if len(filtros_sql_c) > 0:
                 str_filtro_c += " AND " + " AND ".join(filtros_sql_c)
+            str_filtro_c += " AND (r.excluido = 0 OR r.excluido IS NULL)"
                 
             str_filtro_puro = "WHERE 1=1"
             if len(filtros_sql_puro) > 0:
                 str_filtro_puro += " AND " + " AND ".join(filtros_sql_puro)
-
-            coluna_nome = "COALESCE(r.empresa, c.empresa, 'Não Identificado')" if not empresa else "COALESCE(c.segmento, 'Sem Segmento')"
             
             sql_ranking = text(f"""
                 SELECT 
                     {coluna_nome} as nome,
-                    MAX(e.gestor) as gestor, 
+                    MAX(g.nome) as gestor, 
                     MAX(g.avatar) as gestor_avatar,
-                    
                     MAX(CAST(COALESCE(e.ativo, 1) AS INT)) as ativo, 
-                    
                     COUNT(r.resposta_id) as total,
                     MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
                     
-                    -- 👇 CORREÇÃO: Agora busca ações vinculadas à resposta OU vinculadas diretamente à empresa
-                    (SELECT TOP 1 a.id 
-                     FROM dbo.nps_acoes a 
-                     WHERE a.resposta_id = MAX(r.resposta_id) OR a.empresa_id = MAX(e.id)
-                     ORDER BY a.created_at DESC) as acao_id,
-
-                    (SELECT TOP 1 a.status 
-                     FROM dbo.nps_acoes a 
-                     WHERE a.resposta_id = MAX(r.resposta_id) OR a.empresa_id = MAX(e.id)
-                     ORDER BY a.created_at DESC) as acao_status,
+                    (SELECT TOP 1 a.id FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_id,
+                    (SELECT TOP 1 a.status FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_status,
 
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
@@ -1536,15 +1620,15 @@ def get_dashboard_detalhes(
                     ) as nps
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome 
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id 
+                LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id 
                 LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
                 
                 {str_filtro_c}
-                
                 AND (:apenas_ativos = 0 OR e.ativo = 1)
                 
                 GROUP BY {coluna_nome}
-                ORDER BY nps ASC, data_ultima_resposta ASC;
+                ORDER BY nps DESC, data_ultima_resposta DESC;
             """)
             
             ranking_raw = conn.execute(sql_ranking, params).mappings().all()
@@ -1556,6 +1640,7 @@ def get_dashboard_detalhes(
                     (SELECT COUNT(DISTINCT r.cliente_id) 
                      FROM dbo.nps_respostas r
                      LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                     LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                      {str_filtro_c}) as total_responderam
             """)
             
@@ -1581,7 +1666,7 @@ def get_dashboard_trend(
     companhia: Optional[str] = Query(None),
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None),
-    apenas_ativos: bool = Query(True) # 👈 Adicionado
+    apenas_ativos: bool = Query(True)
 ):
     try:
         engine = get_engine()
@@ -1593,26 +1678,18 @@ def get_dashboard_trend(
             filtros_sql = ["COALESCE(r.data_resposta, r.created_at) IS NOT NULL", "(r.excluido = 0 OR r.excluido IS NULL)"]
             params = {}
             
-            # 👇 Adicionado Parâmetro e Filtro
             params["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT e_sub.nome 
-                        FROM dbo.nps_empresas e_sub 
-                        INNER JOIN dbo.nps_companhias comp ON e_sub.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 params["companhia"] = companhia
                 
             if empresa:
                 if empresa == "Não Identificado":
-                    filtros_sql.append("c.empresa IS NULL")
+                    filtros_sql.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
                 else:
-                    filtros_sql.append("c.empresa = :empresa")
+                    filtros_sql.append("e.nome = :empresa")
                     params["empresa"] = empresa
                     
             if data_inicio and data_fim:
@@ -1632,7 +1709,7 @@ def get_dashboard_trend(
                         SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
                     FROM dbo.nps_respostas r
                     {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN Adicionado
+                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                     {condicao}
                     GROUP BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7)
                     ORDER BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) DESC
@@ -1666,11 +1743,7 @@ def get_dashboard_trend(
                 scores.append(nps)
 
         return {"status": "success", "labels": labels, "scores": scores}
-    
     except Exception as e:
-        import traceback
-        print("\n🔥 ERRO NO GRÁFICO:")
-        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/api/dashboard/nuvem-palavras")
@@ -1679,7 +1752,7 @@ def get_nuvem_palavras(
     companhia: Optional[str] = Query(None), 
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None),
-    apenas_ativos: bool = Query(True) # 👈 Adicionado
+    apenas_ativos: bool = Query(True)
 ):
     try:
         engine = get_engine()
@@ -1687,26 +1760,18 @@ def get_nuvem_palavras(
             filtros_sql = ["r.nota <= 6", "r.motivo IS NOT NULL", "LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0", "(r.excluido = 0 OR r.excluido IS NULL)"]
             params = {}
             
-            # 👇 Adicionado Parâmetro e Filtro
             params["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT e_sub.nome 
-                        FROM dbo.nps_empresas e_sub 
-                        INNER JOIN dbo.nps_companhias comp ON e_sub.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 params["companhia"] = companhia
                 
             if empresa:
                 if empresa == "Não Identificado":
-                    filtros_sql.append("c.empresa IS NULL")
+                    filtros_sql.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
                 else:
-                    filtros_sql.append("c.empresa = :empresa")
+                    filtros_sql.append("e.nome = :empresa")
                     params["empresa"] = empresa
                     
             if data_inicio and data_fim:
@@ -1721,7 +1786,7 @@ def get_nuvem_palavras(
                 SELECT CAST(r.motivo AS NVARCHAR(MAX)) as motivo
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN Adicionado
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao}
             """)
             
@@ -1742,8 +1807,6 @@ def get_nuvem_palavras(
             
             return {"status": "success", "nuvem": nuvem}
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/dashboard/exportar")
@@ -1752,7 +1815,7 @@ def exportar_dashboard(
     companhia: Optional[str] = Query(None), 
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None),
-    apenas_ativos: bool = Query(True) # 👈 Adicionado
+    apenas_ativos: bool = Query(True)
 ):
     try:
         engine = get_engine()
@@ -1760,26 +1823,18 @@ def exportar_dashboard(
             filtros_sql = ["(r.excluido = 0 OR r.excluido IS NULL)"]
             parametros = {}
             
-            # 👇 Adicionado Parâmetro e Filtro
             parametros["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("""
-                    COALESCE(r.empresa, c.empresa) IN (
-                        SELECT e_sub.nome 
-                        FROM dbo.nps_empresas e_sub 
-                        INNER JOIN dbo.nps_companhias comp ON e_sub.companhia_id = comp.id 
-                        WHERE comp.nome = :companhia
-                    )
-                """)
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
                 
             if empresa:
                 if empresa == "Não Identificado":
-                    filtros_sql.append("c.empresa IS NULL")
+                    filtros_sql.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
                 else:
-                    filtros_sql.append("c.empresa = :empresa")
+                    filtros_sql.append("e.nome = :empresa")
                     parametros["empresa"] = empresa
                     
             if data_inicio and data_fim:
@@ -1794,10 +1849,10 @@ def exportar_dashboard(
                 SELECT 
                     c.nome as Cliente,
                     c.email as Email,
-                    COALESCE(r.empresa, c.empresa) as Empresa, 
-                    c.segmento as Segmento,
-                    c.perfil_decisor as Perfil,
-                    c.valor_contrato as Receita_ARR,
+                    e.nome as Empresa, 
+                    s.nome as Segmento,
+                    p.nome as Perfil,
+                    e.valor_contrato as Receita_ARR,
                     r.nota as Nota_NPS,
                     CASE 
                         WHEN r.nota >= 9 THEN 'Promotor'
@@ -1809,7 +1864,9 @@ def exportar_dashboard(
                     COALESCE(r.data_resposta, r.created_at) as Data_Resposta
                 FROM dbo.nps_respostas r
                 LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa, c.empresa) = e.nome -- 👈 JOIN Adicionado
+                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
+                LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id
                 {condicao_filtro}
                 ORDER BY Data_Resposta DESC
             """)
@@ -1904,14 +1961,13 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
                 conn.execute(text(f"UPDATE {table_name} SET nome=:n WHERE id=:id"), {"n": item.nome, "id": item_id})
             
             if nome_antigo and str(nome_antigo) != str(item.nome):
+                # 👇 Os clientes SUMIRAM daqui porque agora apontam para o ID!
                 if table_name == 'dbo.nps_segmentos':
                     conn.execute(text("UPDATE dbo.nps_empresas SET segmento=:novo WHERE segmento=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
-                elif table_name == 'dbo.nps_perfis':
-                    conn.execute(text("UPDATE dbo.nps_clientes SET perfil_decisor=:novo WHERE perfil_decisor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
-                elif table_name == 'dbo.nps_cargos':
-                    conn.execute(text("UPDATE dbo.nps_clientes SET cargo=:novo WHERE cargo=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
                 elif table_name == 'dbo.nps_gestores':
                     conn.execute(text("UPDATE dbo.nps_empresas SET gestor=:novo WHERE gestor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'dbo.nps_companhias':
+                    conn.execute(text("UPDATE dbo.nps_empresas SET companhia=:novo WHERE companhia=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
 
         return {"status": "success"}
         
@@ -2030,9 +2086,6 @@ def save_empresa(emp: EmpresaSchema):
 def update_empresa(empresa_id: int, emp: EmpresaSchema):
     engine = get_engine()
     with engine.begin() as conn: 
-        nome_antigo = conn.execute(text("SELECT nome FROM dbo.nps_empresas WHERE id=:id"), {"id": empresa_id}).scalar()
-        
-        # 👇 CORREÇÃO: Adicionado gestor_id=:gid na query SQL
         sql_update = text("""
             UPDATE dbo.nps_empresas 
             SET nome=:n, segmento=:s, valor_contrato=:v, gestor=:g, gestor_id=:gid, companhia_id=:cid 
@@ -2040,18 +2093,9 @@ def update_empresa(empresa_id: int, emp: EmpresaSchema):
         """)
         
         conn.execute(sql_update, {
-            "n": emp.nome, 
-            "s": emp.segmento, 
-            "v": emp.valor_contrato, 
-            "g": emp.gestor, 
-            "gid": emp.gestor_id, # 👈 O ID agora é guardado!
-            "cid": emp.companhia_id, 
-            "id": empresa_id
+            "n": emp.nome, "s": emp.segmento, "v": emp.valor_contrato, 
+            "g": emp.gestor, "gid": emp.gestor_id, "cid": emp.companhia_id, "id": empresa_id
         })
-        
-        if nome_antigo and str(nome_antigo) != str(emp.nome):
-            conn.execute(text("UPDATE dbo.nps_clientes SET empresa=:novo WHERE empresa=:antigo"), 
-                         {"novo": emp.nome, "antigo": nome_antigo})
             
     return {"status": "success"}
         
@@ -2148,10 +2192,16 @@ def delete_cliente_route(cliente_id: str, delete_respostas: bool = True):
 @app.post("/api/clientes")
 def create_cliente_route(payload: ClienteCreate):
     try:
-        auto_cadastrar_referencias(payload.cargo, payload.empresa, payload.perfil_decisor, payload.gestor)
+        # A função auto_cadastrar_referencias foi removida pois os dropdowns agora enviam IDs rígidos
         novo_id = clientes_svc.insert_cliente(
-            payload.nome, payload.email, payload.telefone, 
-            payload.empresa, payload.perfil_decisor, payload.segmento, payload.cargo, payload.gestor
+            payload.nome, 
+            payload.email, 
+            payload.telefone, 
+            payload.empresa_id,  # 👈 Passando o ID
+            payload.perfil_id,   # 👈 Passando o ID
+            payload.segmento_id, # 👈 Passando o ID
+            payload.cargo_id,    # 👈 Passando o ID
+            payload.gestor
         )
         return {"status": "success", "cliente_id": novo_id, "message": "Cliente cadastrado!"}
     except Exception as e:
@@ -2167,23 +2217,18 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
             payload.nome, 
             payload.email, 
             payload.telefone, 
-            payload.empresa, 
-            payload.perfil_decisor, 
-            payload.segmento, 
-            payload.cargo,
+            payload.empresa_id,  # 👈 Passando o ID
+            payload.perfil_id,   # 👈 Passando o ID
+            payload.segmento_id, # 👈 Passando o ID
+            payload.cargo_id,    # 👈 Passando o ID
             payload.ativo 
         )
         return {"status": "success", "message": "Cliente atualizado."}
-        
     except IntegrityError as e:
         error_msg = str(e)
         if "UQ_nps_clientes_email" in error_msg or "duplicate key" in error_msg.lower():
-            raise HTTPException(
-                status_code=400, 
-                detail="Este e-mail já está registado para outro cliente. Utilize um e-mail diferente."
-            )
+            raise HTTPException(status_code=400, detail="Este e-mail já está registado para outro cliente.")
         raise HTTPException(status_code=400, detail="Erro de restrição no banco de dados.")
-        
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -2413,10 +2458,9 @@ async def processar_importacao(payload: dict):
     chaves_cliente = payload.get("chaves_cliente", [])
     chaves_resposta = payload.get("chaves_resposta", [])
     
-    # 👇 1. CAPTURAMOS A COMPANHIA SELECIONADA NO FRONTEND
     configuracao = payload.get("configuracao", {})
     overwrite = configuracao.get("overwrite", True)
-    companhia_id_selecionada = configuracao.get("companhia_id") # Pode ser None
+    companhia_id_selecionada = configuracao.get("companhia_id")
 
     if not dados:
         raise HTTPException(status_code=400, detail="Nenhum dado válido recebido.")
@@ -2427,23 +2471,22 @@ async def processar_importacao(payload: dict):
     inserted_count = 0
     updated_count = 0
     ignored_count = 0
-
     detalhes_erros = [] 
 
     try:
         with engine.begin() as conn:
             
             # ==========================================
-            # 🏢 1. GARANTIR EMPRESAS COM A COMPANHIA DO DROPDOWN
+            # 🏢 1. GARANTIR A EXISTÊNCIA DOS DADOS MESTRE
             # ==========================================
             empresas_unicas = set()
             cargos_unicos = set()
             segmentos_unicos = set()
+            perfis_unicos = set() # 👈 Adicionado para os Perfis!
 
             for row in dados:
                 emp_nome = str(row.get("empresa", "")).strip()
-                if emp_nome: 
-                    empresas_unicas.add(emp_nome)
+                if emp_nome: empresas_unicas.add(emp_nome)
                 
                 if tipo == 'clientes':
                     cargo_nome = str(row.get("cargo", "")).strip()
@@ -2451,47 +2494,49 @@ async def processar_importacao(payload: dict):
                     
                     seg_nome = str(row.get("segmento", "")).strip()
                     if seg_nome: segmentos_unicos.add(seg_nome)
+                    
+                    perf_nome = str(row.get("perfil_decisor", row.get("perfil", ""))).strip()
+                    if perf_nome: perfis_unicos.add(perf_nome)
             
-            # 1.1 Insere ou Atualiza as EMPRESAS
+            # Cria/Atualiza Empresas
             for emp_nome in empresas_unicas:
-                check_emp_sql = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
-                emp_existente = conn.execute(check_emp_sql, {"nome": emp_nome}).fetchone()
+                check_emp = conn.execute(text("SELECT id FROM dbo.nps_empresas WHERE LOWER(nome) = LOWER(:nome)"), {"nome": emp_nome}).fetchone()
+                if not check_emp:
+                    conn.execute(text("INSERT INTO dbo.nps_empresas (nome, companhia_id, created_at) VALUES (:nome, :comp_id, CURRENT_TIMESTAMP)"), {"nome": emp_nome, "comp_id": companhia_id_selecionada})
+                elif overwrite and companhia_id_selecionada:
+                    conn.execute(text("UPDATE dbo.nps_empresas SET companhia_id = :comp_id WHERE id = :id"), {"comp_id": companhia_id_selecionada, "id": check_emp.id})
 
-                if not emp_existente:
-                    # Cria a empresa nova já com a Companhia selecionada no UI (mesmo que seja None)
-                    conn.execute(text("""
-                        INSERT INTO dbo.nps_empresas (nome, companhia_id, created_at) 
-                        VALUES (:nome, :comp_id, CURRENT_TIMESTAMP)
-                    """), {"nome": emp_nome, "comp_id": companhia_id_selecionada})
-                else:
-                    # Se a empresa já existe e o utilizador escolheu uma Companhia no UI, atualiza o vínculo
-                    if overwrite and companhia_id_selecionada:
-                        conn.execute(text("""
-                            UPDATE dbo.nps_empresas 
-                            SET companhia_id = :comp_id 
-                            WHERE id = :id
-                        """), {"comp_id": companhia_id_selecionada, "id": emp_existente.id})
+            # Cria Cargos novos
+            for c_nome in cargos_unicos:
+                if not conn.execute(text("SELECT id FROM dbo.nps_cargos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": c_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)"), {"nome": c_nome})
 
-            # 1.2 Verifica e insere os CARGOS
-            for cargo_nome in cargos_unicos:
-                check_cargo_sql = text("SELECT id FROM dbo.nps_cargos WHERE nome = :nome")
-                if not conn.execute(check_cargo_sql, {"nome": cargo_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)"), {"nome": cargo_nome})
+            # Cria Segmentos novos
+            for s_nome in segmentos_unicos:
+                if not conn.execute(text("SELECT id FROM dbo.nps_segmentos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": s_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": s_nome})
+                    
+            # Cria Perfis novos
+            for p_nome in perfis_unicos:
+                if not conn.execute(text("SELECT id FROM dbo.nps_perfis WHERE LOWER(nome) = LOWER(:nome)"), {"nome": p_nome}).fetchone():
+                    conn.execute(text("INSERT INTO dbo.nps_perfis (nome) VALUES (:nome)"), {"nome": p_nome})
 
-            # 1.3 Verifica e insere os SEGMENTOS
-            for seg_nome in segmentos_unicos:
-                check_seg_sql = text("SELECT id FROM dbo.nps_segmentos WHERE nome = :nome")
-                if not conn.execute(check_seg_sql, {"nome": seg_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": seg_nome})
+            # 💡 A GRANDE MAGIA: Mapeamento Dinâmico Texto -> ID
+            mapa_empresas = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_empresas")).fetchall()}
+            mapa_cargos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_cargos")).fetchall()}
+            mapa_segmentos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_segmentos")).fetchall()}
+            mapa_perfis = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_perfis")).fetchall()}
             
             # ==========================================
             # 🧑‍💼 2. IMPORTAÇÃO DE BASE DE CLIENTES
             # ==========================================
             if tipo == 'clientes':
+                # O mapa_db agora aponta para as novas colunas *_id
                 mapa_db = {
-                    "e-mail": "email", "email_cliente": "email",
+                    "e-mail": "email", "email_cliente": "email", "email": "email",
                     "cliente_id": "cliente_id", "id_cliente": "cliente_id",
-                    "perfil": "perfil_decisor"
+                    "perfil": "perfil_id", "perfil_decisor": "perfil_id", 
+                    "empresa": "empresa_id", "cargo": "cargo_id", "segmento": "segmento_id"
                 }
 
                 for c in dados:
@@ -2499,13 +2544,26 @@ async def processar_importacao(payload: dict):
                     params_busca = {}
                     has_null = False
 
+                    # Tradução das chaves de cruzamento (ex: Se usuário escolheu cruzar por "Empresa")
                     for idx, col_arq in enumerate(chaves_cliente):
                         val = str(c.get(col_arq, "")).strip()
                         if not val:
                             has_null = True
                             break
+                            
                         col_db = mapa_db.get(col_arq.lower(), col_arq.lower())
                         param_name = f"c_param_{idx}"
+                        
+                        # Se for uma coluna de ID, converte o texto para ID antes de cruzar!
+                        if col_db == "empresa_id": val = mapa_empresas.get(val.lower())
+                        elif col_db == "cargo_id": val = mapa_cargos.get(val.lower())
+                        elif col_db == "segmento_id": val = mapa_segmentos.get(val.lower())
+                        elif col_db == "perfil_id": val = mapa_perfis.get(val.lower())
+                        
+                        if val is None:
+                            has_null = True
+                            break
+
                         where_clauses.append(f"{col_db} = :{param_name}")
                         params_busca[param_name] = val
 
@@ -2514,26 +2572,26 @@ async def processar_importacao(payload: dict):
                         continue
 
                     where_sql = " AND ".join(where_clauses)
-                    check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
-                    existente = conn.execute(check_query, params_busca).fetchone()
+                    existente = conn.execute(text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}"), params_busca).fetchone()
 
                     email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
                     
                     raw_dt_envio = str(c.get("ultimo_envio", c.get("data_ultimo_envio", ""))).strip()
-                    dt_envio = None
-                    if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', '']:
-                        dt_envio = raw_dt_envio
+                    dt_envio = raw_dt_envio if raw_dt_envio and raw_dt_envio.lower() not in ['nan', 'nat', 'none', 'null', ''] else None
                     
                     raw_ativo = str(c.get("ativo", "True")).strip().lower()
                     status_ativo = 0 if raw_ativo in ['false', '0', 'falso', 'nao', 'não', 'f'] else 1
 
+                    # Resolve os IDs baseados no que veio no Excel
+                    perfil_raw = str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip().lower()
+
                     params_save = {
-                        "nome": str(c.get("nome", "")).strip(),
+                        "nome": str(c.get("nome", "")).strip() or None,
                         "email": email,
-                        "empresa": str(c.get("empresa", "")).strip(),
-                        "cargo": str(c.get("cargo", "")).strip(),
-                        "perfil": str(c.get("perfil_decisor", c.get("perfil", "Decisor"))).strip(),
-                        "segmento": str(c.get("segmento", "")).strip(),
+                        "empresa_id": mapa_empresas.get(str(c.get("empresa", "")).strip().lower()),
+                        "cargo_id": mapa_cargos.get(str(c.get("cargo", "")).strip().lower()),
+                        "perfil_id": mapa_perfis.get(perfil_raw),
+                        "segmento_id": mapa_segmentos.get(str(c.get("segmento", "")).strip().lower()),
                         "ultimo_envio": dt_envio,
                         "ativo": status_ativo 
                     }
@@ -2541,15 +2599,15 @@ async def processar_importacao(payload: dict):
                     if existente:
                         if overwrite:
                             params_save["cid"] = existente.cliente_id
-                            
+                            # A query de UPDATE agora grava apenas os IDs!
                             update_sql = text("""
                                 UPDATE dbo.nps_clientes 
-                                SET nome = COALESCE(NULLIF(:nome, ''), nome), 
+                                SET nome = COALESCE(:nome, nome), 
                                     email = COALESCE(NULLIF(:email, ''), email),
-                                    empresa = COALESCE(NULLIF(:empresa, ''), empresa), 
-                                    cargo = COALESCE(NULLIF(:cargo, ''), cargo),
-                                    perfil_decisor = COALESCE(NULLIF(:perfil, ''), perfil_decisor), 
-                                    segmento = COALESCE(NULLIF(:segmento, ''), segmento),
+                                    empresa_id = COALESCE(:empresa_id, empresa_id), 
+                                    cargo_id = COALESCE(:cargo_id, cargo_id),
+                                    perfil_id = COALESCE(:perfil_id, perfil_id), 
+                                    segmento_id = COALESCE(:segmento_id, segmento_id),
                                     ativo = :ativo,
                                     ultimo_envio = COALESCE(:ultimo_envio, ultimo_envio),
                                     updated_at = CURRENT_TIMESTAMP
@@ -2561,15 +2619,17 @@ async def processar_importacao(payload: dict):
                             ignored_count += 1
                     else:
                         params_save["cliente_id"] = str(random.randint(100000000, 999999999))
-                        
+                        # A query de INSERT agora grava apenas os IDs!
                         insert_sql = text("""
                             INSERT INTO dbo.nps_clientes (
-                                cliente_id, nome, email, empresa, cargo, 
-                                perfil_decisor, segmento, ativo, ultimo_envio
+                                cliente_id, nome, email, empresa_id, cargo_id, 
+                                perfil_id, segmento_id, ativo, ultimo_envio, status_envio,
+                                created_at, updated_at
                             )
                             VALUES (
-                                :cliente_id, :nome, :email, :empresa, :cargo, 
-                                :perfil, :segmento, :ativo, :ultimo_envio
+                                :cliente_id, :nome, :email, :empresa_id, :cargo_id, 
+                                :perfil_id, :segmento_id, :ativo, :ultimo_envio, 'Pendente',
+                                SYSUTCDATETIME(), SYSUTCDATETIME()
                             )
                         """)
                         conn.execute(insert_sql, params_save)
@@ -2582,8 +2642,7 @@ async def processar_importacao(payload: dict):
                 
                 mapa_clientes = {
                     "email_cliente": "email", "email": "email", "e-mail": "email",
-                    "cliente_id": "cliente_id", "id_cliente": "cliente_id",
-                    "empresa": "empresa", "nome": "nome"
+                    "cliente_id": "cliente_id", "id_cliente": "cliente_id"
                 }
                 mapa_respostas = {
                     "data_resposta": "CAST(data_resposta AS DATE)",
@@ -2594,21 +2653,16 @@ async def processar_importacao(payload: dict):
                 for r in dados:
                     email_atual = str(r.get("email", r.get("e-mail", "Desconhecido")))
                     
-                    # 👇 1. CAPTURAR A EMPRESA E O SEU ID (Para o Dashboard funcionar)
-                    emp_nome = str(r.get("empresa", "")).strip()
-                    empresa_id_banco = None
-                    if emp_nome:
-                        # Busca o ID da empresa que foi inserida/atualizada com a Companhia no passo 1
-                        emp_db = conn.execute(text("SELECT id FROM dbo.nps_empresas WHERE nome = :n"), {"n": emp_nome}).fetchone()
-                        if emp_db:
-                            empresa_id_banco = emp_db.id
+                    # 💡 Traduzimos a Empresa instantaneamente através do dicionário!
+                    emp_nome_raw = str(r.get("empresa", "")).strip()
+                    empresa_id_banco = mapa_empresas.get(emp_nome_raw.lower())
                     
                     nota_str = str(r.get("nota", "")).strip()
                     try:
                         nota = int(nota_str)
                     except ValueError:
                         ignored_count += 1
-                        detalhes_erros.append({"email": email_atual, "motivo": f"Nota inválida ou vazia: '{nota_str}'"})
+                        detalhes_erros.append({"email": email_atual, "motivo": f"Nota inválida: '{nota_str}'"})
                         continue
 
                     if nota >= 9: categoria_nps = "Promotor"
@@ -2631,16 +2685,14 @@ async def processar_importacao(payload: dict):
                         
                     if has_null or not where_clauses:
                         ignored_count += 1
-                        detalhes_erros.append({"email": email_atual, "motivo": "Coluna de identificação do cliente está vazia."})
+                        detalhes_erros.append({"email": email_atual, "motivo": "Falta coluna de identificação."})
                         continue
                         
-                    where_sql = " AND ".join(where_clauses)
-                    check_query = text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}")
-                    cliente_existente = conn.execute(check_query, params_cliente).fetchone()
+                    cliente_existente = conn.execute(text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {' AND '.join(where_clauses)}"), params_cliente).fetchone()
 
                     if not cliente_existente:
                         ignored_count += 1 
-                        detalhes_erros.append({"email": email_atual, "motivo": "Pessoa não encontrada na base de clientes."})
+                        detalhes_erros.append({"email": email_atual, "motivo": "Cliente não existe no banco."})
                         continue
                     
                     cliente_id = cliente_existente.cliente_id
@@ -2667,18 +2719,14 @@ async def processar_importacao(payload: dict):
                                 params_resp[param_name] = val
                                 
                         if not has_null_resp:
-                            resp_sql = " AND ".join(where_resp)
-                            check_resp_query = text(f"SELECT resposta_id FROM dbo.nps_respostas WHERE {resp_sql}")
-                            resp_existente = conn.execute(check_resp_query, params_resp).fetchone()
+                            resp_existente = conn.execute(text(f"SELECT resposta_id FROM dbo.nps_respostas WHERE {' AND '.join(where_resp)}"), params_resp).fetchone()
                             if resp_existente:
                                 resposta_existente_id = resp_existente.resposta_id
 
                     dt_resposta = r.get("data_resposta")
-                    if not dt_resposta or str(dt_resposta).strip() == "":
-                        dt_resposta = None
+                    if not dt_resposta or str(dt_resposta).strip() == "": dt_resposta = None
                     motivo = str(r.get("comentario", r.get("motivo", ""))).strip()
 
-                    # 👇 2. ATUALIZAR SQL PARA GRAVAR 'empresa' E 'empresa_id'
                     if resposta_existente_id:
                         if overwrite:
                             update_sql = text("""
@@ -2691,17 +2739,14 @@ async def processar_importacao(payload: dict):
                                 WHERE resposta_id = :rid
                             """)
                             conn.execute(update_sql, {
-                                "nota": nota, "motivo": motivo, "categoria": categoria_nps,
-                                "dt_resp": dt_resposta, 
-                                "empresa": emp_nome, "empresa_id": empresa_id_banco, # 👈 Vínculos
-                                "rid": resposta_existente_id
+                                "nota": nota, "motivo": motivo, "categoria": categoria_nps, "dt_resp": dt_resposta, 
+                                "empresa": emp_nome_raw, "empresa_id": empresa_id_banco, "rid": resposta_existente_id
                             })
                             updated_count += 1
                         else:
                             ignored_count += 1
                             detalhes_erros.append({"email": email_atual, "motivo": "Resposta já existe e overwrite=False."})
                     else:
-                        resposta_id = str(random.randint(100000000, 999999999))
                         insert_sql = text("""
                             INSERT INTO dbo.nps_respostas (
                                 resposta_id, cliente_id, nota, motivo, categoria, 
@@ -2715,9 +2760,9 @@ async def processar_importacao(payload: dict):
                             )
                         """)
                         conn.execute(insert_sql, {
-                            "rid": resposta_id, "cid": cliente_id, "nota": nota,
+                            "rid": str(random.randint(100000000, 999999999)), "cid": cliente_id, "nota": nota,
                             "motivo": motivo, "categoria": categoria_nps, "dt_resp": dt_resposta,
-                            "empresa": emp_nome, "empresa_id": empresa_id_banco # 👈 Vínculos
+                            "empresa": emp_nome_raw, "empresa_id": empresa_id_banco
                         })
                         inserted_count += 1
 
@@ -2873,15 +2918,19 @@ async def buscar_config_email():
             
             dados = dict(res._mapping) if res else {}
             
-            # 2. Busca o estado da Chave Mestra (Kill Switch)
-            query_ks = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")
-            res_ks = conn.execute(query_ks).scalar()
+            # 2. Busca o estado da Chave Mestra e do SSO
+            query_vars = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('envios_ativos', 'sso_microsoft_ativo')")
+            res_vars = conn.execute(query_vars).fetchall()
             
-            # Se a chave existir, converte para booleano. Se não existir, assume True (Ligado).
-            if res_ks is not None:
-                dados["envios_ativos"] = str(res_ks).lower() == 'true'
-            else:
-                dados["envios_ativos"] = True
+            # Define valores por defeito
+            dados["envios_ativos"] = True
+            dados["sso_ativo"] = False
+            
+            for row in res_vars:
+                if row.chave == 'envios_ativos':
+                    dados["envios_ativos"] = str(row.valor).lower() == 'true'
+                elif row.chave == 'sso_microsoft_ativo':
+                    dados["sso_ativo"] = str(row.valor).lower() == 'true'
                 
             return dados
     except Exception as e:
@@ -2890,9 +2939,8 @@ async def buscar_config_email():
 @app.post("/api/config/email")
 async def salvar_config_email(config: ConfigEmailSchema):
     engine = get_engine()
-    # Usamos begin() para garantir que tudo salva junto (Transação)
     with engine.begin() as conn: 
-        # 1. Limpamos e inserimos as credenciais de e-mail (Microsoft)
+        # 1. Credenciais Microsoft
         conn.execute(text("DELETE FROM dbo.nps_configuracoes_email"))
         query_email = text("""
             INSERT INTO dbo.nps_configuracoes_email 
@@ -2900,22 +2948,20 @@ async def salvar_config_email(config: ConfigEmailSchema):
             VALUES (:t, :c, :s, :e, :b)
         """)
         conn.execute(query_email, {
-            "t": config.tenant_id, 
-            "c": config.client_id, 
-            "s": config.client_secret, 
-            "e": config.email_remetente,
-            "b": config.base_url_frontend 
+            "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
+            "e": config.email_remetente, "b": config.base_url_frontend 
         })
         
-        # 2. Salva o status do Botão de Pânico na tabela global (como texto 'true' ou 'false')
-        valor_kill_switch = 'true' if config.envios_ativos else 'false'
-        query_ks = text("""
-            IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos')
-                UPDATE dbo.nps_configuracoes SET valor = :v WHERE chave = 'envios_ativos'
+        # 2. Lógica UPSERT para as chaves globais (Envios e SSO)
+        sql_upsert_cfg = text("""
+            IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
+                UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
             ELSE
-                INSERT INTO dbo.nps_configuracoes (chave, valor) VALUES ('envios_ativos', :v)
+                INSERT INTO dbo.nps_configuracoes (chave, valor) VALUES (:chave, :valor)
         """)
-        conn.execute(query_ks, {"v": valor_kill_switch})
+        
+        conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": 'true' if config.envios_ativos else 'false'})
+        conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_ativo else 'false'})
 
     return {"status": "sucesso"}
 
@@ -3219,7 +3265,7 @@ def obter_performance_gestor(gestor_id: int, usuario_email: str = Depends(get_cu
                     COALESCE(SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END), 0) as detratores
                 FROM dbo.nps_respostas r
                 INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                INNER JOIN dbo.nps_empresas e ON c.empresa = e.nome
+                INNER JOIN dbo.nps_empresas e ON c.empresa_id = e.id
                 WHERE e.gestor_id = :gestor_id
             """)
             res = conn.execute(sql_nps, {"gestor_id": gestor_id}).mappings().first()
@@ -3459,78 +3505,114 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
             "resumoParetoIA": "Analisando os filtros aplicados, identificamos uma falha de conexão com o motor cognitivo.",
             "recomendacaoIA": "Por favor, tente gerar a análise novamente."
         }
+    
+# 5. NPS POR SEGMENTO (BAR CHART) - FOCO NA EMPRESA
+@app.get("/api/reports/bi-segmento")
+async def get_bi_segmento(periodo: str = Query("Últimos 6 Meses"), segmento: str = Query("Todos"), arr: str = Query("Todos"), safra: str = Query("Todos")):
+    try:
+        where_sql, params = build_bi_filters(periodo, segmento, arr, safra)
+        
+        engine = get_engine()
+        with engine.connect() as conn:
+            # 💡 A MUDANÇA: O agrupamento agora é 100% baseado na tabela de Empresas (e)
+            sql = text(f"""
+                SELECT 
+                    COALESCE(e.segmento, 'Sem Segmento') as segmento,
+                    COUNT(r.resposta_id) as total_respostas,
+                    ROUND(
+                        (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
+                        (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
+                    ) as nps
+                FROM dbo.nps_respostas r
+                -- O vínculo crucial é r.empresa_id -> e.id
+                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id 
+                WHERE {where_sql} 
+                  AND (r.excluido = 0 OR r.excluido IS NULL)
+                GROUP BY COALESCE(e.segmento, 'Sem Segmento')
+                ORDER BY nps DESC
+            """)
+            
+            resultados = conn.execute(sql, params).mappings().all()
+            return [dict(r) for r in resultados]
+            
+    except Exception as e:
+        print(f"❌ Erro BI Segmento: {e}")
+        return []
 
 @app.get("/api/reports/jornada")
-def obter_jornada_cliente(
-    empresa: str, 
-    data_inicio: Optional[str] = Query(None), 
-    data_fim: Optional[str] = Query(None),
-    usuario_email: str = Depends(get_current_user)
-):
+def relatorio_jornada(empresa: str, data_inicio: str = None, data_fim: str = None):
+    """Retorna o histórico de feedbacks e o NPS exato de uma empresa específica"""
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            params = {
-                "empresa": empresa,
-                "inicio": data_inicio,
-                "fim": data_fim
-            }
+            # 1. Prepara os filtros dinâmicos de Data
+            filtro_data = ""
+            params = {"empresa": empresa}
+            
+            if data_inicio and data_fim:
+                filtro_data = "AND COALESCE(r.data_resposta, r.created_at) BETWEEN :data_inicio AND :data_fim"
+                params["data_inicio"] = f"{data_inicio} 00:00:00"
+                params["data_fim"] = f"{data_fim} 23:59:59"
 
-            # 1. Cálculo do NPS com conversão para FLOAT para evitar arredondamento zero
-            sql_nps = text("""
+            # =========================================================
+            # 💡 CORREÇÃO: Usar exatamente a mesma fórmula do Dashboard!
+            # =========================================================
+            sql_nps = text(f"""
                 SELECT 
-                    COUNT(r.resposta_id) as total,
-                    SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0.0 END) as promotores,
-                    SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0.0 END) as detratores
+                    COUNT(r.resposta_id) as total_respostas,
+                    ROUND(
+                        (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
+                        (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
+                    ) as nps_atual
                 FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE c.empresa = :empresa 
-                AND (r.excluido = 0 OR r.excluido IS NULL)
-                AND (:inicio IS NULL OR r.data_resposta >= :inicio)
-                AND (:fim IS NULL OR r.data_resposta <= :fim)
+                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+WHERE e.nome = :empresa
+                AND (r.excluido = 0 OR r.excluido IS NULL) -- 👈 O SEGREDO ESTÁ AQUI: Ignorar apagados!
+                {filtro_data}
             """)
             
-            res_nps = conn.execute(sql_nps, params).mappings().first()
+            resultado_nps = conn.execute(sql_nps, params).fetchone()
             
-            total = res_nps['total'] or 0
-            nps_calculado = 0
-            
-            if total > 0:
-                # Cálculo: ((Promotores - Detratores) / Total) * 100
-                promotores = res_nps['promotores'] or 0
-                detratores = res_nps['detratores'] or 0
-                nps_calculado = round(((promotores - detratores) / total) * 100)
-
-            # 3. SQL do Histórico (Timeline)
-            sql_hist = text("""
+            # 2. Busca a Linha do Tempo (Timeline)
+            sql_historico = text(f"""
                 SELECT 
-                    r.nota, r.motivo, r.canal, 
-                    COALESCE(r.data_resposta, r.created_at) as data,
-                    c.nome as cliente_nome, c.cargo
+                    r.nota, 
+                    c.nome as cliente_nome, 
+                    COALESCE(c.cargo, 'Sem Cargo') as cargo, 
+                    r.motivo, 
+                    COALESCE(r.data_resposta, r.created_at) as data_bruta, 
+                    'E-mail' as canal -- 👈 CORRIGIDO: Removido o r.origem que causava o erro 207
                 FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                WHERE c.empresa = :empresa 
+                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+                WHERE e.nome = :empresa
                 AND (r.excluido = 0 OR r.excluido IS NULL)
-                AND (:inicio IS NULL OR r.data_resposta >= :inicio)
-                AND (:fim IS NULL OR r.data_resposta <= :fim)
-                ORDER BY data DESC
+                {filtro_data}
+                ORDER BY COALESCE(r.data_resposta, r.created_at) DESC
             """)
-            result = conn.execute(sql_hist, params).mappings().all()
             
-            historico = []
-            for r in result:
-                item = dict(r)
-                item["data_formatada"] = r["data"].strftime("%d/%m/%Y %H:%M") if r["data"] else "S/D"
-                historico.append(item)
-                
+            # Converte os resultados do SQL para uma lista de dicionários
+            historico = [dict(row) for row in conn.execute(sql_historico, params).mappings().all()]
+            
+            # Formata a data no formato legível para o Frontend (DD/MM/YYYY)
+            for item in historico:
+                if item.get("data_bruta"):
+                    item["data_formatada"] = item["data_bruta"].strftime("%d/%m/%Y")
+                else:
+                    item["data_formatada"] = "---"
+
+            # 3. Retorna os dados normalizados
             return {
-                "nps_atual": nps_calculado,
-                "total_respostas": res_nps['total'] or 0,
+                "nps_atual": int(resultado_nps.nps_atual) if resultado_nps and resultado_nps.nps_atual is not None else 0,
+                "total_respostas": int(resultado_nps.total_respostas) if resultado_nps else 0,
                 "historico": historico
             }
+            
     except Exception as e:
-        print(f"Erro na Rota Jornada: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"Erro ao gerar Jornada: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Erro interno ao calcular a jornada do cliente.")
 
 # --- ROTA PARA A ABA OPERACIONAL (KPIs DE EXECUÇÃO) ---
 @app.get("/api/reports/operacional")
@@ -3592,7 +3674,6 @@ def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_u
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # Removemos o WHERE EXISTS para listar todos os cadastrados
             sql = text("""
                 SELECT id, nome 
                 FROM dbo.nps_gestores 
@@ -3616,19 +3697,24 @@ def relatorio_clientes_inativos(usuario_email: str = Depends(get_current_user)):
             # 2. Busca os clientes "Vencidos" (Disparados, não respondidos e que ultrapassaram a data limite)
             sql = text("""
                 SELECT 
-                    c.empresa, 
-                    c.nome AS cliente_nome, 
-                    c.email AS cliente_email, 
-                    COALESCE(d.data_envio_inicial, c.ultimo_envio) AS data_envio,
-                    DATEDIFF(day, COALESCE(d.data_envio_inicial, c.ultimo_envio), GETDATE()) AS dias_sem_resposta
+                    COALESCE(c.empresa, 'Sem Empresa') as empresa,
+                    c.nome as cliente_nome,
+                    c.email as cliente_email,
+                    -- Pega a data mais recente de interação (envio ou resposta)
+                    MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) as data_envio,
+                    DATEDIFF(day, MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)), GETDATE()) as dias_sem_resposta
                 FROM dbo.nps_clientes c
+                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
                 LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
-                WHERE 
-                    -- Apenas status de quem recebeu mas não finalizou a pesquisa
-                    COALESCE(d.status, c.status_envio) IN ('Enviado', 'Pendente')
-                    AND COALESCE(d.data_envio_inicial, c.ultimo_envio) IS NOT NULL
-                    -- A MÁGICA: Apenas tempo de espera MAIOR que a regra de recorrência
-                    AND DATEDIFF(day, COALESCE(d.data_envio_inicial, c.ultimo_envio), GETDATE()) > :recorrencia
+                
+                -- 👇 A CORREÇÃO ENTRA AQUI NO WHERE 👇
+                WHERE c.ativo = 1 
+                AND (e.ativo = 1 OR e.ativo IS NULL) -- Garante que a empresa do cliente também não deu churn
+                
+                -- Filtros normais da sua query (exemplo):
+                -- AND DATEDIFF(day, ..., GETDATE()) > :recorrencia_dias
+                
+                GROUP BY c.empresa, c.nome, c.email
                 ORDER BY dias_sem_resposta DESC
             """)
             
@@ -3760,3 +3846,22 @@ def excluir_acao(acao_id: int):
     except Exception as e:
         print(f"Erro ao excluir ação: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/api/cadastros/corrigir-historico")
+def corrigir_historico_nomes(tabela: str, coluna: str, de_nome: str, para_nome: str):
+    """Rota de emergência para corrigir nomes em massa no histórico"""
+    try:
+        from sqlalchemy import text
+        engine = get_engine()
+        with engine.begin() as conn:
+            sql = text(f"UPDATE {tabela} SET {coluna} = :para WHERE {coluna} = :de")
+            resultado = conn.execute(sql, {"para": para_nome, "de": de_nome})
+            linhas_afetadas = resultado.rowcount
+            
+        return {
+            "status": "Sucesso", 
+            "mensagem": f"Foram atualizados {linhas_afetadas} registos de '{de_nome}' para '{para_nome}' na tabela {tabela}!"
+        }
+    except Exception as e:
+        return {"erro": str(e)}
