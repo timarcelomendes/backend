@@ -3,6 +3,8 @@ from sqlalchemy import text
 import urllib.parse
 from database import get_engine
 from datetime import datetime
+from fastapi import HTTPException
+from sqlalchemy import text
 
 def obter_regras_dinamicas():
     """Lê as parametrizações de negócio da base de dados"""
@@ -657,3 +659,38 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
             print(f"❌ Falha ao enviar agradecimento: {resposta_ms.text}")
     except Exception as e:
         print(f"❌ Erro crítico ao enviar agradecimento: {e}")
+
+def validar_dominio_email(email: str, conn):
+    query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")
+    config_dominios = conn.execute(query).scalar()
+    
+    # 🕵️‍♂️ RASTREADORES PARA O TERMINAL
+    print(f"\n🚨 [DEBUG SSO] Iniciando validação para: {email}")
+    print(f"🚨 [DEBUG SSO] Valor lido do banco de dados: '{config_dominios}'")
+
+    # Se não houver configuração, BLOQUEIA.
+    if not config_dominios or not config_dominios.strip():
+        print("🚨 [DEBUG SSO] FALHA: Nenhuma configuração encontrada no banco!")
+        raise HTTPException(
+            status_code=403, 
+            detail="Segurança: O sistema não possui domínios autorizados configurados. Acesso suspenso."
+        )
+
+    try:
+        dominio_usuario = email.split('@')[1].lower().strip()
+        # Limpa os domínios, removendo espaços e itens vazios
+        dominios_validos = [d.strip().lower() for d in config_dominios.split(',') if d.strip()]
+        
+        print(f"🚨 [DEBUG SSO] Domínio do Utilizador: '{dominio_usuario}'")
+        print(f"🚨 [DEBUG SSO] Lista de Permitidos: {dominios_validos}")
+
+        if dominio_usuario not in dominios_validos:
+            print("🚨 [DEBUG SSO] BLOQUEADO: Domínio não pertence à lista!")
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Acesso negado: O domínio '@{dominio_usuario}' não está na lista de permissões da organização."
+            )
+        print("🚨 [DEBUG SSO] SUCESSO: Domínio validado com sucesso!\n")
+            
+    except IndexError:
+        raise HTTPException(status_code=400, detail="O formato do e-mail é inválido.")

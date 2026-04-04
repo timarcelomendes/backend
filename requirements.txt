@@ -1,19 +1,38 @@
-pydantic
-openpyxl
-python-dotenv
+# ==========================================
+# 🚀 CORE & SERVIDOR (API)
+# ==========================================
 fastapi
 uvicorn
+gunicorn
+python-multipart
+
+# ==========================================
+# 🗄️ BANCO DE DADOS (SQL Server)
+# ==========================================
 sqlalchemy
 pyodbc
-pandas
-python-multipart
+pymssql
+
+# ==========================================
+# 🔐 SEGURANÇA, AUTENTICAÇÃO E SSO
+# ==========================================
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
 bcrypt
 pyjwt
-requests
-python-jose[cryptography]
-gunicorn
-openai
-passlib[bcrypt]
 email-validator
-pymssql
+
+# ==========================================
+# 🛠️ UTILITÁRIOS E DADOS
+# ==========================================
+python-dotenv
+requests
+pandas
+openpyxl
 apscheduler
+
+# ==========================================
+# 🤖 INTELIGÊNCIA ARTIFICIAL
+# ==========================================
+openai

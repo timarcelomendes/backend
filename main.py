@@ -35,7 +35,7 @@ from apscheduler.triggers.cron import CronTrigger
 # Importações Locais
 from database import get_engine, exec_sql
 from services.auth_utils import hash_password
-from services.email_svc import enviar_email_recuperacao, processar_disparos_nps
+from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
 from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams 
 from services.webhook_svc import processar_webhook_background
@@ -373,6 +373,9 @@ class RespostaManual(BaseModel):
 
 class MicrosoftAuthPayload(BaseModel):
     access_token: str
+
+class DominiosUpdate(BaseModel):
+    dominios: str
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -544,6 +547,7 @@ async def login(requisicao: LoginRequest, request: Request):
     try:
         engine = get_engine()
         with engine.connect() as conn:
+            validar_dominio_email(requisicao.email, conn)
             query = text("""
                 SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
                 FROM dbo.nps_usuarios 
@@ -681,12 +685,45 @@ async def login(requisicao: LoginRequest, request: Request):
             detail="Erro interno no servidor. A equipa técnica já foi notificada."
         )
 
-@app.post("/api/auth/microsoft")
-async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
+@app.get("/api/auth/sso-config")
+def get_sso_config():
+    """Rota pública para alimentar o botão de Login da Microsoft no Frontend"""
     try:
-        # 1. Verifica se o SSO está ligado nas configurações
         engine = get_engine()
         with engine.connect() as conn:
+            # 1. Verifica se o Administrador ativou o botão no painel
+            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
+            
+            if not sso_check or str(sso_check).lower() != 'true':
+                return {"sso_ativo": False}
+                
+            # 2. Vai buscar apenas os IDs públicos do Azure
+            email_cfg = conn.execute(text("SELECT tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
+            if not email_cfg:
+                return {"sso_ativo": False}
+                
+            return {
+                "sso_ativo": True,
+                "tenant_id": email_cfg["tenant_id"],
+                "client_id": email_cfg["client_id"]
+            }
+    except Exception as e:
+        print(f"Erro ao ler SSO config: {e}")
+        return {"sso_ativo": False}
+
+
+@app.post("/api/auth/microsoft")
+async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
+    print("\n=============================================")
+    print(" 🚨 ALERTA: A ROTA DA MICROSOFT FOI CHAMADA!")
+    print("=============================================\n")
+    try:
+        engine = get_engine()
+        
+        # Usamos begin() para garantir que os INSERTS e UPDATES façam commit automaticamente no final
+        with engine.begin() as conn: 
+            
+            # 1. Verifica se o SSO está ligado nas configurações
             sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
             if not sso_check or str(sso_check).lower() != 'true':
                 raise HTTPException(status_code=403, detail="O Login com Microsoft está desativado pelo administrador.")
@@ -703,7 +740,10 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             # O email principal pode vir no mail ou no userPrincipalName
             user_email = (microsoft_user.get('mail') or microsoft_user.get('userPrincipalName') or "").lower()
 
-            # 3. Verifica se a pessoa existe na NOSSA base de dados
+            # 3. BARREIRA DE DOMÍNIO (Agora a variável user_email já existe!)
+            validar_dominio_email(user_email, conn)
+
+            # 4. Verifica se a pessoa existe na base de dados
             user_db = conn.execute(text("""
                 SELECT usuario_id, nome, email, cargo, tipo, ativo 
                 FROM dbo.nps_usuarios 
@@ -722,14 +762,14 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
                     detail="A sua conta está temporariamente desativada."
                 )
 
-            # 4. Regista a Sessão e Gera o Token JWT nativo (mesma lógica do login normal)
+            # 5. Regista a Sessão e Gera o Token JWT nativo
             agora_utc = datetime.now(timezone.utc)
             
-            # Gera JWT Token
             resultado_tempo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
             tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
             
-            expire = datetime.utcnow() + timedelta(minutes=tempo_minutos)
+            # Usando timezone.utc em vez do obsoleto utcnow()
+            expire = agora_utc + timedelta(minutes=tempo_minutos)
             to_encode = {
                 "sub": user_db["email"],
                 "exp": expire,
@@ -737,15 +777,28 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             }
             access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-            # Regista Permissões
+            # 6. Grava a sessão para o ecrã de "Controlo de Dispositivos"
+            ip_usuario = request.client.host
+            user_agent = request.headers.get("user-agent", "Desconhecido")
+            
+            conn.execute(text("""
+                INSERT INTO dbo.nps_sessoes (usuario_id, token, ip, dispositivo, data_criacao, valida) 
+                VALUES (:uid, :token, :ip, :disp, :agora, 1)
+            """), {
+                "uid": user_db["usuario_id"],
+                "token": access_token,
+                "ip": ip_usuario,
+                "disp": user_agent,
+                "agora": agora_utc
+            })
+
+            # 7. Regista Permissões e Atualiza Último Acesso
             sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": user_db["tipo"]}).fetchall()
             lista_permissoes = [row.chave for row in res_perm]
             
-            # Atualiza último acesso
             conn.execute(text("UPDATE dbo.nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
-            conn.commit()
-
+            
             return {
                 "access_token": access_token,
                 "token_type": "bearer",
@@ -756,42 +809,18 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             }
 
     except HTTPException:
+        # Repassa os erros 403 e 401 para o Frontend mostrar o Toast corretamente
         raise
     except Exception as e:
         print(f"Erro Auth Microsoft: {e}")
         raise HTTPException(status_code=500, detail="Erro interno no servidor de autenticação.")
-    
-@app.get("/api/auth/sso-config")
-def get_sso_config():
-    """Rota pública para alimentar o botão de Login da Microsoft no Frontend"""
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            # Verifica se o Administrador ativou o botão no painel
-            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
-            
-            if not sso_check or str(sso_check).lower() != 'true':
-                return {"sso_ativo": False}
-                
-            # Vai buscar apenas os IDs públicos
-            email_cfg = conn.execute(text("SELECT tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
-            if not email_cfg:
-                return {"sso_ativo": False}
-                
-            return {
-                "sso_ativo": True,
-                "tenant_id": email_cfg["tenant_id"],
-                "client_id": email_cfg["client_id"]
-            }
-    except Exception as e:
-        print(f"Erro ao ler SSO config: {e}")
-        return {"sso_ativo": False}
     
 @app.post("/api/register")
 def registrar_usuario(requisicao: RegistroRequest):
     engine = get_engine()
     
     with engine.begin() as conn:
+        validar_dominio_email(requisicao.email, conn)
         query_check = text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email")
         if conn.execute(query_check, {"email": requisicao.email}).fetchone():
             raise HTTPException(status_code=400, detail="Este e-mail já possui uma conta associada.")
@@ -3025,6 +3054,36 @@ async def testar_envio_email(usuario_email: str = Depends(get_current_user)):
     except Exception as e:
         print(f"❌ ERRO NO TESTE DE ENVIO: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/configuracoes/dominios")
+def get_dominios():
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            valor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
+            return {"dominios": valor if valor else ""}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/configuracoes/dominios")
+def update_dominios(dados: DominiosUpdate):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            # Verifica se a chave já existe
+            existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
+            
+            if existe:
+                conn.execute(text("UPDATE dbo.nps_configuracoes SET valor = :valor WHERE chave = 'dominios_permitidos'"), {"valor": dados.dominios})
+            else:
+                conn.execute(text("""
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, descricao) 
+                    VALUES ('dominios_permitidos', :valor, 'Lista de domínios permitidos')
+                """), {"valor": dados.dominios})
+                
+            return {"mensagem": "Domínios atualizados com sucesso!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Erro ao salvar domínios.")
     
 @app.get("/api/config/nps/elegiveis")
 def contar_elegiveis_nps():
