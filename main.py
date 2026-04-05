@@ -3,6 +3,7 @@ import io
 import json
 import traceback
 import re
+import uuid 
 import secrets
 import string
 import random
@@ -19,7 +20,7 @@ import requests
 import openai
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, BackgroundTasks, Body, Depends, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -27,7 +28,7 @@ from jose import jwt, JWTError, ExpiredSignatureError
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-# Importações do Agendador (Scheduler)
+# Importações do Agendador
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
@@ -35,7 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 # Importações Locais
 from database import get_engine, exec_sql
 from services.auth_utils import hash_password
-from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email
+from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email, enviar_email_confirmacao
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
 from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams 
 from services.webhook_svc import processar_webhook_background
@@ -224,14 +225,13 @@ class AutorizarEmailRequest(BaseModel):
     code: str
 
 class ConfigEmailSchema(BaseModel):
-    tenant_id: str
-    client_id: str
-    client_secret: str
-    email_remetente: EmailStr
+    tenant_id: Optional[str] = ""
+    client_id: Optional[str] = ""
+    client_secret: Optional[str] = ""
+    email_remetente: Optional[str] = ""
     base_url_frontend: Optional[str] = "http://localhost:5173"
     envios_ativos: Optional[bool] = True
-    sso_ativo: Optional[bool] = False
-
+    sso_microsoft_ativo: Optional[bool] = False  # 👈 NOME CORRIGIDO AQUI
 
 class RegistroRequest(BaseModel):
     nome: str
@@ -462,19 +462,16 @@ def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            
             configuracoes = payload.dict()
-            
             sql = text("""
-                UPDATE dbo.nps_configuracoes 
-                SET valor = :valor 
-                WHERE chave = :chave
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
+                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                ELSE
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
             """)
             
             for chave, valor in configuracoes.items():
-
                 valor_string = str(valor) if valor is not None else ""
-                
                 conn.execute(sql, {"chave": chave, "valor": valor_string})
             
         return {"message": "Regras de negócio guardadas com sucesso!"}
@@ -685,32 +682,72 @@ async def login(requisicao: LoginRequest, request: Request):
             detail="Erro interno no servidor. A equipa técnica já foi notificada."
         )
 
+@app.get("/api/auth/verificar-email")
+def verificar_email(token: str):
+    # Ajuste esta URL para a porta do seu Vue.js em dev ou produção
+    url_frontend = "http://localhost:5173/login" 
+    
+    try:
+        # Decodifica e verifica se não expirou (24h)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("tipo_token") != "confirmacao_email":
+            return RedirectResponse(url=f"{url_frontend}?erro=token_invalido")
+            
+        email_usuario = payload.get("sub")
+        
+        # Atualiza APENAS a validação do e-mail. Ativo continua 0!
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE dbo.nps_usuarios SET email_verificado = 1 WHERE email = :email"),
+                {"email": email_usuario}
+            )
+            
+        return RedirectResponse(url=f"{url_frontend}?verificado=true")
+        
+    except Exception as e:
+        print(f"Erro validação de e-mail: {e}")
+        return RedirectResponse(url=f"{url_frontend}?erro=token_invalido")
+
 @app.get("/api/auth/sso-config")
 def get_sso_config():
-    """Rota pública para alimentar o botão de Login da Microsoft no Frontend"""
     try:
+        from sqlalchemy import text
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. Verifica se o Administrador ativou o botão no painel
+            # 1. Busca a chave EXATA que acabámos de arrumar
             sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
             
-            if not sso_check or str(sso_check).lower() != 'true':
-                return {"sso_ativo": False}
+            # 2. Busca as chaves da Microsoft
+            email_cfg = conn.execute(text("SELECT TOP 1 tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
+            
+            # 🛡️ TRADUTOR UNIVERSAL: Converte o valor do banco para minúsculas e remove espaços
+            valor_banco = str(sso_check).strip().lower() if sso_check else 'false'
+            
+            # Se for 'true', '1', 't', 'sim'... ele aceita como Ligado!
+            is_ativo = valor_banco in ['true', '1', 't', 'y', 'sim']
+            client_id = email_cfg.get("client_id") if email_cfg else None
+            
+            # Print para nos ajudar a ver o que está a acontecer no terminal
+            print(f"🕵️ DEBUG LOGIN - Lendo do banco: '{valor_banco}' | Interpretou como LIGADO? {is_ativo}")
+            
+            # Se estiver desligado, avisa o Vue para esconder o botão
+            if not is_ativo:
+                return {"sso_ativo": False, "motivo": "desligado_no_banco"}
                 
-            # 2. Vai buscar apenas os IDs públicos do Azure
-            email_cfg = conn.execute(text("SELECT tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
-            if not email_cfg:
-                return {"sso_ativo": False}
+            # Se faltarem os IDs, esconde o botão para não dar erro na tela
+            if not client_id or str(client_id).strip() == "":
+                return {"sso_ativo": False, "motivo": "falta_client_id"}
                 
+            # Tudo verde! Manda mostrar o botão.
             return {
                 "sso_ativo": True,
-                "tenant_id": email_cfg["tenant_id"],
-                "client_id": email_cfg["client_id"]
+                "tenant_id": str(email_cfg.get("tenant_id", "")).strip(),
+                "client_id": str(client_id).strip()
             }
     except Exception as e:
-        print(f"Erro ao ler SSO config: {e}")
-        return {"sso_ativo": False}
-
+        print(f"❌ ERRO SSO-CONFIG: {e}")
+        return {"sso_ativo": False, "erro": str(e)}
 
 @app.post("/api/auth/microsoft")
 async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
@@ -740,7 +777,7 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             # O email principal pode vir no mail ou no userPrincipalName
             user_email = (microsoft_user.get('mail') or microsoft_user.get('userPrincipalName') or "").lower()
 
-            # 3. BARREIRA DE DOMÍNIO (Agora a variável user_email já existe!)
+            # 3. BARREIRA DE DOMÍNIO
             validar_dominio_email(user_email, conn)
 
             # 4. Verifica se a pessoa existe na base de dados
@@ -768,7 +805,6 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             resultado_tempo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
             tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
             
-            # Usando timezone.utc em vez do obsoleto utcnow()
             expire = agora_utc + timedelta(minutes=tempo_minutos)
             to_encode = {
                 "sub": user_db["email"],
@@ -777,16 +813,18 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             }
             access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-            # 6. Grava a sessão para o ecrã de "Controlo de Dispositivos"
+            # 👇 6. CORRIGIDO: Grava a sessão na tabela REAL com as colunas certas
             ip_usuario = request.client.host
             user_agent = request.headers.get("user-agent", "Desconhecido")
+            novo_token_id = str(uuid.uuid4()) 
             
             conn.execute(text("""
-                INSERT INTO dbo.nps_sessoes (usuario_id, token, ip, dispositivo, data_criacao, valida) 
-                VALUES (:uid, :token, :ip, :disp, :agora, 1)
+                INSERT INTO dbo.nps_sessoes_ativas 
+                (usuario_id, token_id, dispositivo, ip_address, localizacao, criado_em, ultima_atividade, revogado) 
+                VALUES (:uid, :tid, :disp, :ip, 'Detetado Automaticamente', :agora, :agora, 0)
             """), {
                 "uid": user_db["usuario_id"],
-                "token": access_token,
+                "tid": novo_token_id,
                 "ip": ip_usuario,
                 "disp": user_agent,
                 "agora": agora_utc
@@ -809,18 +847,18 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             }
 
     except HTTPException:
-        # Repassa os erros 403 e 401 para o Frontend mostrar o Toast corretamente
         raise
     except Exception as e:
         print(f"Erro Auth Microsoft: {e}")
         raise HTTPException(status_code=500, detail="Erro interno no servidor de autenticação.")
     
 @app.post("/api/register")
-def registrar_usuario(requisicao: RegistroRequest):
+def registrar_usuario(requisicao: RegistroRequest, background_tasks: BackgroundTasks, request: Request):
     engine = get_engine()
     
     with engine.begin() as conn:
         validar_dominio_email(requisicao.email, conn)
+        
         query_check = text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email")
         if conn.execute(query_check, {"email": requisicao.email}).fetchone():
             raise HTTPException(status_code=400, detail="Este e-mail já possui uma conta associada.")
@@ -838,7 +876,11 @@ def registrar_usuario(requisicao: RegistroRequest):
             "senha_hash": senha_hash
         })
         
-    return {"mensagem": "Conta criada com sucesso e aguarda aprovação do administrador!"}
+        # 👇 ENVIO DE E-MAIL EM BACKGROUND (Não trava a tela)
+        url_backend = f"{request.url.scheme}://{request.url.netloc}"
+        background_tasks.add_task(enviar_email_confirmacao, requisicao.email, SECRET_KEY, ALGORITHM, url_backend)
+        
+    return {"mensagem": "Conta criada! Enviámos um link para o seu e-mail. Por favor, confirme para darmos andamento à sua aprovação."}
 
 
 @app.post("/api/reset-password")
@@ -1040,10 +1082,12 @@ async def save_configuracoes(configs: List[ConfigItem]):
         engine = get_engine()
         with engine.begin() as conn:
             for item in configs:
+                # O SEGREDO: Upsert em vez de Update simples
                 conn.execute(text("""
-                    UPDATE dbo.nps_configuracoes 
-                    SET valor = :valor, updated_at = GETDATE() 
-                    WHERE chave = :chave
+                    IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
+                        UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                    ELSE
+                        INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
                 """), {"valor": item.valor, "chave": item.chave})
         return {"status": "success", "detail": "Configurações salvas!"}
     except Exception as e:
@@ -2951,15 +2995,15 @@ async def buscar_config_email():
             query_vars = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('envios_ativos', 'sso_microsoft_ativo')")
             res_vars = conn.execute(query_vars).fetchall()
             
-            # Define valores por defeito
+            # 👇 CORREÇÃO: O nome da variável devolvida ao Vue DEVE ser sso_microsoft_ativo
             dados["envios_ativos"] = True
-            dados["sso_ativo"] = False
+            dados["sso_microsoft_ativo"] = False 
             
             for row in res_vars:
                 if row.chave == 'envios_ativos':
                     dados["envios_ativos"] = str(row.valor).lower() == 'true'
                 elif row.chave == 'sso_microsoft_ativo':
-                    dados["sso_ativo"] = str(row.valor).lower() == 'true'
+                    dados["sso_microsoft_ativo"] = str(row.valor).lower() == 'true' # 👇 CORREÇÃO AQUI TAMBÉM
                 
             return dados
     except Exception as e:
@@ -2969,28 +3013,43 @@ async def buscar_config_email():
 async def salvar_config_email(config: ConfigEmailSchema):
     engine = get_engine()
     with engine.begin() as conn: 
-        # 1. Credenciais Microsoft
-        conn.execute(text("DELETE FROM dbo.nps_configuracoes_email"))
-        query_email = text("""
-            INSERT INTO dbo.nps_configuracoes_email 
-            (tenant_id, client_id, client_secret, email_remetente, base_url_frontend)
-            VALUES (:t, :c, :s, :e, :b)
-        """)
-        conn.execute(query_email, {
-            "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
-            "e": config.email_remetente, "b": config.base_url_frontend 
-        })
+        # 1. Credenciais Microsoft - UPSERT Seguro (Nunca apaga a tabela!)
+        existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes_email")).scalar()
+        
+        if existe:
+            conn.execute(text("""
+                UPDATE dbo.nps_configuracoes_email 
+                SET tenant_id = :t, 
+                    client_id = :c, 
+                    client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
+                    email_remetente = :e, 
+                    base_url_frontend = :b,
+                    atualizado_em = GETDATE()
+            """), {
+                "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
+                "e": config.email_remetente, "b": config.base_url_frontend 
+            })
+        else:
+            conn.execute(text("""
+                INSERT INTO dbo.nps_configuracoes_email 
+                (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
+                VALUES (:t, :c, :s, :e, :b, GETDATE())
+            """), {
+                "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
+                "e": config.email_remetente, "b": config.base_url_frontend 
+            })
         
         # 2. Lógica UPSERT para as chaves globais (Envios e SSO)
+        # Agora possui o updated_at no INSERT para evitar erros de colunas NOT NULL
         sql_upsert_cfg = text("""
             IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
                 UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
             ELSE
-                INSERT INTO dbo.nps_configuracoes (chave, valor) VALUES (:chave, :valor)
+                INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
         """)
         
         conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": 'true' if config.envios_ativos else 'false'})
-        conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_ativo else 'false'})
+        conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_microsoft_ativo else 'false'})
 
     return {"status": "sucesso"}
 
@@ -3250,17 +3309,14 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE dbo.nps_configuracoes 
-                    SET valor = :valor, updated_at = SYSUTCDATETIME() 
-                    WHERE chave = 'sessao_expiracao_minutos'
-                """),
-                {"valor": str(payload.tempo_minutos)}
-            )
+            conn.execute(text("""
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos')
+                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = SYSUTCDATETIME() WHERE chave = 'sessao_expiracao_minutos'
+                ELSE
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES ('sessao_expiracao_minutos', :valor, SYSUTCDATETIME())
+            """), {"valor": str(payload.tempo_minutos)})
             
         return {"status": "success", "message": "Tempo de sessão atualizado com sucesso!"}
-        
     except Exception as e:
         print(f"Erro ao salvar configuração de segurança: {e}")
         raise HTTPException(status_code=500, detail="Erro ao guardar configurações de segurança.")
