@@ -230,6 +230,7 @@ class ConfigEmailSchema(BaseModel):
     client_secret: Optional[str] = ""
     email_remetente: Optional[str] = ""
     base_url_frontend: Optional[str] = "http://localhost:5173"
+    robo_ativo: bool = False
     envios_ativos: Optional[bool] = True
     sso_microsoft_ativo: Optional[bool] = False  # 👈 NOME CORRIGIDO AQUI
 
@@ -351,7 +352,8 @@ class RegrasNegocioConfig(BaseModel):
     lembrete_qtd_maxima: int = 3
     lembrete_dias_1: int = 3
     lembrete_dias_2: int = 7
-    lembrete_dias_3: int = 15
+    lembrete_dias_3: int = 15,
+    robo_ativo: bool = False
 
 class TesteTemplatePayload(BaseModel):
     email_destino: str
@@ -465,6 +467,23 @@ def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get
     try:
         engine = get_engine()
         with engine.begin() as conn:
+            # Busca o ID do utilizador logado para o log
+            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+
+            # --- AUDITORIA: VERIFICA SE O ROBÔ LIGOU OU DESLIGOU ---
+            estado_robo_antigo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
+            novo_robo_str = 'true' if payload.robo_ativo else 'false'
+
+            # Se o estado for diferente do que estava no banco, grava o log!
+            if str(estado_robo_antigo).lower() != novo_robo_str:
+                registrar_log(
+                    acao="CONFIG_ROBO",
+                    mensagem=f"O utilizador {'ATIVOU' if payload.robo_ativo else 'DESATIVOU'} o Robô Automático (Background).",
+                    nivel="WARN",
+                    usuario_id=uid
+                )
+
+            # Salva todas as regras no banco (incluindo o robo_ativo)
             configuracoes = payload.dict()
             sql = text("""
                 IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
@@ -474,7 +493,11 @@ def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get
             """)
             
             for chave, valor in configuracoes.items():
-                valor_string = str(valor) if valor is not None else ""
+                if isinstance(valor, bool):
+                    valor_string = 'true' if valor else 'false'
+                else:
+                    valor_string = str(valor) if valor is not None else ""
+                
                 conn.execute(sql, {"chave": chave, "valor": valor_string})
             
         return {"message": "Regras de negócio guardadas com sucesso!"}
@@ -549,7 +572,7 @@ async def login(requisicao: LoginRequest, request: Request):
         with engine.connect() as conn:
             validar_dominio_email(requisicao.email, conn)
             query = text("""
-                SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo 
+                SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo, avatar_url
                 FROM dbo.nps_usuarios 
                 WHERE email = :email
             """)
@@ -668,9 +691,11 @@ async def login(requisicao: LoginRequest, request: Request):
                 "access_token": access_token,
                 "token_type": "bearer",
                 "nome": resultado["nome"],
-                "cargo": resultado["cargo"], # 👈 ADICIONE ESTA LINHA
+                "email": resultado["email"],
+                "cargo": resultado["cargo"],
                 "tipo": resultado["tipo"],
-                "permissoes": lista_permissoes
+                "permissoes": lista_permissoes,
+                "avatar": resultado.get("avatar_url") or "",
             }
 
     except HTTPException:
@@ -875,13 +900,23 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             
             conn.execute(text("UPDATE dbo.nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
             
+            # --- AUDITORIA: LOGIN SSO ---
+            registrar_log(
+                acao="LOGIN_SSO",
+                mensagem=f"Acesso via Microsoft Entra ID (SSO) realizado com sucesso.",
+                nivel="INFO",
+                usuario_id=user_db["usuario_id"]
+            )
+
             return {
                 "access_token": access_token,
                 "token_type": "bearer",
                 "nome": user_db["nome"],
+                "email": user_db["email"],
                 "cargo": user_db["cargo"],
                 "tipo": user_db["tipo"],
-                "permissoes": lista_permissoes
+                "permissoes": lista_permissoes,
+                "avatar": user_db.get("avatar_url") or "",
             }
 
     except HTTPException:
@@ -1052,6 +1087,66 @@ async def reset_manual_senha(usuario_id: str):
         return {"senha_provisoria": senha_provisoria}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/usuarios/{usuario_id}")
+def excluir_usuario(usuario_id: str, admin_email: str = Depends(exigir_admin)):
+    """Exclui um utilizador do sistema (Apenas Administradores)"""
+    try:
+        engine = get_engine()
+        
+        # Usamos engine.begin() para que ele faça o commit automaticamente no final
+        with engine.begin() as conn:
+            
+            # 1. Pega o ID do Administrador logado usando o e-mail do token
+            admin_id = conn.execute(
+                text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email"),
+                {"email": admin_email}
+            ).scalar()
+
+            # 2. Trava anti-suicídio (Não pode excluir a si mesmo)
+            if str(usuario_id) == str(admin_id):
+                raise HTTPException(status_code=400, detail="Operação bloqueada: Você não pode excluir a sua própria conta.")
+
+            # 3. Verifica qual é o tipo de conta que estamos a tentar excluir
+            usuario_alvo = conn.execute(
+                text("SELECT tipo FROM dbo.nps_usuarios WHERE usuario_id = :id"),
+                {"id": usuario_id}
+            ).mappings().first()
+
+            if not usuario_alvo:
+                raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+            # 4. Trava do Último Admin
+            if str(usuario_alvo["tipo"]).lower() == 'admin':
+                total_admins = conn.execute(
+                    text("SELECT COUNT(usuario_id) FROM dbo.nps_usuarios WHERE LOWER(tipo) = 'admin' AND ativo = 1")
+                ).scalar()
+
+                if total_admins <= 1:
+                    raise HTTPException(status_code=400, detail="Operação bloqueada: Este é o último administrador ativo do sistema.")
+
+            # 5. Limpa as sessões ativas do usuário (para não dar erro de Chave Estrangeira - FK)
+            conn.execute(text("DELETE FROM dbo.nps_sessoes_ativas WHERE usuario_id = :id"), {"id": usuario_id})
+            
+            # 6. Exclui o usuário definitivamente
+            conn.execute(text("DELETE FROM dbo.nps_usuarios WHERE usuario_id = :id"), {"id": usuario_id})
+
+            # 7. Registra a exclusão no nosso Log de Auditoria
+            registrar_log(
+                acao="EXCLUSAO_USUARIO",
+                mensagem=f"O usuário ID {usuario_id} foi excluído definitivamente do sistema.",
+                nivel="WARN",
+                usuario_id=admin_id
+            )
+
+        return {"status": "success", "mensagem": "Usuário excluído com sucesso."}
+        
+    except HTTPException:
+        # Repassa os erros 400 (como a trava de segurança) diretamente para o Vue.js
+        raise
+    except Exception as e:
+        print(f"Erro ao excluir usuário: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao excluir o usuário no banco de dados.")
     
 # ==========================================
 # 🔐 GESTÃO DE PERMISSÕES (RBAC/PBAC)
@@ -2215,12 +2310,23 @@ def update_empresa(empresa_id: int, emp: EmpresaSchema):
 # ==========================================
 
 @app.delete("/api/cadastros/empresas/{empresa_id}")
-def delete_empresa(empresa_id: int):
+def delete_empresa(empresa_id: int, admin_email: str = Depends(exigir_admin)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
+            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+
             conn.execute(text("DELETE FROM dbo.nps_empresas WHERE id = :id"), {"id": empresa_id})
             conn.commit()
+
+            # --- AUDITORIA ---
+            registrar_log(
+                acao="EXCLUSAO_EMPRESA",
+                mensagem=f"A empresa ID {empresa_id} foi excluída permanentemente.",
+                nivel="ERROR",
+                usuario_id=admin_id
+            )
+
             return {"message": "Empresa removida com sucesso"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2280,11 +2386,23 @@ def forcar_envio_nps(cliente_id: str, background_tasks: BackgroundTasks, usuario
         raise HTTPException(status_code=500, detail="Não conseguimos processar o envio manual. Tente novamente em instantes.")
 
 @app.post("/api/clientes/forcar-envio-lote")
-def forcar_envio_lote(payload: LoteEnvio, background_tasks: BackgroundTasks, usuario: str = Depends(get_current_user)):
+def forcar_envio_lote(payload: LoteEnvio, background_tasks: BackgroundTasks, usuario_email: str = Depends(get_current_user)):
     try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+
         from services.email_svc import disparar_convite_nps_especifico
         background_tasks.add_task(disparar_convite_nps_especifico, payload.cliente_ids)
         
+        # --- AUDITORIA ---
+        registrar_log(
+            acao="DISPARO_MANUAL",
+            mensagem=f"Iniciado disparo manual forçado para um lote de {len(payload.cliente_ids)} clientes.",
+            nivel="INFO",
+            usuario_id=uid
+        )
+
         return {
             "status": "success", 
             "message": f"O motor de disparos iniciou o processamento de {len(payload.cliente_ids)} e-mails com sucesso."
@@ -2293,9 +2411,23 @@ def forcar_envio_lote(payload: LoteEnvio, background_tasks: BackgroundTasks, usu
         raise HTTPException(status_code=500, detail="Ocorreu um erro ao tentar processar o lote de envios.")
 
 @app.delete("/api/clientes/{cliente_id}")
-def delete_cliente_route(cliente_id: str, delete_respostas: bool = True): 
+def delete_cliente_route(cliente_id: str, delete_respostas: bool = True, usuario_email: str = Depends(get_current_user)): 
     try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+
+        # O serviço apaga e devolve o status
         ok, msg = clientes_svc.delete_cliente(cliente_id, delete_respostas)
+        
+        # --- AUDITORIA ---
+        registrar_log(
+            acao="EXCLUSAO_CLIENTE",
+            mensagem=f"O cliente ID {cliente_id} e os seus vínculos foram excluídos da base.",
+            nivel="WARN",
+            usuario_id=uid
+        )
+
         return {"status": "success", "message": msg}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2504,25 +2636,32 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 # 🗑️ EXCLUSÃO DEFINITIVA DE FEEDBACKS (ADMIN)
 # ==========================================
 @app.delete("/api/respostas/{resposta_id}")
-def excluir_resposta_definitiva(resposta_id: str, usuario = Depends(exigir_admin)):
+def excluir_resposta_definitiva(resposta_id: str, admin_email: str = Depends(exigir_admin)):
     """Exclui permanentemente uma resposta do banco de dados (Apenas Admins)"""
     try:
         engine = get_engine()
         with engine.begin() as conn:
+            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+            
             check = conn.execute(text("SELECT resposta_id FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id}).fetchone()
             if not check:
                 raise HTTPException(status_code=404, detail="Resposta não encontrada.")
             
             conn.execute(text("DELETE FROM dbo.nps_acoes WHERE resposta_id = :id"), {"id": resposta_id})
-                
             conn.execute(text("DELETE FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id})
             
+            # --- AUDITORIA ---
+            registrar_log(
+                acao="EXCLUSAO_RESPOSTA",
+                mensagem=f"A resposta NPS ID {resposta_id} foi permanentemente excluída da base.",
+                nivel="WARN",
+                usuario_id=admin_id
+            )
+
         return {"status": "success", "message": "Feedback e ações vinculadas foram excluídos permanentemente."}
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        print(f"Erro ao excluir resposta: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Erro interno ao excluir a resposta.")
 
 # ==========================================
@@ -2976,42 +3115,41 @@ def obter_tipo_join():
 # ==========================================
     
 @app.put("/api/usuarios/{usuario_id}")
-async def atualizar_usuario(usuario_id: str, data: dict):
+async def atualizar_usuario(usuario_id: str, data: dict, admin_email: str = Depends(exigir_admin)):
     try:
         engine = get_engine()
-        ativo_status = data.get("ativo") 
-
         with engine.begin() as conn:
+            # Busca o ID do Admin que está a aprovar
+            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+
             query = text("""
                 UPDATE dbo.nps_usuarios 
-                SET nome = :nome, 
-                    email = :email, 
-                    cargo = :cargo, 
-                    ativo = :ativo,
-                    tipo = :tipo 
+                SET nome = :nome, email = :email, cargo = :cargo, ativo = :ativo, tipo = :tipo 
                 WHERE usuario_id = :id
             """)
             conn.execute(query, {
-                "nome": data.get("nome"),
-                "email": data.get("email"),
-                "cargo": data.get("cargo"),
-                "ativo": str(data.get("ativo")),
-                "tipo": data.get("tipo", "Usuário"), # 💡 NOVA LINHA
-                "id": usuario_id
+                "nome": data.get("nome"), "email": data.get("email"), "cargo": data.get("cargo"),
+                "ativo": str(data.get("ativo")), "tipo": data.get("tipo", "Usuário"), "id": usuario_id
             })
 
             password = data.get("password")
             if password and password.strip():
                 senha_hash = hash_password(password)
-                conn.execute(
-                    text("UPDATE dbo.nps_usuarios SET senha_hash = :h WHERE usuario_id = :id"),
-                    {"h": senha_hash, "id": usuario_id}
+                conn.execute(text("UPDATE dbo.nps_usuarios SET senha_hash = :h WHERE usuario_id = :id"), {"h": senha_hash, "id": usuario_id})
+            
+            # --- AUDITORIA ---
+            if str(data.get("ativo")) in ['1', 'true', 'True']:
+                registrar_log(
+                    acao="APROVACAO_USUARIO",
+                    mensagem=f"O utilizador {data.get('email')} teve o seu acesso aprovado/ativado.",
+                    nivel="SUCCESS",
+                    usuario_id=admin_id
                 )
 
         return {"mensagem": "Utilizador atualizado com sucesso"}
     except Exception as e:
-        print(f"Erro ao desativar: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao atualizar status no banco")
+        print(f"Erro ao atualizar: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao atualizar no banco")
 
 
 # ==========================================
@@ -3048,48 +3186,83 @@ async def buscar_config_email():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/config/email")
-async def salvar_config_email(config: ConfigEmailSchema):
+async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depends(exigir_admin)):
     engine = get_engine()
-    with engine.begin() as conn: 
-        # 1. Credenciais Microsoft - UPSERT Seguro (Nunca apaga a tabela!)
-        existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes_email")).scalar()
-        
-        if existe:
-            conn.execute(text("""
-                UPDATE dbo.nps_configuracoes_email 
-                SET tenant_id = :t, 
-                    client_id = :c, 
-                    client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
-                    email_remetente = :e, 
-                    base_url_frontend = :b,
-                    atualizado_em = GETDATE()
-            """), {
-                "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
-                "e": config.email_remetente, "b": config.base_url_frontend 
-            })
-        else:
-            conn.execute(text("""
-                INSERT INTO dbo.nps_configuracoes_email 
-                (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
-                VALUES (:t, :c, :s, :e, :b, GETDATE())
-            """), {
-                "t": config.tenant_id, "c": config.client_id, "s": config.client_secret, 
-                "e": config.email_remetente, "b": config.base_url_frontend 
-            })
-        
-        # 2. Lógica UPSERT para as chaves globais (Envios e SSO)
-        # Agora possui o updated_at no INSERT para evitar erros de colunas NOT NULL
-        sql_upsert_cfg = text("""
-            IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
-            ELSE
-                INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
-        """)
-        
-        conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": 'true' if config.envios_ativos else 'false'})
-        conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_microsoft_ativo else 'false'})
+    try:
+        with engine.begin() as conn: 
+            admin_id = conn.execute(
+                text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), 
+                {"e": admin_email}
+            ).scalar()
 
-    return {"status": "sucesso"}
+            # 1. Atualiza as credenciais da Microsoft (Mantém igual)
+            existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes_email")).scalar()
+            if existe:
+                conn.execute(text("""
+                    UPDATE dbo.nps_configuracoes_email 
+                    SET tenant_id = :t, client_id = :c, client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
+                        email_remetente = :e, base_url_frontend = :b, atualizado_em = GETDATE()
+                """), {"t": config.tenant_id, "c": config.client_id, "s": config.client_secret, "e": config.email_remetente, "b": config.base_url_frontend})
+            else:
+                conn.execute(text("""
+                    INSERT INTO dbo.nps_configuracoes_email (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
+                    VALUES (:t, :c, :s, :e, :b, GETDATE())
+                """), {"t": config.tenant_id, "c": config.client_id, "s": config.client_secret, "e": config.email_remetente, "b": config.base_url_frontend})
+            
+            # --- PREPARAÇÃO DO UPSERT DE CONFIGURAÇÕES ---
+            sql_upsert_cfg = text("""
+                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
+                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                ELSE
+                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
+            """)
+
+            # ==============================================================
+            # TOGGLE 1: MOTOR DE DISPAROS DE E-MAIL
+            # ==============================================================
+            estado_motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
+            novo_motor = 'true' if config.envios_ativos else 'false'
+            
+            if estado_motor != novo_motor:
+                registrar_log(
+                    acao="CONFIG_MOTOR",
+                    mensagem=f"O utilizador {'ATIVOU' if config.envios_ativos else 'DESATIVOU'} o Motor de Disparos de E-mail.",
+                    nivel="WARN",
+                    usuario_id=admin_id
+                )
+            conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": novo_motor})
+
+
+            # ==============================================================
+            # TOGGLE 2: ROBÔ AUTOMÁTICO (Background)
+            # ==============================================================
+            # Ajuste 'robo_ativo' para o nome da variável enviada pelo seu Vue.js
+            estado_robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
+            
+            # Usamos getattr por segurança, caso a propriedade falhe
+            novo_robo_bool = getattr(config, 'robo_ativo', False)
+            novo_robo = 'true' if novo_robo_bool else 'false'
+
+            if estado_robo != novo_robo:
+                registrar_log(
+                    acao="CONFIG_ROBO",
+                    mensagem=f"O utilizador {'ATIVOU' if novo_robo_bool else 'DESATIVOU'} o Robô Automático (Disparos em Background).",
+                    nivel="WARN",
+                    usuario_id=admin_id
+                )
+            conn.execute(sql_upsert_cfg, {"chave": "robo_ativo", "valor": novo_robo})
+
+
+            # ==============================================================
+            # SSO MICROSOFT
+            # ==============================================================
+            conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_microsoft_ativo else 'false'})
+
+        return {"status": "sucesso", "mensagem": "Configurações e auditoria atualizadas."}
+    
+    except Exception as e:
+        print(f"Erro ao salvar config e log: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao salvar configurações.")
 
 @app.post("/api/config/email/autorizar")
 async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
@@ -3231,10 +3404,8 @@ def forcar_disparo_nps(background_tasks: BackgroundTasks):
 # 🖼️ GESTOR DE IMAGENS (E-MAIL TEMPLATES)
 # ==========================================
 
-# 1. Garante que a pasta "uploads" existe fisicamente no servidor
 os.makedirs("uploads", exist_ok=True)
 
-# 2. Transforma a pasta "uploads" numa pasta pública, para que os e-mails consigam aceder
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.post("/api/upload-imagem")
@@ -3281,6 +3452,77 @@ def remover_imagem(nome_arquivo: str):
             return {"status": "success"}
         raise HTTPException(status_code=404, detail="Imagem não encontrada.")
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 👤 GESTOR DE AVATARES DE PERFIL
+# ==========================================
+@app.post("/api/usuarios/me/avatar")
+async def upload_meu_avatar(file: UploadFile = File(...), usuario_email: str = Depends(get_current_user), request: Request = None):
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            # 1. Pega os dados do usuário atual
+            user = conn.execute(text("SELECT usuario_id, avatar_url FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
+            if not user:
+                raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+            # 2. Prepara a pasta de Avatares
+            AVATAR_PATH = "uploads/avatars"
+            os.makedirs(AVATAR_PATH, exist_ok=True)
+
+            # 3. Gera um nome único e seguro para não substituir arquivos de outros
+            ext = os.path.splitext(file.filename)[1]
+            novo_nome = f"avatar_{user['usuario_id']}_{uuid.uuid4().hex}{ext}"
+            caminho_completo = os.path.join(AVATAR_PATH, novo_nome)
+
+            # 4. Salva a nova imagem no servidor
+            with open(caminho_completo, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            # 5. Remove a foto antiga do servidor (Limpeza)
+            if user.get('avatar_url'):
+                antigo_relativo = user['avatar_url'].split('/uploads/')[-1]
+                antigo_fisico = os.path.join("uploads", antigo_relativo)
+                if os.path.exists(antigo_fisico):
+                    try: os.remove(antigo_fisico)
+                    except: pass
+
+            # 6. Salva a nova URL no Banco de Dados
+            base_url = str(request.base_url).rstrip("/")
+            url_publica = f"{base_url}/uploads/avatars/{novo_nome}"
+            
+            conn.execute(text("UPDATE dbo.nps_usuarios SET avatar_url = :url WHERE usuario_id = :id"), 
+                         {"url": url_publica, "id": user['usuario_id']})
+            
+            return {"status": "success", "avatar_url": url_publica}
+            
+    except Exception as e:
+        print(f"❌ Erro no upload do avatar: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao salvar a imagem.")
+
+@app.delete("/api/usuarios/me/avatar")
+async def remover_meu_avatar(usuario_email: str = Depends(get_current_user)):
+    """Remove a foto de perfil do usuário e devolve ao estado de iniciais"""
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            user = conn.execute(text("SELECT usuario_id, avatar_url FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
+            
+            if user and user.get('avatar_url'):
+                # Tenta apagar o arquivo fisicamente
+                antigo_relativo = user['avatar_url'].split('/uploads/')[-1]
+                antigo_fisico = os.path.join("uploads", antigo_relativo)
+                if os.path.exists(antigo_fisico):
+                    try: os.remove(antigo_fisico)
+                    except: pass
+                    
+                # Limpa a coluna no banco
+                conn.execute(text("UPDATE dbo.nps_usuarios SET avatar_url = NULL WHERE usuario_id = :id"), {"id": user['usuario_id']})
+                
+        return {"status": "success", "message": "Avatar removido"}
+    except Exception as e:
+        print(f"❌ Erro ao remover avatar: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
@@ -4018,3 +4260,68 @@ def corrigir_historico_nomes(tabela: str, coluna: str, de_nome: str, para_nome: 
         }
     except Exception as e:
         return {"erro": str(e)}
+    
+# ==========================================
+# 🎯 LOGS: Tela de Logs
+# ==========================================
+
+@app.get("/api/logs")
+def listar_logs(usuario = Depends(exigir_admin)):
+    """Retorna os logs de auditoria do sistema (Últimos 200)"""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            query = text("""
+                SELECT TOP 200 
+                    l.id, 
+                    l.nivel, 
+                    l.acao, 
+                    l.mensagem, 
+                    l.data_criacao,
+                    u.nome as usuario_nome
+                FROM dbo.nps_logs l
+                LEFT JOIN dbo.nps_usuarios u ON l.usuario_id = u.usuario_id
+                ORDER BY l.data_criacao DESC
+            """)
+            resultados = conn.execute(query).mappings().fetchall()
+            
+            logs_formatados = []
+            for r in resultados:
+                logs_formatados.append({
+                    "id": r["id"],
+                    "nivel": r["nivel"],
+                    "acao": r["acao"],
+                    "mensagem": r["mensagem"],
+                    "usuario_nome": r["usuario_nome"] or "Sistema/Robô",
+                    "data_criacao": r["data_criacao"].isoformat() if r["data_criacao"] else None
+                })
+                
+            return logs_formatados
+    except Exception as e:
+        print(f"Erro ao buscar logs: {e}")
+        raise HTTPException(status_code=500, detail="Não foi possível carregar os logs.")
+    
+def registrar_log(acao: str, mensagem: str, nivel: str = 'INFO', usuario_id: int = None):
+    """
+    Grava eventos críticos na tabela de auditoria.
+    Níveis permitidos: 'INFO', 'SUCCESS', 'WARN', 'ERROR'
+    """
+    try:
+        from database import get_engine
+        from sqlalchemy import text
+        
+        engine = get_engine()
+        with engine.begin() as conn:  # .begin() faz o commit automático
+            sql = text("""
+                INSERT INTO dbo.nps_logs (nivel, acao, mensagem, usuario_id)
+                VALUES (:nivel, :acao, :mensagem, :usuario_id)
+            """)
+            conn.execute(sql, {
+                "nivel": nivel,
+                "acao": acao,
+                "mensagem": mensagem,
+                "usuario_id": usuario_id
+            })
+    except Exception as e:
+        # Se o log falhar, o sistema não deve parar, apenas avisa no terminal
+        print(f"🚨 Falha crítica ao gravar log no banco: {e}")

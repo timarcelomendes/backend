@@ -317,6 +317,29 @@ def processar_disparos_nps():
     print("⏳ Iniciando rotina de disparo de NPS...")
     engine = get_engine()
     
+    # =================================================================
+    # 🛑 TRAVA DE SEGURANÇA: VERIFICA OS BOTÕES DO PAINEL
+    # =================================================================
+    try:
+        from sqlalchemy import text # Garantir que o text está importado
+        with engine.connect() as conn:
+            # 1. Verifica o Motor Geral (Se desligar aqui, corta tudo)
+            motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
+            if str(motor).lower() not in ['true', '1']:
+                print("⏸️ Motor de Disparos está DESLIGADO. O robô não fará envios.")
+                return # Interrompe a função imediatamente
+            
+            # 2. Verifica o Robô Automático (Background)
+            robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
+            if str(robo).lower() not in ['true', '1']:
+                print("⏸️ Robô Automático (Background) está DESLIGADO. Nenhuma pesquisa automática será enviada.")
+                return # Interrompe a função imediatamente
+                
+    except Exception as e:
+        print(f"❌ Erro ao ler travas de segurança. Abortando envios por precaução: {e}")
+        return
+    # =================================================================
+    
     # 1. Buscar quem deve receber a pesquisa hoje
     sql_busca = text("""
         SELECT TOP (100)
@@ -362,6 +385,7 @@ def processar_disparos_nps():
                         "empresa": cliente["empresa"] or "",
                         "empresa_id": cliente["empresa_id"] or ""
                     }
+                    import urllib.parse
                     query_string = urllib.parse.urlencode({k: v for k, v in params.items() if v})
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
@@ -409,6 +433,7 @@ def processar_disparos_nps():
                         "saveToSentItems": True
                     }
 
+                    import requests
                     resposta_ms = requests.post(
                         "https://graph.microsoft.com/v1.0/me/sendMail",
                         headers=headers,
@@ -444,9 +469,24 @@ def processar_disparos_nps():
 
         print(f"🏁 Rotina finalizada! {enviados} convites de NPS enviados com sucesso.")
         
+        # =================================================================
+        # 8. AUDITORIA: REGISTRO DA AÇÃO AUTOMÁTICA
+        # =================================================================
+        if enviados > 0:
+            try:
+                from main import registrar_log
+                registrar_log(
+                    acao="DISPARO_AUTOMATICO",
+                    mensagem=f"O Robô enviou com sucesso {enviados} pesquisas agendadas.",
+                    nivel="SUCCESS"
+                )
+            except Exception as log_err:
+                print(f"Erro ao gravar log de auditoria do robô: {log_err}")
+        # =================================================================
+        
     except Exception as e:
         print(f"❌ Erro Fatal na rotina de NPS: {e}")
-
+        
 def disparar_convite_nps_especifico(cliente_ids: list):
     """Busca clientes específicos e força o envio nativo do NPS pelo MS Graph"""
     if not cliente_ids:
