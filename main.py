@@ -376,6 +376,9 @@ class MicrosoftAuthPayload(BaseModel):
 
 class DominiosUpdate(BaseModel):
     dominios: str
+
+class ReenviarEmailReq(BaseModel):
+    email: str
     
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
@@ -681,7 +684,42 @@ async def login(requisicao: LoginRequest, request: Request):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Erro interno no servidor. A equipa técnica já foi notificada."
         )
+    
+@app.post("/api/reenviar-confirmacao")
+def reenviar_email_confirmacao(dados: ReenviarEmailReq, background_tasks: BackgroundTasks, request: Request):
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
 
+            # 1. Busca os dados com as colunas EXATAS da sua tabela
+            query = text("SELECT usuario_id, nome, email, ativo, email_verificado FROM dbo.nps_usuarios WHERE email = :email")
+            user = conn.execute(query, {"email": dados.email.strip()}).mappings().first()
+
+            if not user:
+                raise HTTPException(status_code=404, detail="E-mail não encontrado no sistema.")
+            
+            # 2. Já tem acesso liberado? (Fase 3)
+            if user['ativo'] == True or user['ativo'] == 1:
+                raise HTTPException(status_code=400, detail="Esta conta já está ativa e aprovada. Tente fazer login.")
+
+            # 3. Já confirmou o e-mail, mas aguarda o Admin? (Fase 2)
+            if user['email_verificado'] == True or user['email_verificado'] == 1: 
+                raise HTTPException(status_code=400, detail="O seu e-mail já foi confirmado! Agora basta aguardar a aprovação de um Administrador no painel.")
+            
+            # 4. Se chegou aqui, está na Fase 1 (ativo=False e email_verificado=False). DISPARA O E-MAIL!
+            url_backend = f"{request.url.scheme}://{request.url.netloc}"
+            from services.email_svc import enviar_email_confirmacao
+            
+            background_tasks.add_task(enviar_email_confirmacao, user['email'], SECRET_KEY, ALGORITHM, url_backend)
+            
+            return {"mensagem": "E-mail de confirmação reenviado com sucesso!"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro ao reenviar e-mail: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao tentar reenviar o e-mail.")
+    
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
     # Ajuste esta URL para a porta do seu Vue.js em dev ou produção

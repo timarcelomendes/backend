@@ -702,44 +702,33 @@ from sqlalchemy import text
 from database import get_engine
 
 def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, backend_url: str):
-    """Gera o token e envia o e-mail de verificação via MS Graph"""
+    """Gera o token e envia o e-mail de verificação via MS Graph (Versão Corrigida)"""
     
     # 1. Gera o Token válido por 24 horas
     expire = datetime.now(timezone.utc) + timedelta(hours=24)
     to_encode = {"sub": email_destino, "exp": expire, "tipo_token": "confirmacao_email"}
     token = jwt.encode(to_encode, secret_key, algorithm=algorithm)
     
+    # Garante que a URL não tem barra dupla
+    backend_url = backend_url.rstrip('/')
     link_confirmacao = f"{backend_url}/api/auth/verificar-email?token={token}"
 
     try:
+        # 2. Usa a função MESTRE que já renova o token corretamente!
+        access_token = get_valid_access_token()
+        if not access_token:
+            print("❌ Falha crítica: Não foi possível obter Access Token para confirmação.")
+            return False
+
         engine = get_engine()
         with engine.connect() as conn:
-            # 2. Busca as chaves do banco de dados (as mesmas que testámos agora há pouco!)
-            config = conn.execute(text("""
-                SELECT tenant_id, client_id, client_secret, email_remetente 
-                FROM dbo.nps_configuracoes_email
-            """)).mappings().first()
+            config = conn.execute(text("SELECT email_remetente FROM dbo.nps_configuracoes_email")).mappings().first()
 
             if not config or not config["email_remetente"]:
-                print("❌ Erro: Configurações de e-mail ausentes no banco.")
-                return
+                print("❌ Erro: E-mail remetente ausente no banco de dados.")
+                return False
 
-            # 3. Pega o Token do Graph API
-            token_url = f"https://login.microsoftonline.com/{config['tenant_id']}/oauth2/v2.0/token"
-            token_data = {
-                'client_id': config['client_id'],
-                'client_secret': config['client_secret'],
-                'scope': 'https://graph.microsoft.com/.default',
-                'grant_type': 'client_credentials'
-            }
-            token_res = requests.post(token_url, data=token_data).json()
-            access_token = token_res.get('access_token')
-
-            if not access_token:
-                print("❌ Falha ao obter token do Graph para enviar e-mail de confirmação.")
-                return
-
-            # 4. Dispara o E-mail
+            # 3. Dispara o E-mail usando o token válido
             send_url = f"https://graph.microsoft.com/v1.0/users/{config['email_remetente']}/sendMail"
             
             html_content = f"""
@@ -747,7 +736,7 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
                 <h2 style="color: #1e293b;">Confirme o seu e-mail</h2>
                 <p>Olá! Recebemos um pedido de registo no NPS Intelligence com este e-mail.</p>
                 <p>Para comprovar a titularidade da conta, por favor clique no botão abaixo:</p>
-                <a href="{link_confirmacao}" style="display: inline-block; background-color: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 20px 0;">Verificar Meu E-mail</a>
+                <a href="{link_confirmacao}" style="display: inline-block; background-color: #f97316; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 20px 0;">Verificar Meu E-mail</a>
                 <p style="font-size: 12px; color: #64748b;"><i>Nota: A sua conta permanecerá inativa até aprovação final de um Administrador.</i></p>
             </div>
             """
@@ -766,8 +755,11 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
             
             if res_email.status_code == 202:
                 print(f"✅ E-mail de confirmação enviado para {email_destino}")
+                return True
             else:
                 print(f"❌ Erro ao enviar: {res_email.text}")
+                return False
 
     except Exception as e:
         print(f"❌ Falha no serviço de e-mail de confirmação: {e}")
+        return False
