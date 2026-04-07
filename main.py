@@ -381,7 +381,13 @@ class DominiosUpdate(BaseModel):
 
 class ReenviarEmailReq(BaseModel):
     email: str
-    
+
+class ReenviarEmailRequest(BaseModel):
+    email: str
+
+class SegurancaConfig(BaseModel):
+    tempo_minutos: int
+
 # ==========================================
 # 🔗 ROTAS DE INTEGRAÇÕES (TEAMS / FILLOUT)
 # ==========================================
@@ -571,8 +577,9 @@ async def login(requisicao: LoginRequest, request: Request):
         engine = get_engine()
         with engine.connect() as conn:
             validar_dominio_email(requisicao.email, conn)
+            
             query = text("""
-                SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo, avatar_url
+                SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo, avatar_url, email_verificado
                 FROM dbo.nps_usuarios 
                 WHERE email = :email
             """)
@@ -582,6 +589,12 @@ async def login(requisicao: LoginRequest, request: Request):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, 
                     detail="Este e-mail não está registado na plataforma."
+                )
+
+            if not resultado["email_verificado"]:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, 
+                    detail="O seu e-mail ainda não foi verificado. Por favor, confirme a sua conta através do link enviado para o seu e-mail."
                 )
 
             ativo_val = str(resultado["ativo"]).strip().lower()
@@ -597,7 +610,6 @@ async def login(requisicao: LoginRequest, request: Request):
                     resultado["senha_hash"].encode('utf-8')
                 )
             except Exception as e:
-                # 🚨 ALERTA TI: Falha no sistema de encriptação
                 enviar_alerta_tecnico_teams(f"Erro Crítico no Bcrypt durante o Login: {str(e)}")
                 print(f"Erro Bcrypt: {e}")
                 raise HTTPException(
@@ -652,7 +664,6 @@ async def login(requisicao: LoginRequest, request: Request):
                     "agora": agora_utc
                 })
             
-            # 6. Atualiza último acesso do utilizador
             conn.execute(text("""
                 UPDATE dbo.nps_usuarios 
                 SET ultimo_acesso = :agora
@@ -680,13 +691,11 @@ async def login(requisicao: LoginRequest, request: Request):
             }
             access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-            # 7. Buscar as permissões dinâmicas do banco de dados
             sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
             
             lista_permissoes = [row.chave for row in res_perm]
 
-            # 8. Devolver os dados + permissões para o Frontend
             return {
                 "access_token": access_token,
                 "token_type": "bearer",
@@ -699,10 +708,8 @@ async def login(requisicao: LoginRequest, request: Request):
             }
 
     except HTTPException:
-        # Repassa os erros de senha errada, conta inativa, etc, sem alertar o Teams (pois é culpa do utilizador)
         raise
     except Exception as e:
-        # 🚨 ALERTA TI: O banco de dados caiu, a rede falhou, etc.
         enviar_alerta_tecnico_teams(f"Falha Crítica no Login (Banco Offline?): {str(e)}")
         print(traceback.format_exc())
         raise HTTPException(
@@ -711,27 +718,27 @@ async def login(requisicao: LoginRequest, request: Request):
         )
     
 @app.post("/api/reenviar-confirmacao")
-def reenviar_email_confirmacao(dados: ReenviarEmailReq, background_tasks: BackgroundTasks, request: Request):
+async def reenviar_confirmacao(
+    req: ReenviarEmailRequest, 
+    request: Request, 
+    background_tasks: BackgroundTasks  # 🎯 Injeções necessárias adicionadas aqui!
+):
     try:
         engine = get_engine()
         with engine.connect() as conn:
 
-            # 1. Busca os dados com as colunas EXATAS da sua tabela
             query = text("SELECT usuario_id, nome, email, ativo, email_verificado FROM dbo.nps_usuarios WHERE email = :email")
-            user = conn.execute(query, {"email": dados.email.strip()}).mappings().first()
+            user = conn.execute(query, {"email": req.email.strip()}).mappings().first()
 
             if not user:
                 raise HTTPException(status_code=404, detail="E-mail não encontrado no sistema.")
             
-            # 2. Já tem acesso liberado? (Fase 3)
             if user['ativo'] == True or user['ativo'] == 1:
                 raise HTTPException(status_code=400, detail="Esta conta já está ativa e aprovada. Tente fazer login.")
 
-            # 3. Já confirmou o e-mail, mas aguarda o Admin? (Fase 2)
             if user['email_verificado'] == True or user['email_verificado'] == 1: 
                 raise HTTPException(status_code=400, detail="O seu e-mail já foi confirmado! Agora basta aguardar a aprovação de um Administrador no painel.")
             
-            # 4. Se chegou aqui, está na Fase 1 (ativo=False e email_verificado=False). DISPARA O E-MAIL!
             url_backend = f"{request.url.scheme}://{request.url.netloc}"
             from services.email_svc import enviar_email_confirmacao
             
@@ -1402,7 +1409,7 @@ async def listar_operadores():
         engine = get_engine()
         with engine.connect() as conn:
             query = text("""
-                SELECT usuario_id, nome, email, cargo, tipo, ativo, ultimo_acesso 
+                SELECT usuario_id, nome, email, cargo, tipo, ativo, ultimo_acesso, email_verificado
                 FROM dbo.nps_usuarios 
                 ORDER BY nome ASC
             """)
@@ -3553,9 +3560,6 @@ async def encerrar_sessao(sessao_id: int):
 # ==========================================
 # 🔒 ROTAS DE CONFIGURAÇÃO DE SEGURANÇA
 # ==========================================
-
-class SegurancaConfig(BaseModel):
-    tempo_minutos: int
 
 @app.get("/api/config/seguranca")
 def obter_configuracoes_seguranca(usuario_email: str = Depends(get_current_user)):
