@@ -2,9 +2,10 @@ import requests
 from sqlalchemy import text
 import urllib.parse
 from database import get_engine
-from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy import text
+from jose import jwt
+from datetime import datetime, timedelta, timezone
 
 def obter_regras_dinamicas():
     """Lê as parametrizações de negócio da base de dados"""
@@ -20,13 +21,26 @@ def obter_regras_dinamicas():
         "email_template_html": "",
         "email_agradecimento_promotor": "",
         "email_agradecimento_neutro": "",
-        "email_agradecimento_detrator": ""
+        "email_agradecimento_detrator": "",
+        "email_template_lembrete_1": "",
+        "email_template_lembrete_2": "",
+        "email_template_lembrete_3": ""
     }
     
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html', 'email_agradecimento_html')")
+            # 🎯 CORREÇÃO: Agora pede as chaves corretas do seu novo painel!
+            query = text("""
+                SELECT chave, valor 
+                FROM dbo.nps_configuracoes 
+                WHERE chave IN (
+                    'sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 
+                    'fillout_campos', 'email_template_html', 
+                    'email_agradecimento_promotor', 'email_agradecimento_neutro', 'email_agradecimento_detrator',
+                    'email_template_lembrete_1', 'email_template_lembrete_2', 'email_template_lembrete_3'
+                )
+            """)
             for linha in conn.execute(query).fetchall():
                 if linha.chave in ['sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
                     regras[linha.chave] = int(linha.valor) if linha.valor else regras[linha.chave]
@@ -321,19 +335,19 @@ def processar_disparos_nps():
     # 🛑 TRAVA DE SEGURANÇA: VERIFICA OS BOTÕES DO PAINEL
     # =================================================================
     try:
-        from sqlalchemy import text # Garantir que o text está importado
+        from sqlalchemy import text
         with engine.connect() as conn:
             # 1. Verifica o Motor Geral (Se desligar aqui, corta tudo)
             motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
             if str(motor).lower() not in ['true', '1']:
                 print("⏸️ Motor de Disparos está DESLIGADO. O robô não fará envios.")
-                return # Interrompe a função imediatamente
+                return 
             
             # 2. Verifica o Robô Automático (Background)
             robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
             if str(robo).lower() not in ['true', '1']:
                 print("⏸️ Robô Automático (Background) está DESLIGADO. Nenhuma pesquisa automática será enviada.")
-                return # Interrompe a função imediatamente
+                return 
                 
     except Exception as e:
         print(f"❌ Erro ao ler travas de segurança. Abortando envios por precaução: {e}")
@@ -361,7 +375,6 @@ def processar_disparos_nps():
             print("✅ Nenhum cliente elegível para disparo de NPS no momento.")
             return
 
-        # 2. Obter o Token do Microsoft Graph (USE A SUA FUNÇÃO EXISTENTE AQUI)
         access_token = get_valid_access_token() 
         
         if not access_token:
@@ -373,57 +386,65 @@ def processar_disparos_nps():
             "Content-Type": "application/json"
         }
 
+        # 🎯 NOVO: Carregar as regras e o Template do Banco antes do loop!
+        regras = obter_regras_dinamicas()
+        campos_permitidos = [c.strip().lower() for c in regras.get("fillout_campos", "").split(",")]
+        template_customizado = regras.get("email_template_html", "")
+
         enviados = 0
-        with engine.begin() as conn: # Usamos begin() para garantir os updates
+        with engine.begin() as conn: 
             for cliente in elegiveis:
                 try:
-                    # 3. Montar a URL do Fillout
-                    params = {
+                    # 3. Montar a URL do Fillout dinâmica
+                    params_completos = {
                         "clienteId": cliente["cliente_id"],
                         "email": cliente["email"],
                         "nome": cliente["nome"],
                         "empresa": cliente["empresa"] or "",
-                        "empresa_id": cliente["empresa_id"] or ""
+                        "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
                     }
+                    
                     import urllib.parse
-                    query_string = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+                    params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
+                    query_string = urllib.parse.urlencode(params_finais)
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
-                    # 4. Montar o HTML do E-mail
-                    nome_exibicao = cliente["nome"] or "Parceiro"
+                    # 4. Textos de exibição seguros
+                    nome_exibicao = cliente["nome"].split(" ")[0] if cliente["nome"] else "Parceiro"
                     empresa_exibicao = cliente["empresa"] or "sua empresa"
                     
-                    mail_html = f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-                        <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
-                            <tr>
-                                <td><img src="https://images.fillout.com/orgid-605566/flowpublicid-dPJSvuBRcDus/widgetid-undefined/4XSnUZoTXsHHQrgj2vxtL4/1763399620234.jpg?a=8rcQiWHivWYgnLfV5ojCyf" width="600" style="display:block;width:100%;max-width:600px;height:auto;"></td>
-                            </tr>
-                            <tr>
-                                <td style="padding:40px;color:#333333;line-height:1.6;">
-                                    <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
-                                    <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
-                                    <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
-                                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
-                                        <tr>
-                                            <td align="center">
-                                                <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
-                                            </td>
-                                        </tr>
-                                    </table>
-                                    <div style="border-top:1px solid #EAEAEA;padding-top:25px;">
-                                        <p style="margin:0;font-size:14px;color:#666666;">Um abraço,<br><strong style="color:#1A1A1A;">Equipe Gauge</strong> • Stefanini Group</p>
-                                    </div>
-                                </td>
-                            </tr>
-                        </table>
-                    </body>
-                    </html>
-                    """
+                    # 5. Montar o HTML do E-mail (Agora respeita o banco de dados!)
+                    if template_customizado and "{survey_url}" in template_customizado:
+                        mail_html = template_customizado.replace("{nome}", nome_exibicao) \
+                                                        .replace("{empresa}", empresa_exibicao) \
+                                                        .replace("{survey_url}", survey_url)
+                    else:
+                        # Fallback se o banco estiver vazio
+                        mail_html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+                            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
+                                <tr>
+                                    <td style="padding:40px;color:#333333;line-height:1.6;">
+                                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
+                                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
+                                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
+                                        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
+                                            <tr>
+                                                <td align="center">
+                                                    <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </body>
+                        </html>
+                        """
 
-                    # 5. Disparar via Microsoft Graph API
+                    # 6. Disparar via Microsoft Graph API
                     payload = {
                         "message": {
                             "subject": f"[Pesquisa NPS] Sua opinião importa {'— ' + cliente['empresa'] if cliente['empresa'] else ''}",
@@ -441,7 +462,7 @@ def processar_disparos_nps():
                     )
                     
                     if resposta_ms.status_code in (200, 202):
-                        # 6. Sucesso! Atualiza o banco (Soma 90 dias para o próximo envio)
+                        # 7. Sucesso! Atualiza o banco 
                         sql_update = text("""
                             UPDATE dbo.nps_clientes
                             SET status_envio = 'Enviado',
@@ -454,11 +475,9 @@ def processar_disparos_nps():
                         conn.execute(sql_update, {"id": cliente["cliente_id"]})
                         enviados += 1
                     else:
-                        # Falha ao enviar pela MS
                         raise Exception(f"Erro MS Graph: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
-                    # 7. Regista o erro neste cliente específico, mas não para o loop!
                     sql_erro = text("""
                         UPDATE dbo.nps_clientes
                         SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME()
@@ -470,7 +489,7 @@ def processar_disparos_nps():
         print(f"🏁 Rotina finalizada! {enviados} convites de NPS enviados com sucesso.")
         
         # =================================================================
-        # 8. AUDITORIA: REGISTRO DA AÇÃO AUTOMÁTICA
+        # 8. AUDITORIA
         # =================================================================
         if enviados > 0:
             try:
@@ -482,7 +501,6 @@ def processar_disparos_nps():
                 )
             except Exception as log_err:
                 print(f"Erro ao gravar log de auditoria do robô: {log_err}")
-        # =================================================================
         
     except Exception as e:
         print(f"❌ Erro Fatal na rotina de NPS: {e}")
@@ -496,7 +514,6 @@ def disparar_convite_nps_especifico(cliente_ids: list):
     from database import get_engine
     engine = get_engine()
     
-    # Prepara a query de forma segura
     ids_formatados = ",".join([f"'{cid}'" for cid in cliente_ids])
     
     sql_busca = text(f"""
@@ -525,44 +542,42 @@ def disparar_convite_nps_especifico(cliente_ids: list):
             "Content-Type": "application/json"
         }
 
+        # 🎯 CORREÇÃO 1: Carrega as regras FORA do loop para não causar Deadlock!
+        regras = obter_regras_dinamicas()
+        
+        # 🎯 CORREÇÃO 2: Garante que não dá erro se o fillout_campos vier vazio (None)
+        campos_raw = regras.get("fillout_campos") or "clienteId,email,nome"
+        campos_permitidos = [c.strip().lower() for c in campos_raw.split(",")]
+        
+        template_customizado = regras.get("email_template_html") or ""
+
+        # Abre a transação UMA única vez
         with engine.begin() as conn:
             for cliente in clientes:
                 try:
-                    # 1. Carregar regras
-                    regras = obter_regras_dinamicas()
-                    
-                    # 2. Construir URL do Fillout apenas com os campos permitidos
-                    campos_permitidos = [c.strip().lower() for c in regras["fillout_campos"].split(",")]
-                    
                     params_completos = {
                         "clienteId": cliente["cliente_id"],
                         "email": cliente["email"],
                         "nome": cliente["nome"],
                         "empresa": cliente["empresa"] or "",
                         "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
-                        # Se adicionar gestor/segmento na query da tabela nps_clientes, pode mapear aqui também
                     }
                     
-                    # Filtra o dicionário para conter apenas as chaves que o admin selecionou no frontend
                     params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
                     
+                    import urllib.parse
                     query_string = urllib.parse.urlencode(params_finais)
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
-                    # 3. Textos de exibição seguros
                     nome_exibicao = cliente["nome"].split(" ")[0] if cliente["nome"] else "Parceiro"
                     empresa_exibicao = cliente["empresa"] or "sua empresa"
                     
-                    # 4. Template HTML Dinâmico (Se o admin tiver criado um, usa-o. Senão, usa o código padrão Gauge)
-                    template_customizado = regras["email_template_html"]
-                    
                     if template_customizado and "{survey_url}" in template_customizado:
-                        # Substitui as variáveis dinâmicas no HTML do administrador
                         mail_html = template_customizado.replace("{nome}", nome_exibicao) \
                                                         .replace("{empresa}", empresa_exibicao) \
                                                         .replace("{survey_url}", survey_url)
                     else:
-                        # O template fixo da Gauge que você já tinha caso o admin não insira nada
+                        # Fallback
                         mail_html = f"""
                         <!DOCTYPE html>
                         <html>
@@ -587,7 +602,6 @@ def disparar_convite_nps_especifico(cliente_ids: list):
                         </html>
                         """
 
-                    # 3. Disparar via MS Graph API
                     payload = {
                         "message": {
                             "subject": f"[Pesquisa NPS] Sua opinião importa {'— ' + cliente['empresa'] if cliente['empresa'] else ''}",
@@ -597,6 +611,7 @@ def disparar_convite_nps_especifico(cliente_ids: list):
                         "saveToSentItems": True
                     }
 
+                    import requests
                     resposta_ms = requests.post(
                         "https://graph.microsoft.com/v1.0/me/sendMail",
                         headers=headers,
@@ -604,7 +619,6 @@ def disparar_convite_nps_especifico(cliente_ids: list):
                     )
                     
                     if resposta_ms.status_code in (200, 202):
-                        # 4. Atualizar o banco de dados
                         sql_update = text("""
                             UPDATE dbo.nps_clientes
                             SET status_envio = 'Enviado',
@@ -620,7 +634,6 @@ def disparar_convite_nps_especifico(cliente_ids: list):
                         raise Exception(f"Erro na API da Microsoft: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
-                    # Se falhar um cliente, guarda o erro no banco mas continua para o próximo
                     sql_erro = text("UPDATE dbo.nps_clientes SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id")
                     conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
                     print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
@@ -635,23 +648,19 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
 
     print(f"📧 Preparando e-mail de agradecimento para {nome} ({categoria})...")
     
-    # 1. Obter token de autorização da Microsoft
     access_token = get_valid_access_token()
     if not access_token:
         print("❌ Não foi possível obter o token para enviar o agradecimento.")
         return
 
-    # Textos de exibição seguros
     primeiro_nome = nome.split(" ")[0] if nome else "Parceiro"
     empresa_exibicao = empresa if empresa else "sua empresa" 
     motivo_exibicao = motivo if motivo else "Nenhum comentário adicional deixado no formulário."
     expectativas_exibicao = expectativas if expectativas else "Não respondido."
     falta_exibicao = o_que_faltava if o_que_faltava else "Não respondido."
 
-    # 1. Carregar os Templates do Banco
     regras = obter_regras_dinamicas()
     
-    # 2. Escolher o template e assunto com base na Categoria
     if categoria == 'Promotor':
         assunto = f"Obrigado pela sua nota {nota}! 🌟"
         template_customizado = regras.get("email_agradecimento_promotor", "")
@@ -662,19 +671,17 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
         assunto = "O seu feedback é muito importante para nós 💡"
         template_customizado = regras.get("email_agradecimento_detrator", "")
 
-    # 3. Injetar Variáveis no Template
+    # 🎯 CORREÇÃO: Os parênteses dos .replace() agora estão perfeitos
     if template_customizado:
         mail_html = template_customizado.replace("{nome}", primeiro_nome) \
                                         .replace("{empresa}", empresa_exibicao) \
-                                        .replace("{nota}", str(nota)
-                                        .replace("{motivo}", motivo_exibicao)
-                                        .replace("{expectativas}", expectativas_exibicao)
-                                        .replace("{o_que_faltava}", falta_exibicao))
+                                        .replace("{nota}", str(nota)) \
+                                        .replace("{motivo}", motivo_exibicao) \
+                                        .replace("{expectativas}", expectativas_exibicao) \
+                                        .replace("{o_que_faltava}", falta_exibicao)
     else:
-        # Fallback de emergência caso o Admin deixe as caixas em branco
         mail_html = f"<h2>Obrigado, {primeiro_nome}!</h2><p>A sua nota {nota} foi registada para a empresa {empresa_exibicao}.</p>"
 
-    # 4. Disparo via MS Graph API
     payload = {
         "message": {
             "subject": assunto,
@@ -734,12 +741,6 @@ def validar_dominio_email(email: str, conn):
             
     except IndexError:
         raise HTTPException(status_code=400, detail="O formato do e-mail é inválido.")
-    
-from jose import jwt
-from datetime import datetime, timedelta, timezone
-import requests
-from sqlalchemy import text
-from database import get_engine
 
 def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, backend_url: str):
     """Gera o token e envia o e-mail de verificação via MS Graph (Versão Corrigida)"""
