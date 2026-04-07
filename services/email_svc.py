@@ -51,30 +51,36 @@ def obter_regras_dinamicas():
         
     return regras
 
+import os
+import re
+
 def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> str:
     if not html_content:
         return ""
 
-    dominio = dominio_contexto
-    if not dominio:
+    dominio_front = dominio_contexto
+    if not dominio_front:
         try:
             from database import get_engine
             from sqlalchemy import text
             with get_engine().connect() as conn:
                 res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'url_sistema'")).scalar()
-                dominio = res
-        except Exception as e:
+                dominio_front = res
+        except Exception:
             pass
 
-    if not dominio:
-        dominio = "https://nps-intelligence.gauge.com.br"
+    dominio_front = (dominio_front or "https://nps-intelligence.gauge.com.br").rstrip("/")
 
-    dominio = dominio.rstrip("/")
+    azure_host = os.getenv("WEBSITE_HOSTNAME")
+    if azure_host:
+        url_real_backend = f"https://{azure_host}"
+    else:
+        url_real_backend = "http://localhost:8000"
+
+    html_corrigido = html_content.replace("{backend_url}", url_real_backend)
     
-    html_corrigido = html_content.replace("{backend_url}", dominio)
-    
-    html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{dominio}/', html_corrigido)
-    
+    html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{url_real_backend}/', html_corrigido)
+
     return html_corrigido
 
 def obter_configuracoes_email():
