@@ -188,8 +188,8 @@ def exigir_manager(token_data: dict = Depends(get_current_user_token_data)):
 # ==========================================
 
 class AcaoCriar(BaseModel):
-    resposta_id: str
-    empresa_id: Optional[int] = 0
+    resposta_id: Optional[str] = None 
+    empresa_id: Optional[int] = None  
     gestor_id: Optional[int] = None
     titulo: str
     descricao: Optional[str] = ""
@@ -2571,9 +2571,13 @@ async def restore_resposta_route(resposta_id: str):
 def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
+        import uuid # 🎯 Necessário para gerar o ID que a base de dados exige
+        
+        # 1. Gerar um ID único para identificar esta resposta manual
+        novo_id_resposta = f"manual_{uuid.uuid4().hex[:16]}"
+
         with engine.begin() as conn:
-            
-            # 1. Obter o nome da empresa associada a este cliente
+            # 2. Obter o nome da empresa associada a este cliente
             sql_cliente = text("SELECT empresa FROM dbo.nps_clientes WHERE cliente_id = :cliente_id")
             resultado_cliente = conn.execute(sql_cliente, {"cliente_id": resp.cliente_id}).fetchone()
             
@@ -2582,13 +2586,14 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
             
             empresa_nome = resultado_cliente.empresa
 
-            # 2. Inserir a resposta na tabela principal
+            # 3. Inserir a resposta (Agora com o resposta_id obrigatório e fuso horário corrigido)
             sql_insert = text("""
                 INSERT INTO dbo.nps_respostas 
-                (cliente_id, empresa, nota, motivo, canal, data_resposta) 
-                VALUES (:cliente_id, :empresa, :nota, :motivo, :canal, GETDATE())
+                (resposta_id, cliente_id, empresa, nota, motivo, canal, data_resposta, created_at, excluido) 
+                VALUES (:res_id, :cliente_id, :empresa, :nota, :motivo, :canal, SYSUTCDATETIME(), SYSUTCDATETIME(), 0)
             """)
             conn.execute(sql_insert, {
+                "res_id": novo_id_resposta,
                 "cliente_id": resp.cliente_id,
                 "empresa": empresa_nome,
                 "nota": resp.nota,
@@ -2596,40 +2601,44 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
                 "canal": resp.canal
             })
 
-            # 3. INTERROMPER A RÉGUA DE LEMBRETES (Mudar status para Respondido)
+            # 4. INTERROMPER A RÉGUA DE LEMBRETES (Status 'Respondido' para o robô não enviar mais)
             sql_update_disparo = text("""
                 UPDATE dbo.nps_disparos 
-                SET status = 'Respondido', data_resposta = GETDATE() 
-                WHERE cliente_id = :cliente_id
+                SET status = 'Respondido', updated_at = SYSUTCDATETIME()
+                WHERE cliente_id = :cliente_id AND status <> 'Respondido'
             """)
             conn.execute(sql_update_disparo, {"cliente_id": resp.cliente_id})
             
-            # Atualizar também na tabela de clientes por segurança
+            # Atualizar status no cadastro do cliente
             sql_update_cliente = text("""
                 UPDATE dbo.nps_clientes 
-                SET status_envio = 'Respondido' 
+                SET status_envio = 'Respondido', updated_at = SYSUTCDATETIME()
                 WHERE cliente_id = :cliente_id
             """)
             conn.execute(sql_update_cliente, {"cliente_id": resp.cliente_id})
 
-            # 4. CRIAR AÇÃO AUTOMÁTICA SE FOR DETRATOR (Notas 0 a 6)
+            # 5. CRIAR AÇÃO AUTOMÁTICA PARA DETRATORES
             if resp.nota <= 6:
-                # Obter o ID da empresa para associar a ação
                 sql_empresa_id = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
                 res_emp = conn.execute(sql_empresa_id, {"nome": empresa_nome}).fetchone()
                 
                 if res_emp:
                     sql_acao = text("""
-                        INSERT INTO dbo.nps_acoes (empresa_id, descricao, prioridade, status, data_criacao)
-                        VALUES (:empresa_id, :descricao, 'Alta', 'Pendente', GETDATE())
+                        INSERT INTO dbo.nps_acoes (empresa_id, resposta_id, descricao, prioridade, status, data_criacao)
+                        VALUES (:emp_id, :res_id, :desc, 'Alta', 'Pendente', SYSUTCDATETIME())
                     """)
                     desc = f"Tratar Detrator (Nota {resp.nota}). Feedback inserido manualmente via {resp.canal}."
-                    conn.execute(sql_acao, {"empresa_id": res_emp.id, "descricao": desc})
+                    conn.execute(sql_acao, {
+                        "emp_id": res_emp.id, 
+                        "res_id": novo_id_resposta, # 🎯 Vincula a ação à resposta que acabámos de criar
+                        "desc": desc
+                    })
 
-        return {"status": "success", "message": "Resposta inserida com sucesso!"}
+        return {"status": "success", "message": "Resposta inserida com sucesso!", "id": novo_id_resposta}
     
     except Exception as e:
         print(f"Erro ao inserir resposta manual: {e}")
+        # Retorna o detalhe do erro para ajudar no debug do frontend
         raise HTTPException(status_code=500, detail=str(e))
     
 # ==========================================
