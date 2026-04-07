@@ -209,7 +209,7 @@ class BasicoSchema(BaseModel):
 
 class RespostaUpdate(BaseModel):
     nota: int
-    categoria: str
+    categoria: Optional[str] = ""
     motivo: Optional[str] = ""
     canal: Optional[str] = ""
     expectativas: Optional[str] = ""
@@ -2535,14 +2535,59 @@ async def listar_respostas(
 @app.put("/api/respostas/{resposta_id}")
 def update_resposta_route(resposta_id: str, payload: RespostaUpdate):
     try:
-        from services import respostas_svc
-        respostas_svc.update_resposta(
-            resposta_id, payload.nota, payload.categoria, payload.motivo, 
-            payload.canal, payload.expectativas, payload.o_que_faltava
-        )
-        return {"status": "success"}
+        engine = get_engine()
+        
+        # 1. TRATAMENTO INTELIGENTE DA CATEGORIA
+        # (Para evitar conflitos com a CHECK constraint do SQL Server)
+        cat_segura = None
+        if payload.categoria:
+            # Põe tudo em maiúsculas (geralmente as constraints exigem isso)
+            cat_upper = payload.categoria.upper().strip()
+            
+            # Mapeamento para as categorias padrão mais prováveis do seu sistema
+            if "UX" in cat_upper or "UI" in cat_upper:
+                cat_segura = "UX/UI"
+            elif "PERFORMANCE" in cat_upper or "LENTO" in cat_upper:
+                cat_segura = "Performance"
+            elif "ATENDIMENTO" in cat_upper or "SUPORTE" in cat_upper:
+                cat_segura = "Atendimento"
+            elif "BUG" in cat_upper or "ERRO" in cat_upper:
+                cat_segura = "Bugs"
+            elif "INTEGRA" in cat_upper:
+                cat_segura = "Integração"
+            else:
+                # Se não for nada conhecido, usamos o valor com Primeira Letra Maiúscula
+                cat_segura = payload.categoria.title()
+
+        with engine.begin() as conn:
+            # 2. ATUALIZAÇÃO NO BANCO DE DADOS
+            sql = text("""
+                UPDATE dbo.nps_respostas 
+                SET nota = :nota, 
+                    categoria = :categoria, 
+                    motivo = :motivo, 
+                    canal = :canal, 
+                    expectativas = :expectativas, 
+                    o_que_faltava = :o_que_faltava
+                WHERE resposta_id = :id
+            """)
+            
+            conn.execute(sql, {
+                "nota": payload.nota,
+                "categoria": cat_segura, # Usamos a categoria tratada
+                "motivo": payload.motivo or "",
+                "canal": payload.canal or "Manual",
+                "expectativas": payload.expectativas or "",
+                "o_que_faltava": payload.o_que_faltava or "",
+                "id": resposta_id
+            })
+            
+        return {"status": "success", "message": "Feedback enriquecido com sucesso!"}
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Erro ao enriquecer resposta: {str(e)}")
+        # Retorna o detalhe exato para você saber que constraint falhou
+        raise HTTPException(status_code=500, detail=f"Erro de Banco de Dados: {str(e)}")
 
 # ==========================================
 # 🗂️ ARQUIVAR / DESARQUIVAR FEEDBACKS
