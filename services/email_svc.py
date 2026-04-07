@@ -585,7 +585,7 @@ def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = Non
         
         template_customizado = regras.get("email_template_html") or ""
 
-        template_customizado = tornar_links_absolutos(template_customizado)
+        template_customizado = tornar_links_absolutos(template_customizado, dominio_origem)
 
         # Abre a transação UMA única vez
         with engine.begin() as conn:
@@ -709,6 +709,7 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
 
     # 🎯 CORREÇÃO: Os parênteses dos .replace() agora estão perfeitos
     if template_customizado:
+        template_customizado = tornar_links_absolutos(template_customizado)
         mail_html = template_customizado.replace("{nome}", primeiro_nome) \
                                         .replace("{empresa}", empresa_exibicao) \
                                         .replace("{nota}", str(nota)) \
