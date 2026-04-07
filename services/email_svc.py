@@ -14,7 +14,6 @@ def obter_regras_dinamicas():
     from database import get_engine
     from sqlalchemy import text
     
-    # Valores de segurança (Fallback)
     regras = {
         "sla_detrator_dias": 2,
         "sla_neutro_dias": 5,
@@ -32,7 +31,6 @@ def obter_regras_dinamicas():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            # 🎯 CORREÇÃO: Agora pede as chaves corretas do seu novo painel!
             query = text("""
                 SELECT chave, valor 
                 FROM dbo.nps_configuracoes 
@@ -57,10 +55,6 @@ def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> s
     if not html_content:
         return ""
 
-    # Adicionamos flush=True em todos os prints
-    print("\n--- 🔍 DEBUG DE IMAGENS ---", flush=True)
-    print(f"Domínio contexto: {dominio_contexto}", flush=True)
-
     dominio = dominio_contexto
     if not dominio:
         try:
@@ -69,28 +63,17 @@ def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> s
             with get_engine().connect() as conn:
                 res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'url_sistema'")).scalar()
                 dominio = res
-                print(f"Domínio no Banco: {dominio}", flush=True)
         except Exception as e:
-            print(f"Erro banco: {e}", flush=True)
+            pass
 
     if not dominio:
         dominio = "https://nps-intelligence.gauge.com.br"
-        print(f"Usando Fallback: {dominio}", flush=True)
 
     dominio = dominio.rstrip("/")
     
-    # Verifica se há algo para converter
-    relativos = re.findall(r'src=["\'](/[a-zA-Z0-9].*?)["\']', html_content)
-    print(f"Links detectados para conversão: {relativos}", flush=True)
-
-    html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{dominio}/', html_content)
+    html_corrigido = html_content.replace("{backend_url}", dominio)
     
-    # Pega apenas o src da primeira imagem para conferir
-    primeira_img = re.search(r'src=\"(.*?)\"', html_corrigido)
-    if primeira_img:
-        print(f"Resultado final da URL: {primeira_img.group(1)}", flush=True)
-    
-    print("--- 🏁 FIM DEBUG ---\n", flush=True)
+    html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{dominio}/', html_corrigido)
     
     return html_corrigido
 
