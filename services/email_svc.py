@@ -54,32 +54,44 @@ def obter_regras_dinamicas():
     return regras
 
 def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> str:
-    """
-    Detecta links de imagens relativos e injeta o domínio correto.
-    """
     if not html_content:
         return ""
 
-    # 1. Definição do domínio: Prioridade para o contexto da requisição, 
-    # fallback para uma variável de ambiente ou config do banco.
+    # --- DEBUG INÍCIO ---
+    print("\n--- 🔍 DEBUG DE IMAGENS ---")
+    print(f"Domínio recebido via contexto: {dominio_contexto}")
+    # --- DEBUG FIM ---
+
     dominio = dominio_contexto
-    
     if not dominio:
-        # Se não houver contexto (ex: Cron Job), tenta ler da configuração do sistema
-        from database import get_engine
-        from sqlalchemy import text
         try:
+            from database import get_engine
+            from sqlalchemy import text
             with get_engine().connect() as conn:
                 res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'url_sistema'")).scalar()
-                dominio = res if res else "https://seu-dominio-padrao.com"
-        except:
-            dominio = "https://seu-dominio-padrao.com"
+                dominio = res
+                print(f"Domínio buscado no Banco (url_sistema): {dominio}")
+        except Exception as e:
+            print(f"Erro ao buscar no banco: {e}")
+
+    if not dominio:
+        dominio = "https://nps-intelligence.gauge.com.br" # Seu fallback
+        print(f"Usando Fallback: {dominio}")
 
     dominio = dominio.rstrip("/")
+    
+    # Verificando se existem caminhos relativos antes da troca
+    links_relativos = re.findall(r'src=["\'](/[a-zA-Z0-9].*?)["\']', html_content)
+    if links_relativos:
+        print(f"Links relativos encontrados para converter: {links_relativos}")
+    else:
+        print("⚠️ Nenhuma imagem com caminho relativo (ex: /uploads/...) foi encontrada no HTML.")
 
-    # 2. Regex para encontrar src="/..." ou src='/...' e substituir
-    # Esta regex evita duplicar o domínio se ele já for absoluto
     html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{dominio}/', html_content)
+    
+    # --- DEBUG FINAL ---
+    print(f"URL Final da primeira imagem: {re.search(r'src=\"(.*?)\"', html_corrigido).group(1) if 'src=' in html_corrigido else 'Nenhuma'}")
+    print("--- 🏁 FIM DEBUG ---\n")
     
     return html_corrigido
 
