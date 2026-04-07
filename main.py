@@ -1436,15 +1436,6 @@ async def listar_operadores():
 # ==========================================
 # 🏠 ROTAS: DASHBOARD (Home)
 # ==========================================
-import re
-import io
-from collections import Counter
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-from fastapi import Query, HTTPException
-from fastapi.responses import StreamingResponse
-from sqlalchemy import text
-import pandas as pd
 
 @app.get("/api/dashboard/kpis")
 def get_dashboard_kpis(
@@ -1457,20 +1448,22 @@ def get_dashboard_kpis(
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
-            config_valor = conn.execute(sql_set).scalar()
             tipo_join = "LEFT JOIN"
             
             filtros_sql = []
             parametros = {}
             
+            # Filtro Ativos
             parametros["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
+            # 🎯 CORREÇÃO DEFINITIVA DO FILTRO DE COMPANHIA
+            # O WHERE entra explicitamente DENTRO do IN() 
             if companhia and companhia != "Todas as Companhias":
                 filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
             
+            # Filtro de Empresa
             if empresa:
                 if empresa == "Não Identificado":
                     filtros_sql.append("COALESCE(r.empresa_id, c.empresa_id) IS NULL")
@@ -1478,15 +1471,19 @@ def get_dashboard_kpis(
                     filtros_sql.append("e.nome = :empresa")
                     parametros["empresa"] = empresa
                     
+            # Filtro de Datas
             if data_inicio and data_fim:
                 filtros_sql.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
                 filtros_sql.append("COALESCE(r.data_resposta, r.created_at) <= :data_fim")
                 parametros["data_inicio"] = f"{data_inicio} 00:00:00"
                 parametros["data_fim"] = f"{data_fim} 23:59:59"
 
+            # CONSTRUÇÃO SEGURA DOS CONECTORES LOGICOS
             condicao_filtro = ""
+            condicao_filtro_and = ""
             if len(filtros_sql) > 0:
                 condicao_filtro = " WHERE " + " AND ".join(filtros_sql)
+                condicao_filtro_and = " AND " + " AND ".join(filtros_sql)
 
             # --- 3. PROCESSAMENTO DE PALAVRAS MAIS USADAS ---
             sql_termos = text(f"""
@@ -1500,6 +1497,8 @@ def get_dashboard_kpis(
             
             comentarios_raw = conn.execute(sql_termos, parametros).scalars().all()
             
+            import re
+            from collections import Counter
             stop_words = {
                 'para', 'com', 'mais', 'esta', 'está', 'pela', 'pelo', 'como', 'muito', 'tudo', 
                 'fazer', 'quando', 'você', 'pode', 'seria', 'estão', 'neste', 'esse', 'isso',
@@ -1546,7 +1545,6 @@ def get_dashboard_kpis(
                 nps_decisor = round(((resumo['decisor_promotores'] - resumo['decisor_detratores']) / dec_total) * 100)
 
             # --- 5. CÁLCULO REVENUE AT RISK ---
-            filtro_sub = condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""
             sql_rev = text(f"""
                 SELECT SUM(emp_out.valor_contrato) as risco
                 FROM dbo.nps_empresas emp_out
@@ -1555,7 +1553,8 @@ def get_dashboard_kpis(
                     FROM dbo.nps_respostas r
                     INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
                     LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
-                    WHERE r.nota <= 6 {filtro_sub}
+                    WHERE r.nota <= 6  
+                    {condicao_filtro_and}
                 )
             """)
             risco_real = conn.execute(sql_rev, parametros).scalar() or 0
@@ -1571,7 +1570,7 @@ def get_dashboard_kpis(
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
                 WHERE r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
-                {condicao_filtro.replace("WHERE", "AND") if condicao_filtro else ""} 
+                {condicao_filtro_and} 
                 ORDER BY r.created_at DESC;
             """)
             
@@ -1592,9 +1591,10 @@ def get_dashboard_kpis(
                 f["tags"] = [tag for tag, keys in regras_tags.items() if any(k in texto for k in keys)]
                 feedbacks_processados.append(f)
 
-            condicao_resgate = condicao_filtro.replace("r.", "atual.")
-            if condicao_resgate:
-                condicao_resgate = condicao_resgate.replace("WHERE", "AND") 
+            # --- 7. CÁLCULOS RESGATES ---
+            # 🎯 CORREÇÃO: Aplica a conversão de "r." para "atual." ANTES de fazer o join
+            filtros_resgate = [f.replace("r.", "atual.") for f in filtros_sql]
+            condicao_resgate_and = " AND " + " AND ".join(filtros_resgate) if filtros_resgate else ""
                 
             query_resgates = text(f"""
                 WITH Historico AS (
@@ -1611,12 +1611,14 @@ def get_dashboard_kpis(
                 WHERE atual.rn = 1 
                   AND anterior.nota <= 8  
                   AND atual.nota >= 9     
-                  {condicao_resgate}      
+                  {condicao_resgate_and}      
             """)
             
             total_resgatados = conn.execute(query_resgates, parametros).scalar() or 0
 
             # --- VARIÁVEIS ANTIGAS ---
+            from datetime import datetime, timedelta, timezone
+            
             filtros_sql_ant = []
             params_ant = {}
             
@@ -1670,7 +1672,7 @@ def get_dashboard_kpis(
                 
             variacao_nps = nps_score - nps_anterior
 
-            # 7. TÓPICOS CRÍTICOS ---
+            # 8. TÓPICOS CRÍTICOS ---
             sql_todos_comentarios = text(f"""
                 SELECT r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario
                 FROM dbo.nps_respostas r
@@ -1722,7 +1724,7 @@ def get_dashboard_kpis(
                 {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1      
-                  {condicao_resgate}      
+                  {condicao_resgate_and}      
             """)
             
             res_perdidos = conn.execute(query_perdidos, parametros).mappings().first()
