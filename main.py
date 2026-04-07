@@ -747,29 +747,20 @@ def reenviar_email_confirmacao(dados: ReenviarEmailReq, background_tasks: Backgr
     
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
-    # Ajuste esta URL para a porta do seu Vue.js em dev ou produção
     url_frontend = "http://localhost:5173/login" 
-    
     try:
-        # Decodifica e verifica se não expirou (24h)
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("tipo_token") != "confirmacao_email":
-            return RedirectResponse(url=f"{url_frontend}?erro=token_invalido")
-            
         email_usuario = payload.get("sub")
         
-        # Atualiza APENAS a validação do e-mail. Ativo continua 0!
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(
-                text("UPDATE dbo.nps_usuarios SET email_verificado = 1 WHERE email = :email"),
+                text("UPDATE dbo.nps_usuarios SET email_verificado = 1, ativo = 1 WHERE email = :email"),
                 {"email": email_usuario}
             )
             
         return RedirectResponse(url=f"{url_frontend}?verificado=true")
-        
     except Exception as e:
-        print(f"Erro validação de e-mail: {e}")
         return RedirectResponse(url=f"{url_frontend}?erro=token_invalido")
 
 @app.get("/api/auth/sso-config")
