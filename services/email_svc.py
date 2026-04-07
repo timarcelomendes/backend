@@ -1,3 +1,5 @@
+import os
+import re
 import requests
 from sqlalchemy import text
 import urllib.parse
@@ -50,6 +52,36 @@ def obter_regras_dinamicas():
         print(f"⚠️ Usando regras padrão. Erro ao ler banco: {e}")
         
     return regras
+
+def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> str:
+    """
+    Detecta links de imagens relativos e injeta o domínio correto.
+    """
+    if not html_content:
+        return ""
+
+    # 1. Definição do domínio: Prioridade para o contexto da requisição, 
+    # fallback para uma variável de ambiente ou config do banco.
+    dominio = dominio_contexto
+    
+    if not dominio:
+        # Se não houver contexto (ex: Cron Job), tenta ler da configuração do sistema
+        from database import get_engine
+        from sqlalchemy import text
+        try:
+            with get_engine().connect() as conn:
+                res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'url_sistema'")).scalar()
+                dominio = res if res else "https://seu-dominio-padrao.com"
+        except:
+            dominio = "https://seu-dominio-padrao.com"
+
+    dominio = dominio.rstrip("/")
+
+    # 2. Regex para encontrar src="/..." ou src='/...' e substituir
+    # Esta regex evita duplicar o domínio se ele já for absoluto
+    html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{dominio}/', html_content)
+    
+    return html_corrigido
 
 def obter_configuracoes_email():
     """Procura as credenciais ativas na base de dados."""
@@ -391,6 +423,8 @@ def processar_disparos_nps():
         campos_permitidos = [c.strip().lower() for c in regras.get("fillout_campos", "").split(",")]
         template_customizado = regras.get("email_template_html", "")
 
+        template_customizado = tornar_links_absolutos(template_customizado)
+
         enviados = 0
         with engine.begin() as conn: 
             for cliente in elegiveis:
@@ -505,7 +539,7 @@ def processar_disparos_nps():
     except Exception as e:
         print(f"❌ Erro Fatal na rotina de NPS: {e}")
         
-def disparar_convite_nps_especifico(cliente_ids: list):
+def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = None):
     """Busca clientes específicos e força o envio nativo do NPS pelo MS Graph"""
     if not cliente_ids:
         return
@@ -542,14 +576,16 @@ def disparar_convite_nps_especifico(cliente_ids: list):
             "Content-Type": "application/json"
         }
 
-        # 🎯 CORREÇÃO 1: Carrega as regras FORA do loop para não causar Deadlock!
+        # 1: Carrega as regras FORA do loop para não causar Deadlock!
         regras = obter_regras_dinamicas()
         
-        # 🎯 CORREÇÃO 2: Garante que não dá erro se o fillout_campos vier vazio (None)
+        # 2: Garante que não dá erro se o fillout_campos vier vazio (None)
         campos_raw = regras.get("fillout_campos") or "clienteId,email,nome"
         campos_permitidos = [c.strip().lower() for c in campos_raw.split(",")]
         
         template_customizado = regras.get("email_template_html") or ""
+
+        template_customizado = tornar_links_absolutos(template_customizado)
 
         # Abre a transação UMA única vez
         with engine.begin() as conn:

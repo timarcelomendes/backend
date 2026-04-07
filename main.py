@@ -2373,29 +2373,36 @@ def change_cliente_status(cliente_id: str, payload: StatusUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/clientes/{cliente_id}/forcar-envio")
-def forcar_envio_nps(cliente_id: str, background_tasks: BackgroundTasks, usuario: str = Depends(get_current_user)):
+def forcar_envio_nps(cliente_id: str, request: Request, background_tasks: BackgroundTasks, usuario: str = Depends(get_current_user)):
     try:
+        # 🎯 CAPTURA O DOMÍNIO AUTOMATICAMENTE DA REQUISIÇÃO
+        dominio_atual = request.headers.get("origin") or str(request.base_url)
+        
         from services.email_svc import disparar_convite_nps_especifico
-        background_tasks.add_task(disparar_convite_nps_especifico, [cliente_id])
+        # Passamos o domínio como segundo argumento
+        background_tasks.add_task(disparar_convite_nps_especifico, [cliente_id], dominio_atual)
         
         return {
             "status": "success", 
             "message": "Solicitação recebida! O e-mail está a ser despachado agora mesmo."
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Não conseguimos processar o envio manual. Tente novamente em instantes.")
+        raise HTTPException(status_code=500, detail="Não conseguimos processar o envio manual.")
 
 @app.post("/api/clientes/forcar-envio-lote")
-def forcar_envio_lote(payload: LoteEnvio, background_tasks: BackgroundTasks, usuario_email: str = Depends(get_current_user)):
+def forcar_envio_lote(payload: LoteEnvio, request: Request, background_tasks: BackgroundTasks, usuario_email: str = Depends(get_current_user)):
     try:
+        # 🎯 CAPTURA O DOMÍNIO AUTOMATICAMENTE DA REQUISIÇÃO
+        dominio_atual = request.headers.get("origin") or str(request.base_url)
+
         engine = get_engine()
         with engine.connect() as conn:
             uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
 
         from services.email_svc import disparar_convite_nps_especifico
-        background_tasks.add_task(disparar_convite_nps_especifico, payload.cliente_ids)
+        # Passamos o domínio como segundo argumento
+        background_tasks.add_task(disparar_convite_nps_especifico, payload.cliente_ids, dominio_atual)
         
-        # --- AUDITORIA ---
         registrar_log(
             acao="DISPARO_MANUAL",
             mensagem=f"Iniciado disparo manual forçado para um lote de {len(payload.cliente_ids)} clientes.",
