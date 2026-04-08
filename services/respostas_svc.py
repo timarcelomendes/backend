@@ -44,7 +44,18 @@ def read_df(sql: str, params: dict = None) -> pd.DataFrame:
         cols = list(result.keys())
     return pd.DataFrame(rows, columns=cols)
 
-def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil: str, incluir_excluidas: bool, topn: int) -> pd.DataFrame:
+def load_respostas(
+    q: str, 
+    companhia: str, 
+    empresa: str, 
+    categoria: str, 
+    perfil: str, 
+    incluir_excluidas: bool, 
+    topn: int, 
+    data_inicio: str = None,
+    data_fim: str = None,
+    tipo_data: str = "data_resposta" # 🎯 Readicionado para o filtro de datas funcionar!
+):
     where = []
     params = {}
 
@@ -65,8 +76,15 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
         params["cat"] = categoria
         
     if perfil and perfil != "Todos":
-        where.append("c.perfil_decisor = :perf")
-        params["perf"] = perfil
+        where.append("(LOWER(LTRIM(RTRIM(r.perfil_decisor))) LIKE :perf OR LOWER(LTRIM(RTRIM(c.perfil_decisor))) LIKE :perf)")
+        params["perf"] = f"%{perfil.strip().lower()}%"
+
+    # 🎯 FILTRO DE DATAS INTELIGENTE
+    if data_inicio and data_fim:
+        coluna_alvo = "r.data_resposta" if tipo_data == "data_resposta" else "r.created_at"
+        where.append(f"COALESCE({coluna_alvo}, r.created_at) >= :data_inicio AND COALESCE({coluna_alvo}, r.created_at) <= :data_fim")
+        params["data_inicio"] = f"{data_inicio} 00:00:00"
+        params["data_fim"] = f"{data_fim} 23:59:59"
 
     if not incluir_excluidas:
         where.append("r.excluido = 0")
@@ -96,7 +114,7 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
         e.gestor_id AS gestor_id,
         
         comp.nome AS companhia,
-        c.perfil_decisor AS perfil_cliente,
+        COALESCE(r.perfil_decisor, c.perfil_decisor) AS perfil_cliente,
         r.nota,
         r.nota_anterior,
         r.motivo, 
@@ -105,7 +123,9 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
         r.expectativas, 
         r.o_que_faltava, 
         r.jira_issue_url,
-        r.created_at,
+        r.created_at,                        
+        r.data_resposta,                     
+        COALESCE(r.data_resposta, r.created_at) AS data_exibicao,
         r.excluido,
         
         (SELECT TOP 1 id FROM dbo.nps_acoes WHERE resposta_id = r.resposta_id) AS acao_vinculada
@@ -118,11 +138,10 @@ def load_respostas(q: str, companhia: str, empresa: str, categoria: str, perfil:
     ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.resposta_id DESC;
     """
     
-    # Executa o sql gigante de cima
     df = read_df(sql, params)
     
     if 'nota_anterior' in df.columns:
-        df['nota_anterior'] = df['nota_anterior'].apply(lambda x: str(int(x)) if pd.notnull(x) else "")
+        df['nota_anterior'] = df['nota_anterior'].apply(lambda x: str(int(float(x))) if pd.notnull(x) and x != "" else "")
         
     return df
 
@@ -443,3 +462,10 @@ def processar_webhook_fillout(payload: dict):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
+    
+def read_df(sql, params=None):
+    """Executa uma query e retorna um DataFrame do Pandas"""
+    from sqlalchemy import text
+    engine = get_engine()
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn, params=params)

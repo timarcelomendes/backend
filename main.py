@@ -1819,6 +1819,8 @@ def get_dashboard_detalhes(
                     
                     (SELECT TOP 1 a.id FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_id,
                     (SELECT TOP 1 a.status FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_status,
+                    -- 🎯 A LINHA ABAIXO FOI ADICIONADA PARA TRAZER A DATA PARA O RADAR:
+                    (SELECT TOP 1 a.created_at FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_criada_em,
 
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
@@ -2529,14 +2531,32 @@ async def listar_respostas(
     empresa: str = "",
     categoria: str = "Todas",
     perfil: str = "Todos",
+    tipo_data: str = "data_resposta", # 🎯 Adicionado
+    data_inicio: str = None,
+    data_fim: str = None,
     incluir_excluidas: bool = False,
     topn: int = 100000
 ):
     try:
         from services import respostas_svc
-        df = respostas_svc.load_respostas(q, companhia, empresa, categoria, perfil, incluir_excluidas, topn)
+        
+        df = respostas_svc.load_respostas(
+            q=q, 
+            companhia=companhia, 
+            empresa=empresa, 
+            categoria=categoria, 
+            perfil=perfil, 
+            incluir_excluidas=incluir_excluidas, 
+            topn=topn,
+            data_inicio=data_inicio,
+            data_fim=data_fim,
+            tipo_data=tipo_data # 🎯 Repassado para a função
+        )
         return df.fillna("").to_dict(orient="records")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/api/respostas/{resposta_id}")
