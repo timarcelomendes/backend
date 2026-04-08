@@ -4430,3 +4430,54 @@ def registrar_log(acao: str, mensagem: str, nivel: str = 'INFO', usuario_id: int
     except Exception as e:
         # Se o log falhar, o sistema não deve parar, apenas avisa no terminal
         print(f"🚨 Falha crítica ao gravar log no banco: {e}")
+
+@app.get("/api/logs/emails")
+async def listar_logs_emails(topn: int = 1000):
+    try:
+        from database import get_engine
+        import pandas as pd
+        from sqlalchemy import text
+        
+        engine = get_engine()
+        
+        # 🎯 QUERY ADAPTADA PARA A SUA TABELA nps_disparos
+        sql = text(f"""
+            SELECT TOP ({topn})
+                id, 
+                nome as nome_cliente,
+                email as destinatario, 
+                
+                -- 1. Cria um assunto dinâmico baseado no facto de ser o 1º envio ou um lembrete
+                CASE 
+                    WHEN lembretes_enviados > 0 THEN 'Lembrete de Pesquisa NPS (' + CAST(lembretes_enviados AS VARCHAR) + ')'
+                    ELSE 'Convite de Pesquisa NPS' 
+                END as assunto, 
+                
+                status, 
+                
+                -- 2. Junta as informações vitais num log técnico para aparecer no pop-up do frontend
+                CONCAT(
+                    '📍 URL de Destino: ', COALESCE(survey_url, 'N/A'), CHAR(10), CHAR(10),
+                    '🔄 Lembretes Enviados: ', CAST(COALESCE(lembretes_enviados, 0) AS VARCHAR), CHAR(10),
+                    '📅 Último Lembrete: ', COALESCE(CONVERT(VARCHAR, data_ultimo_lembrete, 120), 'N/A'), CHAR(10), CHAR(10),
+                    '⚠️ Registo de Erro: ', COALESCE(erro_msg, 'Nenhum erro registado. Disparo com sucesso.')
+                ) as mensagem, 
+                
+                -- 3. Escolhe a data mais relevante (envio, agendamento ou criação)
+                COALESCE(data_envio_inicial, data_agendamento, created_at) as data_envio
+                
+            FROM dbo.nps_disparos
+            ORDER BY COALESCE(data_envio_inicial, data_agendamento, created_at) DESC
+        """)
+        
+        with engine.connect() as conn:
+            df = pd.read_sql(sql, conn)
+            
+        # Retorna a lista de dicionários para o Vue.js exibir na tabela
+        return df.fillna("").to_dict(orient="records")
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(e))

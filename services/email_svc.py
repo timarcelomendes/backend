@@ -5,9 +5,34 @@ from sqlalchemy import text
 import urllib.parse
 from database import get_engine
 from fastapi import HTTPException
-from sqlalchemy import text
 from jose import jwt
 from datetime import datetime, timedelta, timezone
+
+def registrar_log_disparo(email, nome, status, assunto, erro=None, cliente_id=None, empresa_id=None, url=None):
+    """
+    Função unificada para gravar qualquer disparo de e-mail na tabela nps_disparos.
+    """
+    try:
+        from database import get_engine
+        engine = get_engine()
+        with engine.begin() as conn:
+            sql = text("""
+                INSERT INTO dbo.nps_disparos 
+                (cliente_id, empresa_id, nome, email, status, survey_url, erro_msg, data_envio_inicial, created_at, lembretes_enviados)
+                VALUES 
+                (:cid, :eid, :nome, :email, :status, :url, :erro, GETDATE(), GETDATE(), 0)
+            """)
+            conn.execute(sql, {
+                "cid": cliente_id,
+                "eid": empresa_id,
+                "nome": nome or "Utilizador Sistema",
+                "email": email,
+                "status": status,
+                "url": url,
+                "erro": str(erro) if erro else None
+            })
+    except Exception as e:
+        print(f"⚠️ Falha ao registar log de e-mail para {email}: {e}")
 
 def obter_regras_dinamicas():
     """Lê as parametrizações de negócio da base de dados"""
@@ -50,9 +75,6 @@ def obter_regras_dinamicas():
         print(f"⚠️ Usando regras padrão. Erro ao ler banco: {e}")
         
     return regras
-
-import os
-import re
 
 def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> str:
     if not html_content:
@@ -129,8 +151,6 @@ def get_valid_access_token():
         print("⚠️ E-mail não configurado ou não autorizado.")
         return None
     return gerar_access_token(config)
-
-import os  # <-- Certifique-se de que tem este import no topo do seu ficheiro email_svc.py
 
 def enviar_email_recuperacao(email_destino, token):
     """Envia o e-mail com o link de recuperação de palavra-passe com design premium."""
@@ -236,16 +256,18 @@ def enviar_email_recuperacao(email_destino, token):
     }
 
     try:
-        import requests
         response = requests.post(url_send, json=payload, headers=headers)
         if response.status_code == 202:
             print(f"✅ E-mail de recuperação enviado para {email_destino}")
+            registrar_log_disparo(email_destino, "Utilizador", "Enviado", "Recuperação de Palavra-passe - NPS Intelligence", url=link_recuperacao)
             return True
         else:
             print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
+            registrar_log_disparo(email_destino, "Utilizador", "Erro", "Recuperação de Palavra-passe - NPS Intelligence", erro=response.text, url=link_recuperacao)
             return False
     except Exception as e:
         print(f"❌ Falha no disparo de recuperação: {e}")
+        registrar_log_disparo(email_destino, "Utilizador", "Erro", "Recuperação de Palavra-passe - NPS Intelligence", erro=str(e), url=link_recuperacao)
         return False
     
 def enviar_email_senha_alterada(email_destino):
@@ -299,16 +321,18 @@ def enviar_email_senha_alterada(email_destino):
     }
 
     try:
-        import requests
         response = requests.post(url_send, json=payload, headers=headers)
         if response.status_code == 202:
             print(f"✅ E-mail de confirmação de alteração de senha enviado para {email_destino}")
+            registrar_log_disparo(email_destino, "Utilizador", "Enviado", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence")
             return True
         else:
             print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
+            registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=response.text)
             return False
     except Exception as e:
         print(f"❌ Falha no disparo de confirmação de senha: {e}")
+        registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=str(e))
         return False
     
 def enviar_email_teste(email_destino):
@@ -353,9 +377,15 @@ def enviar_email_teste(email_destino):
 
     try:
         response = requests.post(url_send, json=payload, headers=headers)
-        return response.status_code == 202 
+        if response.status_code == 202:
+            registrar_log_disparo(email_destino, "Administrador", "Enviado", "Teste de Conexão - NPS Intelligence ✅")
+            return True
+        else:
+            registrar_log_disparo(email_destino, "Administrador", "Erro", "Teste de Conexão - NPS Intelligence ✅", erro=response.text)
+            return False 
     except Exception as e:
         print(f"❌ Falha no disparo de teste: {e}")
+        registrar_log_disparo(email_destino, "Administrador", "Erro", "Teste de Conexão - NPS Intelligence ✅", erro=str(e))
         return False
 
 def processar_disparos_nps():
@@ -438,9 +468,7 @@ def processar_disparos_nps():
                         "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
                     }
                     
-                    import urllib.parse
-                    params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
-                    query_string = urllib.parse.urlencode(params_finais)
+                    query_string = urllib.parse.urlencode({k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v})
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
                     # 4. Textos de exibição seguros
@@ -488,7 +516,6 @@ def processar_disparos_nps():
                         "saveToSentItems": True
                     }
 
-                    import requests
                     resposta_ms = requests.post(
                         "https://graph.microsoft.com/v1.0/me/sendMail",
                         headers=headers,
@@ -507,8 +534,10 @@ def processar_disparos_nps():
                             WHERE cliente_id = :id
                         """)
                         conn.execute(sql_update, {"id": cliente["cliente_id"]})
+                        registrar_log_disparo(cliente["email"], nome_exibicao, "Enviado", payload["message"]["subject"], cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         enviados += 1
                     else:
+                        registrar_log_disparo(cliente["email"], nome_exibicao, "Erro", payload["message"]["subject"], erro=resposta_ms.text, cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         raise Exception(f"Erro MS Graph: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
@@ -518,6 +547,7 @@ def processar_disparos_nps():
                         WHERE cliente_id = :id
                     """)
                     conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
+                    registrar_log_disparo(cliente.get("email"), cliente.get("nome"), "Erro", "Disparo NPS Automático", erro=str(erro_cliente)[:250], cliente_id=cliente.get("cliente_id"), empresa_id=cliente.get("empresa_id"))
                     print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
 
         print(f"🏁 Rotina finalizada! {enviados} convites de NPS enviados com sucesso.")
@@ -601,7 +631,6 @@ def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = Non
                     
                     params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
                     
-                    import urllib.parse
                     query_string = urllib.parse.urlencode(params_finais)
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
@@ -647,7 +676,6 @@ def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = Non
                         "saveToSentItems": True
                     }
 
-                    import requests
                     resposta_ms = requests.post(
                         "https://graph.microsoft.com/v1.0/me/sendMail",
                         headers=headers,
@@ -665,13 +693,16 @@ def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = Non
                             WHERE cliente_id = :id
                         """)
                         conn.execute(sql_update, {"id": cliente["cliente_id"]})
+                        registrar_log_disparo(cliente["email"], nome_exibicao, "Enviado", payload["message"]["subject"], cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         print(f"✅ Convite enviado com sucesso para {cliente['email']}")
                     else:
+                        registrar_log_disparo(cliente["email"], nome_exibicao, "Erro", payload["message"]["subject"], erro=resposta_ms.text, cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         raise Exception(f"Erro na API da Microsoft: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
                     sql_erro = text("UPDATE dbo.nps_clientes SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id")
                     conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
+                    registrar_log_disparo(cliente.get("email"), cliente.get("nome"), "Erro", "Disparo NPS Manual", erro=str(erro_cliente)[:250], cliente_id=cliente.get("cliente_id"), empresa_id=cliente.get("empresa_id"))
                     print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
 
     except Exception as e:
@@ -707,7 +738,6 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
         assunto = "O seu feedback é muito importante para nós 💡"
         template_customizado = regras.get("email_agradecimento_detrator", "")
 
-    # 🎯 CORREÇÃO: Os parênteses dos .replace() agora estão perfeitos
     if template_customizado:
         template_customizado = tornar_links_absolutos(template_customizado)
         mail_html = template_customizado.replace("{nome}", primeiro_nome) \
@@ -734,25 +764,25 @@ def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int
     }
 
     try:
-        import requests
         resposta_ms = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
         
         if resposta_ms.status_code in (200, 202):
             print(f"✅ E-mail de agradecimento enviado com sucesso para {email_destino}")
+            registrar_log_disparo(email_destino, primeiro_nome, "Enviado", assunto)
         else:
             print(f"❌ Falha ao enviar agradecimento: {resposta_ms.text}")
+            registrar_log_disparo(email_destino, primeiro_nome, "Erro", assunto, erro=resposta_ms.text)
     except Exception as e:
         print(f"❌ Erro crítico ao enviar agradecimento: {e}")
+        registrar_log_disparo(email_destino, nome, "Erro", assunto, erro=str(e))
 
 def validar_dominio_email(email: str, conn):
     query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")
     config_dominios = conn.execute(query).scalar()
     
-    # 🕵️‍♂️ RASTREADORES PARA O TERMINAL
     print(f"\n🚨 [DEBUG SSO] Iniciando validação para: {email}")
     print(f"🚨 [DEBUG SSO] Valor lido do banco de dados: '{config_dominios}'")
 
-    # Se não houver configuração, BLOQUEIA.
     if not config_dominios or not config_dominios.strip():
         print("🚨 [DEBUG SSO] FALHA: Nenhuma configuração encontrada no banco!")
         raise HTTPException(
@@ -762,7 +792,6 @@ def validar_dominio_email(email: str, conn):
 
     try:
         dominio_usuario = email.split('@')[1].lower().strip()
-        # Limpa os domínios, removendo espaços e itens vazios
         dominios_validos = [d.strip().lower() for d in config_dominios.split(',') if d.strip()]
         
         print(f"🚨 [DEBUG SSO] Domínio do Utilizador: '{dominio_usuario}'")
@@ -787,12 +816,10 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
     to_encode = {"sub": email_destino, "exp": expire, "tipo_token": "confirmacao_email"}
     token = jwt.encode(to_encode, secret_key, algorithm=algorithm)
     
-    # Garante que a URL não tem barra dupla
     backend_url = backend_url.rstrip('/')
     link_confirmacao = f"{backend_url}/api/auth/verificar-email?token={token}"
 
     try:
-        # 2. Usa a função MESTRE que já renova o token corretamente!
         access_token = get_valid_access_token()
         if not access_token:
             print("❌ Falha crítica: Não foi possível obter Access Token para confirmação.")
@@ -806,7 +833,6 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
                 print("❌ Erro: E-mail remetente ausente no banco de dados.")
                 return False
 
-            # 3. Dispara o E-mail usando o token válido
             send_url = f"https://graph.microsoft.com/v1.0/users/{config['email_remetente']}/sendMail"
             
             html_content = f"""
@@ -833,11 +859,14 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
             
             if res_email.status_code == 202:
                 print(f"✅ E-mail de confirmação enviado para {email_destino}")
+                registrar_log_disparo(email_destino, "Novo Registo", "Enviado", "Confirme o seu e-mail - NPS Intelligence", url=link_confirmacao)
                 return True
             else:
                 print(f"❌ Erro ao enviar: {res_email.text}")
+                registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=res_email.text, url=link_confirmacao)
                 return False
 
     except Exception as e:
         print(f"❌ Falha no serviço de e-mail de confirmação: {e}")
+        registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=str(e), url=link_confirmacao)
         return False
