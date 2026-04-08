@@ -54,7 +54,7 @@ def load_respostas(
     topn: int, 
     data_inicio: str = None,
     data_fim: str = None,
-    tipo_data: str = "data_resposta" # 🎯 Readicionado para o filtro de datas funcionar!
+    tipo_data: str = "data_resposta" 
 ):
     where = []
     params = {}
@@ -75,11 +75,11 @@ def load_respostas(
         where.append("r.categoria = :cat")
         params["cat"] = categoria
         
+    # 🎯 Procurar na coluna nome da tabela nps_perfis (alias 'p')
     if perfil and perfil != "Todos":
-        where.append("(LOWER(LTRIM(RTRIM(r.perfil_decisor))) LIKE :perf OR LOWER(LTRIM(RTRIM(c.perfil_decisor))) LIKE :perf)")
+        where.append("(LOWER(LTRIM(RTRIM(r.perfil_decisor))) LIKE :perf OR LOWER(LTRIM(RTRIM(p.nome))) LIKE :perf)")
         params["perf"] = f"%{perfil.strip().lower()}%"
 
-    # 🎯 FILTRO DE DATAS INTELIGENTE
     if data_inicio and data_fim:
         coluna_alvo = "r.data_resposta" if tipo_data == "data_resposta" else "r.created_at"
         where.append(f"COALESCE({coluna_alvo}, r.created_at) >= :data_inicio AND COALESCE({coluna_alvo}, r.created_at) <= :data_fim")
@@ -114,7 +114,10 @@ def load_respostas(
         e.gestor_id AS gestor_id,
         
         comp.nome AS companhia,
-        COALESCE(r.perfil_decisor, c.perfil_decisor) AS perfil_cliente,
+        
+        -- 🎯 AQUI: Lê do Perfil Relacional em vez do texto simples
+        COALESCE(r.perfil_decisor, p.nome) AS perfil_cliente,  
+        
         r.nota,
         r.nota_anterior,
         r.motivo, 
@@ -132,6 +135,7 @@ def load_respostas(
         
     FROM BaseHistorico r
     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+    LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id  -- 🎯 NOVO JOIN ADICIONADO!
     LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
     LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
     {where_sql}
