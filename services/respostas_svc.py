@@ -95,7 +95,7 @@ def load_respostas(
     WITH BaseHistorico AS (
         SELECT 
             *,
-            LAG(nota) OVER (PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) ASC, resposta_id ASC) as nota_anterior
+            LAG(nota) OVER (PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) ASC, created_at ASC) as nota_anterior
         FROM dbo.nps_respostas
         {'WHERE excluido = 0' if not incluir_excluidas else ''}
     )
@@ -112,10 +112,7 @@ def load_respostas(
         
         e.id AS empresa_id,
         e.gestor_id AS gestor_id,
-        
         comp.nome AS companhia,
-        
-        -- 🎯 AQUI: Lê do Perfil Relacional em vez do texto simples
         COALESCE(r.perfil_decisor, p.nome) AS perfil_cliente,  
         
         r.nota,
@@ -130,16 +127,15 @@ def load_respostas(
         r.data_resposta,                     
         COALESCE(r.data_resposta, r.created_at) AS data_exibicao,
         r.excluido,
-        
         (SELECT TOP 1 id FROM dbo.nps_acoes WHERE resposta_id = r.resposta_id) AS acao_vinculada
         
     FROM BaseHistorico r
     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-    LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id  -- 🎯 NOVO JOIN ADICIONADO!
+    LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
     LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
     LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
     {where_sql}
-    ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.resposta_id DESC;
+    ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.created_at DESC
     """
     
     df = read_df(sql, params)

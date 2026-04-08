@@ -1457,8 +1457,6 @@ def get_dashboard_kpis(
             parametros["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
-            # 🎯 CORREÇÃO DEFINITIVA DO FILTRO DE COMPANHIA
-            # O WHERE entra explicitamente DENTRO do IN() 
             if companhia and companhia != "Todas as Companhias":
                 filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
@@ -1592,30 +1590,43 @@ def get_dashboard_kpis(
                 feedbacks_processados.append(f)
 
             # --- 7. CÁLCULOS RESGATES ---
-            # 🎯 CORREÇÃO: Aplica a conversão de "r." para "atual." ANTES de fazer o join
             filtros_resgate = [f.replace("r.", "atual.") for f in filtros_sql]
             condicao_resgate_and = " AND " + " AND ".join(filtros_resgate) if filtros_resgate else ""
-                
-            query_resgates = text(f"""
+
+            # --- CÁLCULO DE DETRATORES RESGATADOS (Detrator -> Promotor) ---
+            query_resgatados = text(f"""
                 WITH Historico AS (
                     SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
-                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
+                           -- 🎯 CORREÇÃO: Substituir resposta_id por created_at para desempatar pela hora exata
+                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, created_at DESC) as rn
                     FROM dbo.nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
                 )
-                SELECT COUNT(*) 
+                SELECT 
+                    c.nome as cliente_nome,
+                    COALESCE(e.nome, 'Sem Empresa') as empresa_nome,
+                    anterior.nota as nota_anterior,
+                    atual.nota as nota_atual
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
                 {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1 
-                  AND anterior.nota <= 8  
+                  AND anterior.nota <= 6 
                   AND atual.nota >= 9     
                   {condicao_resgate_and}      
             """)
             
-            total_resgatados = conn.execute(query_resgates, parametros).scalar() or 0
-
+            res_resgatados_raw = conn.execute(query_resgatados, parametros).mappings().all()
+            
+            detratores_resgatados = len(res_resgatados_raw)
+            lista_resgatados = [dict(r) for r in res_resgatados_raw]
+            
+            res_resgatados_raw = conn.execute(query_resgatados, parametros).mappings().all()
+            
+            detratores_resgatados = len(res_resgatados_raw)
+            lista_resgatados = [dict(r) for r in res_resgatados_raw]
+            
             # --- VARIÁVEIS ANTIGAS ---
             from datetime import datetime, timedelta, timezone
             
@@ -1708,28 +1719,42 @@ def get_dashboard_kpis(
                     
             topicos_criticos = sorted(topicos_criticos, key=lambda x: (-x["mencoes"], x["notaMedia"]))[:5]
 
-            # --- CÁLCULO DE PROMOTORES PERDIDOS / EM RISCO ---
+            # --- CÁLCULO DE PROMOTORES PERDIDOS / RISCO DE CHURN ---
             query_perdidos = text(f"""
                 WITH Historico AS (
                     SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
-                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, resposta_id DESC) as rn
+                           -- 🎯 CORREÇÃO: Substituir resposta_id por created_at para desempatar pela hora exata
+                           ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, created_at DESC) as rn
                     FROM dbo.nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
                 )
                 SELECT 
-                    SUM(CASE WHEN anterior.nota >= 9 AND atual.nota <= 8 THEN 1 ELSE 0 END) as total_em_risco,
-                    SUM(CASE WHEN anterior.nota >= 9 AND atual.nota <= 6 THEN 1 ELSE 0 END) as queda_drastica
+                    c.nome as cliente_nome,
+                    COALESCE(e.nome, 'Sem Empresa') as empresa_nome,
+                    anterior.nota as nota_anterior,
+                    atual.nota as nota_atual,
+                    CASE WHEN anterior.nota >= 9 AND atual.nota <= 6 THEN 1 ELSE 0 END as queda_drastica
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
                 {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
                 LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
-                WHERE atual.rn = 1      
+                WHERE atual.rn = 1 
+                  AND anterior.nota >= 9 
+                  AND atual.nota <= 8     
                   {condicao_resgate_and}      
             """)
             
-            res_perdidos = conn.execute(query_perdidos, parametros).mappings().first()
-            clientes_em_risco = res_perdidos['total_em_risco'] or 0
-            queda_drastica = res_perdidos['queda_drastica'] or 0
+            res_perdidos_raw = conn.execute(query_perdidos, parametros).mappings().all()
+            
+            clientes_em_risco = len(res_perdidos_raw)
+            queda_drastica = sum(1 for r in res_perdidos_raw if r['queda_drastica'] == 1)
+            lista_risco = [dict(r) for r in res_perdidos_raw]
+            
+            res_perdidos_raw = conn.execute(query_perdidos, parametros).mappings().all()
+            
+            clientes_em_risco = len(res_perdidos_raw)
+            queda_drastica = sum(1 for r in res_perdidos_raw if r['queda_drastica'] == 1)
+            lista_risco = [dict(r) for r in res_perdidos_raw]
             
         return {
             "status": "success",
@@ -1740,9 +1765,11 @@ def get_dashboard_kpis(
                 "neutros": neutros,
                 "detratores": detratores,
                 "nps_decisor": nps_decisor, 
-                "clientes_resgatados": total_resgatados,
+                "clientes_resgatados": detratores_resgatados, 
+                "lista_resgatados": lista_resgatados,
                 "clientes_em_risco": clientes_em_risco, 
-                "queda_drastica": queda_drastica,       
+                "queda_drastica": queda_drastica,
+                "lista_risco": lista_risco,    
                 "variacao_nps": variacao_nps, 
                 "revenue_at_risk": float(risco_real),
                 "termos_frequentes": termos_frequentes,
@@ -1887,7 +1914,7 @@ def get_dashboard_trend(
             params = {}
             
             params["apenas_ativos"] = 1 if apenas_ativos else 0
-            filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
+            filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1 OR COALESCE(r.empresa_id, c.empresa_id) IS NULL)")
             
             if companhia and companhia != "Todas as Companhias":
                 filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
@@ -2531,7 +2558,7 @@ async def listar_respostas(
     empresa: str = "",
     categoria: str = "Todas",
     perfil: str = "Todos",
-    tipo_data: str = "data_resposta", # 🎯 Adicionado
+    tipo_data: str = "data_resposta",
     data_inicio: str = None,
     data_fim: str = None,
     incluir_excluidas: bool = False,
@@ -2550,7 +2577,7 @@ async def listar_respostas(
             topn=topn,
             data_inicio=data_inicio,
             data_fim=data_fim,
-            tipo_data=tipo_data # 🎯 Repassado para a função
+            tipo_data=tipo_data
         )
         return df.fillna("").to_dict(orient="records")
     except Exception as e:
