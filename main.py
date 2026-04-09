@@ -784,25 +784,37 @@ async def reenviar_confirmacao(
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
     try:
-        # Lemos o token
+        # 1. Decodifica o token para ler os dados protegidos
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
-        url_origem = payload.get("origin") # 🎯 Recuperamos a URL do Frontend!
+        url_origem = payload.get("origin") 
         
         if not email or not url_origem:
             raise HTTPException(status_code=400, detail="Token inválido")
 
+        # 2. Executa a atualização no Banco de Dados
         engine = get_engine()
         with engine.begin() as conn:
-            # 1. Valida se o usuário existe
-            # 2. Faz o UPDATE para Ativo = 1
-            pass # (Coloque aqui o seu código de validação do banco de dados)
+            # Atualiza a flag de verificação e ativa o usuário
+            # Ajustei os nomes das colunas para o padrão que o seu login espera
+            result = conn.execute(
+                text("""
+                    UPDATE dbo.nps_usuarios 
+                    SET email_verificado = 1, 
+                        ativo = 1 
+                    WHERE email = :email
+                """),
+                {"email": email}
+            )
+            
+            print(f"✅ Sucesso: e-mail {email} verificado no banco.")
 
-        # 🚀 O Python atira o utilizador de volta para o Vue.js com o recado!
-        return RedirectResponse(url=f"{url_origem}/login?status=confirmado")
+        base_url = url_origem.rstrip('/')
+        return RedirectResponse(url=f"{base_url}/login?status=confirmado")
 
-    except (ExpiredSignatureError, JWTError):
-        # Se falhar ou expirar, podemos usar um fallback (assumindo que a API e o App partilham domínio base)
+    except (ExpiredSignatureError, JWTError) as e:
+        print(f"❌ Erro na verificação do token: {str(e)}")
+        # Se não tivermos a url_origem (token corrompido), usamos um caminho relativo
         return RedirectResponse(url="/login?status=erro")
 
 @app.get("/api/auth/sso-config")
