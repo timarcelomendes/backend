@@ -796,7 +796,7 @@ def verificar_email(token: str):
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(
-                text("UPDATE dbo.nps_usuarios SET email_verificado = 1, ativo = 1 WHERE email = :email"),
+                text("UPDATE dbo.nps_usuarios SET email_verificado = 1, ativo = 0 WHERE email = :email"),
                 {"email": email}
             )
             print(f"✅ Usuário {email} verificado com sucesso.")
