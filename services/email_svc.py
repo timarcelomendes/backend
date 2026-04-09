@@ -100,15 +100,19 @@ def tornar_links_absolutos(html_content: str, dominio_contexto: str = None) -> s
         url_real_backend = "http://localhost:8000"
 
     html_corrigido = html_content.replace("{backend_url}", url_real_backend)
-    
     html_corrigido = re.sub(r'src=["\']/(?!/)', f'src="{url_real_backend}/', html_corrigido)
 
     return html_corrigido
 
 def obter_configuracoes_email():
-    """Procura as credenciais ativas na base de dados."""
-    # Import local para evitar import circular
+    """Procura as credenciais ativas na base de dados e DESCRIPTOGRAFA de forma segura."""
     from database import get_engine 
+    from sqlalchemy import text
+    try:
+        from services.crypto_svc import decrypt_data
+    except ImportError:
+        decrypt_data = lambda x: x # Previne erro se o arquivo crypto_svc não existir ainda
+
     engine = get_engine()
     try:
         with engine.connect() as conn:
@@ -116,8 +120,18 @@ def obter_configuracoes_email():
                 SELECT TOP 1 tenant_id, client_id, client_secret, refresh_token, email_remetente 
                 FROM dbo.nps_configuracoes_email
             """)
-            # Usamos mappings() para poder aceder como config['tenant_id']
-            return conn.execute(query).mappings().first()
+            resultado = conn.execute(query).mappings().first()
+            if resultado:
+                config = dict(resultado)
+                
+                # 🎯 Descriptografa na memória (se estiver em texto plano no banco, o decrypt ignora e devolve igual)
+                if config.get('client_secret'):
+                    config['client_secret'] = decrypt_data(config['client_secret'])
+                if config.get('refresh_token'):
+                    config['refresh_token'] = decrypt_data(config['refresh_token'])
+                    
+                return config
+            return None
     except Exception as e:
         print(f"❌ Erro ao ler banco: {e}")
         return None
@@ -154,25 +168,15 @@ def get_valid_access_token():
 
 def enviar_email_recuperacao(email_destino, token):
     """Envia o e-mail com o link de recuperação de palavra-passe com design premium."""
-    
-    # 1. Obtém o token válido da Graph API
     access_token = get_valid_access_token()
-    
     if not access_token:
         print("❌ Falha crítica: Não foi possível obter Access Token para recuperação de senha.")
         return False
 
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
-    
-    # 🔗 LINK INTELIGENTE (Localhost vs Nuvem)
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-    
-    # Limpa uma eventual barra no final do link para evitar erros como "com//redefinir"
-    frontend_url = frontend_url.rstrip('/') 
-    
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/') 
     link_recuperacao = f"{frontend_url}/redefinir-senha?token={token}"
     
-    # 2. Monta o corpo do e-mail de recuperação (Design Premium)
     payload = {
         "message": {
             "subject": "Recuperação de Palavra-passe - NPS Intelligence",
@@ -186,7 +190,6 @@ def enviar_email_recuperacao(email_destino, token):
                         <tr>
                             <td align="center">
                                 <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 20px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; overflow: hidden;">
-                                    
                                     <tr>
                                         <td align="center" style="padding: 40px 20px 20px 20px;">
                                             <span style="font-size: 28px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
@@ -194,15 +197,12 @@ def enviar_email_recuperacao(email_destino, token):
                                             </span>
                                         </td>
                                     </tr>
-                                    
                                     <tr>
                                         <td style="padding: 0 40px 30px 40px; text-align: left;">
                                             <h2 style="color: #0f172a; font-size: 20px; margin-bottom: 15px; font-weight: 800; letter-spacing: -0.5px;">Recuperação de Acesso</h2>
-                                            
                                             <p style="color: #475569; font-size: 15px; line-height: 1.6; margin-bottom: 25px;">
                                                 Recebemos um pedido para repor a palavra-passe associada à sua conta corporativa. Clique no botão abaixo para criar uma nova palavra-passe de acesso à plataforma.
                                             </p>
-                                            
                                             <table width="100%" cellpadding="0" cellspacing="0">
                                                 <tr>
                                                     <td align="center" style="padding: 10px 0 30px 0;">
@@ -212,13 +212,11 @@ def enviar_email_recuperacao(email_destino, token):
                                                     </td>
                                                 </tr>
                                             </table>
-                                            
                                             <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin-bottom: 0;">
                                                 <strong>Atenção:</strong> Este link é válido apenas por <strong>1 hora</strong>. Se o prazo expirar, terá de solicitar um novo link de recuperação.
                                             </p>
                                         </td>
                                     </tr>
-                                    
                                     <tr>
                                         <td style="background-color: #f1f5f9; padding: 25px 40px; border-top: 1px solid #e2e8f0;">
                                             <p style="margin: 0; color: #64748b; font-size: 12px; line-height: 1.5; text-align: center;">
@@ -227,17 +225,6 @@ def enviar_email_recuperacao(email_destino, token):
                                         </td>
                                     </tr>
                                 </table>
-                                
-                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px;">
-                                    <tr>
-                                        <td align="center" style="padding: 20px 0;">
-                                            <p style="margin: 0; color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 3px; font-weight: 800;">
-                                                NPS Intelligence © 2026
-                                            </p>
-                                        </td>
-                                    </tr>
-                                </table>
-                                
                             </td>
                         </tr>
                     </table>
@@ -250,10 +237,7 @@ def enviar_email_recuperacao(email_destino, token):
         "saveToSentItems": "true"
     }
 
-    headers = {
-        'Authorization': f'Bearer {access_token}', 
-        'Content-Type': 'application/json'
-    }
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
 
     try:
         response = requests.post(url_send, json=payload, headers=headers)
@@ -271,17 +255,12 @@ def enviar_email_recuperacao(email_destino, token):
         return False
     
 def enviar_email_senha_alterada(email_destino):
-    """Envia um e-mail confirmando que a senha foi alterada com sucesso."""
-    # 1. Obtém o token válido
     access_token = get_valid_access_token()
-    
     if not access_token:
         print("❌ Falha crítica: Não foi possível obter Access Token para confirmação de senha.")
         return False
 
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
-    
-    # 2. Monta o corpo do e-mail de segurança
     payload = {
         "message": {
             "subject": "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence",
@@ -295,18 +274,12 @@ def enviar_email_senha_alterada(email_destino):
                     <h2 style="color: #10b981; margin-top: 0;">Senha Alterada com Sucesso</h2>
                     <p>Olá,</p>
                     <p>Confirmamos que a senha da sua conta foi alterada recentemente.</p>
-                    <p>Se foi você quem fez esta alteração, não é necessária nenhuma ação adicional. Pode aceder à plataforma normalmente.</p>
                     <div style="margin: 30px 0; padding: 15px; background-color: #fef2f2; border-left: 4px solid #ef4444; border-radius: 4px;">
                         <p style="margin: 0; color: #991b1b; font-size: 14px;">
                             <strong>Não foi você?</strong><br>
-                            Se não solicitou esta alteração, contacte imediatamente o administrador do sistema para proteger o seu acesso.
+                            Se não solicitou esta alteração, contacte imediatamente o administrador do sistema.
                         </p>
                     </div>
-                    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;">
-                    <p style="font-size: 11px; color: #94a3b8; line-height: 1.5; text-align: center;">
-                        Este é um e-mail automático de segurança, por favor não responda. <br>
-                        NPS Intelligence Hub © 2026
-                    </p>
                 </div>
                 """
             },
@@ -315,65 +288,44 @@ def enviar_email_senha_alterada(email_destino):
         "saveToSentItems": "true"
     }
 
-    headers = {
-        'Authorization': f'Bearer {access_token}', 
-        'Content-Type': 'application/json'
-    }
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
 
     try:
         response = requests.post(url_send, json=payload, headers=headers)
         if response.status_code == 202:
-            print(f"✅ E-mail de confirmação de alteração de senha enviado para {email_destino}")
             registrar_log_disparo(email_destino, "Utilizador", "Enviado", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence")
             return True
         else:
-            print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
             registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=response.text)
             return False
     except Exception as e:
-        print(f"❌ Falha no disparo de confirmação de senha: {e}")
         registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=str(e))
         return False
     
 def enviar_email_teste(email_destino):
-    """Envia um e-mail simples para validar a configuração da API."""
     config = obter_configuracoes_email()
-    
     if not config or not config['refresh_token']:
         print("⚠️ E-mail não configurado ou não autorizado.")
         return False
 
-    # 1. Obtém um token novo
     access_token = gerar_access_token(config)
     if not access_token:
         return False
 
-    # 2. Configura o endpoint da Microsoft Graph
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
-    
-    # 3. Monta o conteúdo do e-mail de teste
     payload = {
         "message": {
             "subject": "Teste de Conexão - NPS Intelligence ✅",
             "body": {
                 "contentType": "HTML",
-                "content": f"""
-                <div style="font-family: sans-serif; border: 2px solid #10b981; padding: 20px; border-radius: 15px;">
-                    <h2 style="color: #10b981;">Conexão Bem-sucedida!</h2>
-                    <p>Este é um e-mail de teste disparado pelo painel de configurações.</p>
-                    <p>Se você recebeu esta mensagem, a integração com o Outlook está <b>ativa e funcional</b>.</p>
-                </div>
-                """
+                "content": """<div style="font-family: sans-serif; border: 2px solid #10b981; padding: 20px; border-radius: 15px;"><h2 style="color: #10b981;">Conexão Bem-sucedida!</h2></div>"""
             },
             "toRecipients": [{"emailAddress": {"address": email_destino}}]
         },
         "saveToSentItems": True
     }
 
-    headers = {
-        'Authorization': f'Bearer {access_token}', 
-        'Content-Type': 'application/json'
-    }
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
 
     try:
         response = requests.post(url_send, json=payload, headers=headers)
@@ -384,48 +336,29 @@ def enviar_email_teste(email_destino):
             registrar_log_disparo(email_destino, "Administrador", "Erro", "Teste de Conexão - NPS Intelligence ✅", erro=response.text)
             return False 
     except Exception as e:
-        print(f"❌ Falha no disparo de teste: {e}")
         registrar_log_disparo(email_destino, "Administrador", "Erro", "Teste de Conexão - NPS Intelligence ✅", erro=str(e))
         return False
 
 def processar_disparos_nps():
-    """Busca clientes elegíveis e envia a pesquisa via Microsoft Graph"""
     print("⏳ Iniciando rotina de disparo de NPS...")
     engine = get_engine()
     
-    # =================================================================
-    # 🛑 TRAVA DE SEGURANÇA: VERIFICA OS BOTÕES DO PAINEL
-    # =================================================================
     try:
         from sqlalchemy import text
         with engine.connect() as conn:
-            # 1. Verifica o Motor Geral (Se desligar aqui, corta tudo)
             motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
-            if str(motor).lower() not in ['true', '1']:
-                print("⏸️ Motor de Disparos está DESLIGADO. O robô não fará envios.")
-                return 
+            if str(motor).lower() not in ['true', '1']: return 
             
-            # 2. Verifica o Robô Automático (Background)
             robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
-            if str(robo).lower() not in ['true', '1']:
-                print("⏸️ Robô Automático (Background) está DESLIGADO. Nenhuma pesquisa automática será enviada.")
-                return 
-                
+            if str(robo).lower() not in ['true', '1']: return 
     except Exception as e:
-        print(f"❌ Erro ao ler travas de segurança. Abortando envios por precaução: {e}")
         return
-    # =================================================================
     
-    # 1. Buscar quem deve receber a pesquisa hoje
     sql_busca = text("""
-        SELECT TOP (100)
-            c.cliente_id, c.email, c.nome, c.empresa, 
-            e.id AS empresa_id
+        SELECT TOP (100) c.cliente_id, c.email, c.nome, c.empresa, e.id AS empresa_id
         FROM dbo.nps_clientes c
         LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
-        WHERE c.ativo = 1
-          AND c.status_envio IN ('Pendente', 'Erro')
-          AND (c.proximo_envio IS NULL OR c.proximo_envio <= CAST(GETDATE() AS DATE))
+        WHERE c.ativo = 1 AND c.status_envio IN ('Pendente', 'Erro') AND (c.proximo_envio IS NULL OR c.proximo_envio <= CAST(GETDATE() AS DATE))
         ORDER BY COALESCE(c.proximo_envio, '1900-01-01') ASC
     """)
     
@@ -433,80 +366,35 @@ def processar_disparos_nps():
         with engine.connect() as conn:
             elegiveis = conn.execute(sql_busca).mappings().all()
             
-        if not elegiveis:
-            print("✅ Nenhum cliente elegível para disparo de NPS no momento.")
-            return
+        if not elegiveis: return
 
         access_token = get_valid_access_token() 
+        if not access_token: return
         
-        if not access_token:
-            print("❌ Falha crítica: Não foi possível obter Access Token.")
-            return
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        # 🎯 NOVO: Carregar as regras e o Template do Banco antes do loop!
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         regras = obter_regras_dinamicas()
         campos_permitidos = [c.strip().lower() for c in regras.get("fillout_campos", "").split(",")]
-        template_customizado = regras.get("email_template_html", "")
-
-        template_customizado = tornar_links_absolutos(template_customizado)
+        template_customizado = tornar_links_absolutos(regras.get("email_template_html", ""))
 
         enviados = 0
         with engine.begin() as conn: 
             for cliente in elegiveis:
                 try:
-                    # 3. Montar a URL do Fillout dinâmica
                     params_completos = {
-                        "clienteId": cliente["cliente_id"],
-                        "email": cliente["email"],
-                        "nome": cliente["nome"],
-                        "empresa": cliente["empresa"] or "",
-                        "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
+                        "clienteId": cliente["cliente_id"], "email": cliente["email"], "nome": cliente["nome"],
+                        "empresa": cliente["empresa"] or "", "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
                     }
-                    
                     query_string = urllib.parse.urlencode({k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v})
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
                     
-                    # 4. Textos de exibição seguros
                     nome_exibicao = cliente["nome"].split(" ")[0] if cliente["nome"] else "Parceiro"
                     empresa_exibicao = cliente["empresa"] or "sua empresa"
                     
-                    # 5. Montar o HTML do E-mail (Agora respeita o banco de dados!)
                     if template_customizado and "{survey_url}" in template_customizado:
-                        mail_html = template_customizado.replace("{nome}", nome_exibicao) \
-                                                        .replace("{empresa}", empresa_exibicao) \
-                                                        .replace("{survey_url}", survey_url)
+                        mail_html = template_customizado.replace("{nome}", nome_exibicao).replace("{empresa}", empresa_exibicao).replace("{survey_url}", survey_url)
                     else:
-                        # Fallback se o banco estiver vazio
-                        mail_html = f"""
-                        <!DOCTYPE html>
-                        <html>
-                        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-                            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
-                                <tr>
-                                    <td style="padding:40px;color:#333333;line-height:1.6;">
-                                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
-                                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
-                                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
-                                        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
-                                            <tr>
-                                                <td align="center">
-                                                    <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
-                                                </td>
-                                            </tr>
-                                        </table>
-                                    </td>
-                                </tr>
-                            </table>
-                        </body>
-                        </html>
-                        """
+                        mail_html = f"<html><body><a href='{survey_url}'>Responder Pesquisa</a></body></html>"
 
-                    # 6. Disparar via Microsoft Graph API
                     payload = {
                         "message": {
                             "subject": f"[Pesquisa NPS] Sua opinião importa {'— ' + cliente['empresa'] if cliente['empresa'] else ''}",
@@ -516,23 +404,10 @@ def processar_disparos_nps():
                         "saveToSentItems": True
                     }
 
-                    resposta_ms = requests.post(
-                        "https://graph.microsoft.com/v1.0/me/sendMail",
-                        headers=headers,
-                        json=payload
-                    )
+                    resposta_ms = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
                     
                     if resposta_ms.status_code in (200, 202):
-                        # 7. Sucesso! Atualiza o banco 
-                        sql_update = text("""
-                            UPDATE dbo.nps_clientes
-                            SET status_envio = 'Enviado',
-                                ultimo_envio = CAST(GETDATE() AS DATE),
-                                proximo_envio = DATEADD(DAY, 90, CAST(GETDATE() AS DATE)),
-                                ultimo_erro = NULL,
-                                updated_at = SYSUTCDATETIME()
-                            WHERE cliente_id = :id
-                        """)
+                        sql_update = text("UPDATE dbo.nps_clientes SET status_envio = 'Enviado', ultimo_envio = CAST(GETDATE() AS DATE), proximo_envio = DATEADD(DAY, 90, CAST(GETDATE() AS DATE)), ultimo_erro = NULL, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id")
                         conn.execute(sql_update, {"id": cliente["cliente_id"]})
                         registrar_log_disparo(cliente["email"], nome_exibicao, "Enviado", payload["message"]["subject"], cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         enviados += 1
@@ -541,131 +416,52 @@ def processar_disparos_nps():
                         raise Exception(f"Erro MS Graph: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
-                    sql_erro = text("""
-                        UPDATE dbo.nps_clientes
-                        SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME()
-                        WHERE cliente_id = :id
-                    """)
+                    sql_erro = text("UPDATE dbo.nps_clientes SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id")
                     conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
                     registrar_log_disparo(cliente.get("email"), cliente.get("nome"), "Erro", "Disparo NPS Automático", erro=str(erro_cliente)[:250], cliente_id=cliente.get("cliente_id"), empresa_id=cliente.get("empresa_id"))
-                    print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
 
-        print(f"🏁 Rotina finalizada! {enviados} convites de NPS enviados com sucesso.")
-        
-        # =================================================================
-        # 8. AUDITORIA
-        # =================================================================
         if enviados > 0:
             try:
                 from main import registrar_log
-                registrar_log(
-                    acao="DISPARO_AUTOMATICO",
-                    mensagem=f"O Robô enviou com sucesso {enviados} pesquisas agendadas.",
-                    nivel="SUCCESS"
-                )
-            except Exception as log_err:
-                print(f"Erro ao gravar log de auditoria do robô: {log_err}")
-        
+                registrar_log(acao="DISPARO_AUTOMATICO", mensagem=f"O Robô enviou com sucesso {enviados} pesquisas agendadas.", nivel="SUCCESS")
+            except Exception:
+                pass
     except Exception as e:
         print(f"❌ Erro Fatal na rotina de NPS: {e}")
         
 def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = None):
-    """Busca clientes específicos e força o envio nativo do NPS pelo MS Graph"""
-    if not cliente_ids:
-        return
-        
-    print(f"🚀 Iniciando disparo forçado nativo para {len(cliente_ids)} cliente(s)...")
+    if not cliente_ids: return
     from database import get_engine
     engine = get_engine()
-    
     ids_formatados = ",".join([f"'{cid}'" for cid in cliente_ids])
-    
-    sql_busca = text(f"""
-        SELECT c.cliente_id, c.email, c.nome, c.empresa, e.id AS empresa_id
-        FROM dbo.nps_clientes c
-        LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome
-        WHERE c.cliente_id IN ({ids_formatados})
-    """)
+    sql_busca = text(f"SELECT c.cliente_id, c.email, c.nome, c.empresa, e.id AS empresa_id FROM dbo.nps_clientes c LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome WHERE c.cliente_id IN ({ids_formatados})")
     
     try:
         with engine.connect() as conn:
             clientes = conn.execute(sql_busca).mappings().all()
-            
-        if not clientes:
-            print("❌ Nenhum cliente encontrado.")
-            return
+        if not clientes: return
 
         access_token = get_valid_access_token() 
-        
-        if not access_token:
-            print("❌ Falha crítica: Não foi possível obter Access Token.")
-            return
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        # 1: Carrega as regras FORA do loop para não causar Deadlock!
+        if not access_token: return
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         regras = obter_regras_dinamicas()
-        
-        # 2: Garante que não dá erro se o fillout_campos vier vazio (None)
         campos_raw = regras.get("fillout_campos") or "clienteId,email,nome"
         campos_permitidos = [c.strip().lower() for c in campos_raw.split(",")]
-        
-        template_customizado = regras.get("email_template_html") or ""
+        template_customizado = tornar_links_absolutos(regras.get("email_template_html") or "", dominio_origem)
 
-        template_customizado = tornar_links_absolutos(template_customizado, dominio_origem)
-
-        # Abre a transação UMA única vez
         with engine.begin() as conn:
             for cliente in clientes:
                 try:
-                    params_completos = {
-                        "clienteId": cliente["cliente_id"],
-                        "email": cliente["email"],
-                        "nome": cliente["nome"],
-                        "empresa": cliente["empresa"] or "",
-                        "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""
-                    }
-                    
-                    params_finais = {k: v for k, v in params_completos.items() if k.lower() in campos_permitidos and v}
-                    
+                    params_finais = {k: v for k, v in {"clienteId": cliente["cliente_id"], "email": cliente["email"], "nome": cliente["nome"], "empresa": cliente["empresa"] or "", "empresa_id": str(cliente["empresa_id"]) if cliente["empresa_id"] else ""}.items() if k.lower() in campos_permitidos and v}
                     query_string = urllib.parse.urlencode(params_finais)
                     survey_url = f"https://forms.fillout.com/t/dPJSvuBRcDus?{query_string}"
-                    
                     nome_exibicao = cliente["nome"].split(" ")[0] if cliente["nome"] else "Parceiro"
                     empresa_exibicao = cliente["empresa"] or "sua empresa"
                     
                     if template_customizado and "{survey_url}" in template_customizado:
-                        mail_html = template_customizado.replace("{nome}", nome_exibicao) \
-                                                        .replace("{empresa}", empresa_exibicao) \
-                                                        .replace("{survey_url}", survey_url)
+                        mail_html = template_customizado.replace("{nome}", nome_exibicao).replace("{empresa}", empresa_exibicao).replace("{survey_url}", survey_url)
                     else:
-                        # Fallback
-                        mail_html = f"""
-                        <!DOCTYPE html>
-                        <html>
-                        <body style="margin:0;padding:40px 15px;background-color:#F0F2F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-                            <table width="600" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.05);">
-                                <tr>
-                                    <td style="padding:40px;color:#333333;line-height:1.6;">
-                                        <h1 style="margin:0 0 20px 0;font-size:22px;color:#1A1A1A;text-align:center;font-weight:700;">Pesquisa de Satisfação</h1>
-                                        <p style="font-size:16px;margin-bottom:20px;">Olá, <strong>{nome_exibicao}</strong>,</p>
-                                        <p style="font-size:16px;margin-bottom:30px;color:#4A4A4A;">Para continuarmos elevando o nível da nossa parceria com a <strong>{empresa_exibicao}</strong>, precisamos ouvir você.</p>
-                                        <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:30px;">
-                                            <tr>
-                                                <td align="center">
-                                                    <a href="{survey_url}" target="_blank" style="display:inline-block;padding:16px 36px;background-color:#F97316;color:#ffffff;font-size:16px;font-weight:bold;text-decoration:none;border-radius:8px;">Responder em 1 minuto</a>
-                                                </td>
-                                            </tr>
-                                        </table>
-                                    </td>
-                                </tr>
-                            </table>
-                        </body>
-                        </html>
-                        """
+                        mail_html = f"<html><body><a href='{survey_url}'>Responder</a></body></html>"
 
                     payload = {
                         "message": {
@@ -676,162 +472,86 @@ def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = Non
                         "saveToSentItems": True
                     }
 
-                    resposta_ms = requests.post(
-                        "https://graph.microsoft.com/v1.0/me/sendMail",
-                        headers=headers,
-                        json=payload
-                    )
+                    resposta_ms = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
                     
                     if resposta_ms.status_code in (200, 202):
-                        sql_update = text("""
-                            UPDATE dbo.nps_clientes
-                            SET status_envio = 'Enviado',
-                                ultimo_envio = CAST(GETDATE() AS DATE),
-                                proximo_envio = DATEADD(DAY, 90, CAST(GETDATE() AS DATE)),
-                                ultimo_erro = NULL,
-                                updated_at = SYSUTCDATETIME()
-                            WHERE cliente_id = :id
-                        """)
-                        conn.execute(sql_update, {"id": cliente["cliente_id"]})
+                        conn.execute(text("UPDATE dbo.nps_clientes SET status_envio = 'Enviado', ultimo_envio = CAST(GETDATE() AS DATE), proximo_envio = DATEADD(DAY, 90, CAST(GETDATE() AS DATE)), ultimo_erro = NULL, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id"), {"id": cliente["cliente_id"]})
                         registrar_log_disparo(cliente["email"], nome_exibicao, "Enviado", payload["message"]["subject"], cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
-                        print(f"✅ Convite enviado com sucesso para {cliente['email']}")
                     else:
                         registrar_log_disparo(cliente["email"], nome_exibicao, "Erro", payload["message"]["subject"], erro=resposta_ms.text, cliente_id=cliente["cliente_id"], empresa_id=cliente["empresa_id"], url=survey_url)
                         raise Exception(f"Erro na API da Microsoft: {resposta_ms.text}")
 
                 except Exception as erro_cliente:
-                    sql_erro = text("UPDATE dbo.nps_clientes SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id")
-                    conn.execute(sql_erro, {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
+                    conn.execute(text("UPDATE dbo.nps_clientes SET status_envio = 'Erro', ultimo_erro = :erro, updated_at = SYSUTCDATETIME() WHERE cliente_id = :id"), {"erro": str(erro_cliente)[:250], "id": cliente["cliente_id"]})
                     registrar_log_disparo(cliente.get("email"), cliente.get("nome"), "Erro", "Disparo NPS Manual", erro=str(erro_cliente)[:250], cliente_id=cliente.get("cliente_id"), empresa_id=cliente.get("empresa_id"))
-                    print(f"❌ Erro ao enviar para {cliente['email']}: {erro_cliente}")
 
     except Exception as e:
         print(f"❌ Erro fatal no disparo manual: {e}")
 
 def enviar_email_resposta(email_destino: str, nome: str, empresa: str, nota: int, categoria: str, motivo: str = "", expectativas: str = "", o_que_faltava: str = ""):
-    if not email_destino or email_destino == "-":
-        print("⚠️ E-mail de destino não fornecido. Agradecimento ignorado.")
-        return
-
-    print(f"📧 Preparando e-mail de agradecimento para {nome} ({categoria})...")
-    
+    if not email_destino or email_destino == "-": return
     access_token = get_valid_access_token()
-    if not access_token:
-        print("❌ Não foi possível obter o token para enviar o agradecimento.")
-        return
+    if not access_token: return
 
     primeiro_nome = nome.split(" ")[0] if nome else "Parceiro"
     empresa_exibicao = empresa if empresa else "sua empresa" 
-    motivo_exibicao = motivo if motivo else "Nenhum comentário adicional deixado no formulário."
-    expectativas_exibicao = expectativas if expectativas else "Não respondido."
-    falta_exibicao = o_que_faltava if o_que_faltava else "Não respondido."
-
     regras = obter_regras_dinamicas()
     
     if categoria == 'Promotor':
-        assunto = f"Obrigado pela sua nota {nota}! 🌟"
-        template_customizado = regras.get("email_agradecimento_promotor", "")
+        assunto, template_customizado = f"Obrigado pela sua nota {nota}! 🌟", regras.get("email_agradecimento_promotor", "")
     elif categoria == 'Neutro':
-        assunto = "Recebemos a sua avaliação. Vamos melhorar! 🚀"
-        template_customizado = regras.get("email_agradecimento_neutro", "")
+        assunto, template_customizado = "Recebemos a sua avaliação. Vamos melhorar! 🚀", regras.get("email_agradecimento_neutro", "")
     else:
-        assunto = "O seu feedback é muito importante para nós 💡"
-        template_customizado = regras.get("email_agradecimento_detrator", "")
+        assunto, template_customizado = "O seu feedback é muito importante para nós 💡", regras.get("email_agradecimento_detrator", "")
 
     if template_customizado:
-        template_customizado = tornar_links_absolutos(template_customizado)
-        mail_html = template_customizado.replace("{nome}", primeiro_nome) \
-                                        .replace("{empresa}", empresa_exibicao) \
-                                        .replace("{nota}", str(nota)) \
-                                        .replace("{motivo}", motivo_exibicao) \
-                                        .replace("{expectativas}", expectativas_exibicao) \
-                                        .replace("{o_que_faltava}", falta_exibicao)
+        mail_html = tornar_links_absolutos(template_customizado).replace("{nome}", primeiro_nome).replace("{empresa}", empresa_exibicao).replace("{nota}", str(nota)).replace("{motivo}", motivo if motivo else "N/A").replace("{expectativas}", expectativas if expectativas else "N/A").replace("{o_que_faltava}", o_que_faltava if o_que_faltava else "N/A")
     else:
         mail_html = f"<h2>Obrigado, {primeiro_nome}!</h2><p>A sua nota {nota} foi registada para a empresa {empresa_exibicao}.</p>"
 
     payload = {
-        "message": {
-            "subject": assunto,
-            "body": {"contentType": "HTML", "content": mail_html},
-            "toRecipients": [{"emailAddress": {"address": email_destino}}]
-        },
+        "message": {"subject": assunto, "body": {"contentType": "HTML", "content": mail_html}, "toRecipients": [{"emailAddress": {"address": email_destino}}]},
         "saveToSentItems": True
     }
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
     try:
         resposta_ms = requests.post("https://graph.microsoft.com/v1.0/me/sendMail", headers=headers, json=payload)
-        
         if resposta_ms.status_code in (200, 202):
-            print(f"✅ E-mail de agradecimento enviado com sucesso para {email_destino}")
             registrar_log_disparo(email_destino, primeiro_nome, "Enviado", assunto)
         else:
-            print(f"❌ Falha ao enviar agradecimento: {resposta_ms.text}")
             registrar_log_disparo(email_destino, primeiro_nome, "Erro", assunto, erro=resposta_ms.text)
     except Exception as e:
-        print(f"❌ Erro crítico ao enviar agradecimento: {e}")
         registrar_log_disparo(email_destino, nome, "Erro", assunto, erro=str(e))
 
 def validar_dominio_email(email: str, conn):
     query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")
     config_dominios = conn.execute(query).scalar()
     
-    print(f"\n🚨 [DEBUG SSO] Iniciando validação para: {email}")
-    print(f"🚨 [DEBUG SSO] Valor lido do banco de dados: '{config_dominios}'")
-
     if not config_dominios or not config_dominios.strip():
-        print("🚨 [DEBUG SSO] FALHA: Nenhuma configuração encontrada no banco!")
-        raise HTTPException(
-            status_code=403, 
-            detail="Segurança: O sistema não possui domínios autorizados configurados. Acesso suspenso."
-        )
+        raise HTTPException(status_code=403, detail="Segurança: O sistema não possui domínios autorizados configurados.")
 
     try:
         dominio_usuario = email.split('@')[1].lower().strip()
         dominios_validos = [d.strip().lower() for d in config_dominios.split(',') if d.strip()]
-        
-        print(f"🚨 [DEBUG SSO] Domínio do Utilizador: '{dominio_usuario}'")
-        print(f"🚨 [DEBUG SSO] Lista de Permitidos: {dominios_validos}")
-
         if dominio_usuario not in dominios_validos:
-            print("🚨 [DEBUG SSO] BLOQUEADO: Domínio não pertence à lista!")
-            raise HTTPException(
-                status_code=403, 
-                detail=f"Acesso negado: O domínio '@{dominio_usuario}' não está na lista de permissões da organização."
-            )
-        print("🚨 [DEBUG SSO] SUCESSO: Domínio validado com sucesso!\n")
-            
+            raise HTTPException(status_code=403, detail=f"Acesso negado: O domínio '@{dominio_usuario}' não está na lista de permissões.")
     except IndexError:
         raise HTTPException(status_code=400, detail="O formato do e-mail é inválido.")
 
 def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, backend_url: str):
-    """Gera o token e envia o e-mail de verificação via MS Graph (Versão Corrigida)"""
-    
-    # 1. Gera o Token válido por 24 horas
     expire = datetime.now(timezone.utc) + timedelta(hours=24)
-    to_encode = {"sub": email_destino, "exp": expire, "tipo_token": "confirmacao_email"}
-    token = jwt.encode(to_encode, secret_key, algorithm=algorithm)
-    
-    backend_url = backend_url.rstrip('/')
-    link_confirmacao = f"{backend_url}/api/auth/verificar-email?token={token}"
+    token = jwt.encode({"sub": email_destino, "exp": expire, "tipo_token": "confirmacao_email"}, secret_key, algorithm=algorithm)
+    link_confirmacao = f"{backend_url.rstrip('/')}/api/auth/verificar-email?token={token}"
 
     try:
         access_token = get_valid_access_token()
-        if not access_token:
-            print("❌ Falha crítica: Não foi possível obter Access Token para confirmação.")
-            return False
+        if not access_token: return False
 
         engine = get_engine()
         with engine.connect() as conn:
             config = conn.execute(text("SELECT email_remetente FROM dbo.nps_configuracoes_email")).mappings().first()
-
-            if not config or not config["email_remetente"]:
-                print("❌ Erro: E-mail remetente ausente no banco de dados.")
-                return False
+            if not config or not config["email_remetente"]: return False
 
             send_url = f"https://graph.microsoft.com/v1.0/users/{config['email_remetente']}/sendMail"
             
@@ -841,32 +561,20 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
                 <p>Olá! Recebemos um pedido de registo no NPS Intelligence com este e-mail.</p>
                 <p>Para comprovar a titularidade da conta, por favor clique no botão abaixo:</p>
                 <a href="{link_confirmacao}" style="display: inline-block; background-color: #f97316; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 20px 0;">Verificar Meu E-mail</a>
-                <p style="font-size: 12px; color: #64748b;"><i>Nota: A sua conta permanecerá inativa até aprovação final de um Administrador.</i></p>
             </div>
             """
 
-            email_body = {
-                "message": {
-                    "subject": "Confirme o seu e-mail - NPS Intelligence",
-                    "body": {"contentType": "HTML", "content": html_content},
-                    "toRecipients": [{"emailAddress": {"address": email_destino}}]
-                },
-                "saveToSentItems": "true"
-            }
-
+            email_body = {"message": {"subject": "Confirme o seu e-mail - NPS Intelligence", "body": {"contentType": "HTML", "content": html_content}, "toRecipients": [{"emailAddress": {"address": email_destino}}]}, "saveToSentItems": "true"}
             headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
             res_email = requests.post(send_url, json=email_body, headers=headers)
             
             if res_email.status_code == 202:
-                print(f"✅ E-mail de confirmação enviado para {email_destino}")
                 registrar_log_disparo(email_destino, "Novo Registo", "Enviado", "Confirme o seu e-mail - NPS Intelligence", url=link_confirmacao)
                 return True
             else:
-                print(f"❌ Erro ao enviar: {res_email.text}")
                 registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=res_email.text, url=link_confirmacao)
                 return False
 
     except Exception as e:
-        print(f"❌ Falha no serviço de e-mail de confirmação: {e}")
         registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=str(e), url=link_confirmacao)
         return False
