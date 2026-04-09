@@ -3364,9 +3364,6 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
         # 🔓 DESCRIPTOGRAFIA: Recuperamos o segredo real para falar com a Microsoft
         secret_real = decrypt_data(config['client_secret'])
 
-        base_url = config['base_url_frontend'].strip().rstrip('/')
-        redirect_uri = f"{base_url}/configuracoes"
-
         url = f"https://login.microsoftonline.com/{config['tenant_id']}/oauth2/v2.0/token"
         
         payload = {
@@ -3374,12 +3371,18 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
             'client_secret': secret_real,
             'code': requisicao.code,
             'grant_type': 'authorization_code',
-            'redirect_uri': requisicao.redirect_uri,
+            
+            # 🎯 Usa a URL dinâmica que o Vue enviou, zero hardcode!
+            'redirect_uri': requisicao.redirect_uri, 
+            
             'scope': 'offline_access mail.send'
         }
-                
-        res_raw = requests.post(url, data=payload)
-        res = res_raw.json()
+        
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        
+        # 🚀 Apenas UM pedido HTTP com os headers corretos
+        response = requests.post(url, data=payload, headers=headers)
+        res = response.json()
 
         if "refresh_token" not in res:
             print(f"❌ Erro Microsoft: {res}") 
