@@ -82,7 +82,7 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     # Busca o ID da empresa através do JOIN e cruza com a Fila de Disparos
     sql = f"""
-    -- 👇 CTE to get only the latest dispatch for each client
+    -- 👇 CTE para obter apenas o último disparo de cada cliente
     WITH LatestDisparo AS (
         SELECT 
             cliente_id,
@@ -99,7 +99,6 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         c.email, 
         c.telefone,          
         
-        -- 👇 Traz o ID e o Nome de cada relação
         c.cargo_id, cg.nome as cargo,             
         c.empresa_id, e.nome as empresa, e.gestor,            
         c.perfil_id, p.nome as perfil_decisor, 
@@ -108,9 +107,21 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) as ultimo_envio,
         DATEADD(day, ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) AS proximo_envio,
 
+        -- 🎯 MAGIA AQUI: Lógica à prova de falhas para o Estado
         CASE 
-            WHEN COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL THEN 'Pendente'
+            -- 1. Se o ciclo de carência terminou, volta para a fila
             WHEN GETDATE() >= DATEADD(day, ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) THEN 'Pendente'
+            
+            -- 2. Se nunca foi disparado
+            WHEN COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio) IS NULL THEN 'Pendente'
+            
+            -- 3. A PROVA DE BALA: Vai à tabela de respostas confirmar se há algo mais recente que o disparo
+            WHEN (SELECT COUNT(1) FROM dbo.nps_respostas r2 WHERE r2.cliente_id = c.cliente_id AND COALESCE(r2.data_resposta, r2.created_at) >= COALESCE(d.data_envio_inicial, c.ultimo_envio, '2000-01-01')) > 0 THEN 'Respondido'
+            
+            -- 4. Força a prioridade máxima para a palavra "Respondido" se estiver presa numa das tabelas
+            WHEN c.status_envio = 'Respondido' OR d.status = 'Respondido' THEN 'Respondido'
+            
+            -- 5. Fallback padrão
             ELSE COALESCE(d.status, c.status_envio, 'Não Iniciado')
         END AS status_envio,
         
@@ -125,12 +136,10 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
         CAST(CASE WHEN EXISTS (SELECT 1 FROM dbo.nps_acoes a WHERE a.empresa_id = e.id AND a.status != 'Concluído') THEN 1 ELSE 0 END AS BIT) AS tem_acao_pendente
         
     FROM dbo.nps_clientes c
-    -- 👇 OS NOVOS JOINS PELO ID
     LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
     LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
     LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id
     LEFT JOIN dbo.nps_cargos cg ON c.cargo_id = cg.id
-    -- 👇 Join with the CTE instead of the raw table, filtering for rn = 1
     LEFT JOIN LatestDisparo d ON c.cliente_id = d.cliente_id AND d.rn = 1
     {where_sql}
     ORDER BY c.updated_at DESC;
