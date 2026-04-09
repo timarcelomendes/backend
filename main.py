@@ -242,6 +242,7 @@ class ConfigEmailRequest(BaseModel):
 
 class AutorizarEmailRequest(BaseModel):
     code: str
+    redirect_uri: str
 
 class ConfigEmailSchema(BaseModel):
     tenant_id: Optional[str] = ""
@@ -3351,7 +3352,7 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
     engine = get_engine()
     with engine.connect() as conn:
         config_row = conn.execute(text("""
-            SELECT TOP 1 tenant_id, client_id, client_secret, base_url_frontend 
+            SELECT TOP 1 tenant_id, client_id, client_secret
             FROM dbo.nps_configuracoes_email
         """)).fetchone()
         
@@ -3370,10 +3371,10 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
         
         payload = {
             'client_id': config['client_id'],
-            'client_secret': secret_real, # Enviamos o valor real (em memória)
+            'client_secret': secret_real,
             'code': requisicao.code,
             'grant_type': 'authorization_code',
-            'redirect_uri': redirect_uri, 
+            'redirect_uri': requisicao.redirect_uri,
             'scope': 'offline_access mail.send'
         }
                 
