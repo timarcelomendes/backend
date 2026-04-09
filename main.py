@@ -41,7 +41,7 @@ from apscheduler.triggers.cron import CronTrigger
 # Importações Locais
 from database import get_engine, exec_sql
 from services.auth_utils import hash_password
-from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email, enviar_email_confirmacao
+from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email, enviar_email_confirmacao, validar_senha_forte
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
 from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams 
 from services.webhook_svc import processar_webhook_background
@@ -904,8 +904,9 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
 def registrar_usuario(
     requisicao: RegistroRequest, 
     background_tasks: BackgroundTasks,
-    request: Request  # 👈 O slowapi precisa disto de volta aqui!
+    request: Request
 ):
+    validar_senha_forte(requisicao.password)
     engine = get_engine()
     
     with engine.begin() as conn:
@@ -928,13 +929,10 @@ def registrar_usuario(
             "senha_hash": senha_hash
         })
         
-        # 🎯 Continuamos a usar a URL exata do Vue.js!
         url_frontend = requisicao.url_plataforma 
             
-            # 2. Pegamos a URL da própria API (Backend)
         url_backend = f"{request.url.scheme}://{request.url.netloc}" 
 
-            # 3. Enviamos ambas para a tarefa de e-mail
         background_tasks.add_task(
             enviar_email_confirmacao, 
             requisicao.email, 
@@ -1040,6 +1038,7 @@ async def solicitar_recuperacao(
 
 @app.post("/api/usuarios/alterar-senha")
 async def alterar_minha_senha(requisicao: AlterarSenhaRequest, usuario_email: str = Depends(get_current_user)):
+    validar_senha_forte(requisicao.nova_senha)
     engine = get_engine()
     with engine.connect() as conn:
         user = conn.execute(

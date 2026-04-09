@@ -642,3 +642,25 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
     except Exception as e:
         registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=str(e), url=link_confirmacao)
         return False
+    
+import re
+
+def validar_senha_forte(password: str):
+    """
+    Critérios:
+    - Mínimo 8 caracteres
+    - Pelo menos uma letra maiúscula
+    - Pelo menos um número
+    - Pelo menos um caractere especial (@$!%*?&)
+    """
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 8 caracteres.")
+    
+    if not re.search(r"[A-Z]", password):
+        raise HTTPException(status_code=400, detail="A senha deve conter pelo menos uma letra maiúscula.")
+        
+    if not re.search(r"[0-9]", password):
+        raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um número.")
+        
+    if not re.search(r"[@$!%*?&]", password):
+        raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um caractere especial (@$!%*?&).")
