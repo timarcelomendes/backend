@@ -1003,7 +1003,7 @@ async def solicitar_recuperacao(
             )
             
             print(f"📧 A disparar e-mail de recuperação para: {email_banco}")
-            background_tasks.add_task(enviar_email_recuperacao, email_banco, token)
+            enviar_email_recuperacao(email_banco, token)
                 
         return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
     
