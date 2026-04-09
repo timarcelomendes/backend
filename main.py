@@ -956,6 +956,7 @@ async def resetar_senha(
     
     try:
         try:
+            # 1. Valida se o Token (o link do e-mail) é verdadeiro e está no prazo
             payload = jwt.decode(req.token, SECRET_KEY, algorithms=[ALGORITHM])
             email_usuario = payload.get("sub")
             tipo_token = payload.get("tipo")
@@ -965,6 +966,9 @@ async def resetar_senha(
         except JWTError:
             raise HTTPException(status_code=400, detail="O link de recuperação expirou ou é inválido.")
 
+        validar_senha_forte(req.nova_senha)
+
+        # 3. Se a senha for forte, continua para a encriptação
         senha_encriptada = pwd_context.hash(req.nova_senha)
         
         with engine.begin() as conn:
@@ -992,12 +996,11 @@ async def resetar_senha(
         print(f"❌ Erro ao redefinir a palavra-passe no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao guardar a nova palavra-passe.")
 
-
 @app.post("/api/esqueci-senha")
-@limiter.limit("3/minute") # 🛡️ Impede flood na caixa de correio do usuário
+@limiter.limit("3/minute")
 async def solicitar_recuperacao(
     requisicao: EsqueciSenhaRequest, 
-    request: Request, # 🛡️ INJEÇÃO OBRIGATÓRIA PARA O LIMITER LER O IP
+    request: Request,
     background_tasks: BackgroundTasks
 ):
     engine = get_engine()
@@ -1038,7 +1041,9 @@ async def solicitar_recuperacao(
 
 @app.post("/api/usuarios/alterar-senha")
 async def alterar_minha_senha(requisicao: AlterarSenhaRequest, usuario_email: str = Depends(get_current_user)):
+    
     validar_senha_forte(requisicao.nova_senha)
+
     engine = get_engine()
     with engine.connect() as conn:
         user = conn.execute(
@@ -1049,7 +1054,9 @@ async def alterar_minha_senha(requisicao: AlterarSenhaRequest, usuario_email: st
         if not bcrypt.checkpw(requisicao.senha_atual.encode('utf-8'), user.senha_hash.encode('utf-8')):
             raise HTTPException(status_code=400, detail="A senha atual está incorreta.")
 
+        # 2. Se a senha atual estiver certa E a nova for forte, fazemos o Hash
         novo_hash = bcrypt.hashpw(requisicao.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
         conn.execute(
             text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE email = :email"),
             {"hash": novo_hash, "email": usuario_email}
