@@ -258,6 +258,7 @@ class RegistroRequest(BaseModel):
     nome: str
     email: str
     password: str
+    url_plataforma: str
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -888,11 +889,11 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
         raise HTTPException(status_code=500, detail="Erro interno no servidor de autenticação.")
     
 @app.post("/api/register")
-@limiter.limit("3/minute") # 🛡️ Impede a criação de contas fantasma em massa
+@limiter.limit("3/minute")
 def registrar_usuario(
     requisicao: RegistroRequest, 
-    background_tasks: BackgroundTasks, 
-    request: Request
+    background_tasks: BackgroundTasks,
+    request: Request  # 👈 O slowapi precisa disto de volta aqui!
 ):
     engine = get_engine()
     
@@ -916,11 +917,19 @@ def registrar_usuario(
             "senha_hash": senha_hash
         })
         
-        url_backend = f"{request.url.scheme}://{request.url.netloc}"
-        background_tasks.add_task(enviar_email_confirmacao, requisicao.email, SECRET_KEY, ALGORITHM, url_backend)
+        # 🎯 Continuamos a usar a URL exata do Vue.js!
+        url_frontend = requisicao.url_plataforma 
         
-    return {"mensagem": "Conta criada! Enviámos um link para o seu e-mail. Por favor, confirme para darmos andamento à sua aprovação."}
-
+        # Passamos a URL do Frontend para a tarefa de e-mail
+        background_tasks.add_task(
+            enviar_email_confirmacao, 
+            requisicao.email, 
+            SECRET_KEY, 
+            ALGORITHM, 
+            url_frontend # 🚀 Agora o e-mail terá o link correto!
+        )
+        
+    return {"mensagem": "Conta criada! Verifique o seu e-mail."}
 
 @app.post("/api/reset-password")
 @limiter.limit("3/minute") # 🛡️ Protege a rota final de reset
