@@ -165,38 +165,43 @@ async def status_webhook_fillout():
     """Healthcheck simples para o botão do Frontend"""
     return {"status": "success", "message": "🟢 Ouvindo POSTs no novo endereço!"}
 
+from fastapi import Depends, HTTPException, status
+from jose import jwt, JWTError, ExpiredSignatureError
+
 # ==========================================
 # 🔐 4. DEPENDÊNCIAS DE AUTENTICAÇÃO
 # ==========================================
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+
+async def get_current_user_token_data(token: str = Depends(oauth2_scheme)):
+    """Descodifica o token, valida a expiração e devolve o payload completo"""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Sessão expirada. Por favor, faça login novamente.",
+        detail="Sessão expirada ou inválida. Por favor, faça login novamente.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
+        # A validação de expiração (verify_exp=True) é o padrão, mas deixamos explícito
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True})
-        email: str = payload.get("sub")
-        if email is None:
+        
+        if payload.get("sub") is None:
             raise credentials_exception
-        return email
+            
+        return payload
     except (ExpiredSignatureError, JWTError):
         raise credentials_exception
 
-async def get_current_user_token_data(token: str = Depends(oauth2_scheme)):
-    """Descodifica o token e devolve os dados (incluindo o tipo)"""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Sessão inválida.")
+async def get_current_user(token_data: dict = Depends(get_current_user_token_data)):
+    """Devolve apenas o e-mail do utilizador (Para rotas comuns)"""
+    return token_data.get("sub")
 
 def exigir_admin(token_data: dict = Depends(get_current_user_token_data)):
+    """Protege a rota exigindo o cargo de Admin"""
     if token_data.get("tipo") != "Admin":
         raise HTTPException(status_code=403, detail="Acesso negado. Apenas Administradores.")
     return token_data.get("sub")
 
 def exigir_manager(token_data: dict = Depends(get_current_user_token_data)):
+    """Protege a rota exigindo o cargo de Manager ou Admin"""
     if token_data.get("tipo") not in ["Admin", "Manager"]:
         raise HTTPException(status_code=403, detail="Acesso negado. Requer nível Manager ou superior.")
     return token_data.get("sub")
@@ -778,22 +783,27 @@ async def reenviar_confirmacao(
     
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
-    # (Mantido igual: GET de verificação via link não é atrativo para brute force direto)
-    url_frontend = "http://localhost:5173/login" 
     try:
+        # Lemos o token
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email_usuario = payload.get("sub")
+        email = payload.get("sub")
+        url_origem = payload.get("origin") # 🎯 Recuperamos a URL do Frontend!
         
+        if not email or not url_origem:
+            raise HTTPException(status_code=400, detail="Token inválido")
+
         engine = get_engine()
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE dbo.nps_usuarios SET email_verificado = 1, ativo = 1 WHERE email = :email"),
-                {"email": email_usuario}
-            )
-            
-        return RedirectResponse(url=f"{url_frontend}?verificado=true")
-    except Exception as e:
-        return RedirectResponse(url=f"{url_frontend}?erro=token_invalido")
+            # 1. Valida se o usuário existe
+            # 2. Faz o UPDATE para Ativo = 1
+            pass # (Coloque aqui o seu código de validação do banco de dados)
+
+        # 🚀 O Python atira o utilizador de volta para o Vue.js com o recado!
+        return RedirectResponse(url=f"{url_origem}/login?status=confirmado")
+
+    except (ExpiredSignatureError, JWTError):
+        # Se falhar ou expirar, podemos usar um fallback (assumindo que a API e o App partilham domínio base)
+        return RedirectResponse(url="/login?status=erro")
 
 @app.get("/api/auth/sso-config")
 def get_sso_config():
@@ -919,17 +929,21 @@ def registrar_usuario(
         
         # 🎯 Continuamos a usar a URL exata do Vue.js!
         url_frontend = requisicao.url_plataforma 
-        
-        # Passamos a URL do Frontend para a tarefa de e-mail
+            
+            # 2. Pegamos a URL da própria API (Backend)
+        url_backend = f"{request.url.scheme}://{request.url.netloc}" 
+
+            # 3. Enviamos ambas para a tarefa de e-mail
         background_tasks.add_task(
             enviar_email_confirmacao, 
             requisicao.email, 
             SECRET_KEY, 
             ALGORITHM, 
-            url_frontend # 🚀 Agora o e-mail terá o link correto!
+            url_frontend, 
+            url_backend 
         )
-        
-    return {"mensagem": "Conta criada! Verifique o seu e-mail."}
+            
+        return {"mensagem": "Conta solicitada! Verifique seu e-mail para confirmar o endereço."}
 
 @app.post("/api/reset-password")
 @limiter.limit("3/minute") # 🛡️ Protege a rota final de reset

@@ -592,10 +592,21 @@ def validar_dominio_email(email: str, conn):
     except IndexError:
         raise HTTPException(status_code=400, detail="O formato do e-mail é inválido.")
 
-def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, backend_url: str):
+def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, url_frontend: str, url_backend: str):
     expire = datetime.now(timezone.utc) + timedelta(hours=24)
-    token = jwt.encode({"sub": email_destino, "exp": expire, "tipo_token": "confirmacao_email"}, secret_key, algorithm=algorithm)
-    link_confirmacao = f"{backend_url.rstrip('/')}/api/auth/verificar-email?token={token}"
+    
+    # 🎯 1. EMBUTIR A URL DO SITE NO TOKEN
+    payload = {
+        "sub": email_destino, 
+        "exp": expire, 
+        "tipo_token": "confirmacao_email",
+        "origin": url_frontend  # 👈 O token memoriza de onde o utilizador veio!
+    }
+    token = jwt.encode(payload, secret_key, algorithm=algorithm)
+    
+    # 🎯 2. O LINK DO E-MAIL APONTA PARA A API (Backend)
+    # O clique vai bater no Python primeiro, para ele poder validar o token
+    link_confirmacao = f"{url_backend.rstrip('/')}/api/auth/verificar-email?token={token}"
 
     try:
         access_token = get_valid_access_token()
