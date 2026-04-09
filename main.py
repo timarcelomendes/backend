@@ -13,6 +13,11 @@ from typing import Optional, List, Any
 from contextlib import asynccontextmanager
 import shutil
 from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler # 🛡️ Import correto
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 import pandas as pd
 import bcrypt
@@ -56,7 +61,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 # ==========================================
 # ⏰ 2. LIFESPAN E SCHEDULERS
 # ==========================================
-# 👈 1. O scheduler passa a ser GLOBAL (coloque fora/antes da função lifespan)
 scheduler = BackgroundScheduler()
 
 @asynccontextmanager
@@ -96,6 +100,10 @@ async def lifespan(app: FastAPI):
 # ==========================================
 # 🚀 3. INICIALIZAÇÃO DO APP E MIDDLEWARES
 # ==========================================
+
+# Cria a instância do Limiter baseada no IP do usuário
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="NPS API - Gauge Stefanini",
     description="API centralizada para gestão de NPS, Clientes e Respostas",
@@ -103,22 +111,33 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://blue-sand-0bbaa2010.6.azurestaticapps.net"
+# 🛡️ REGISTO DO RATE LIMITER NO FASTAPI (O que faltava)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# 1. Lê a origem segura do ambiente do servidor (Produção)
+# Se não encontrar nada, o padrão é o localhost para não quebrar a sua máquina
+origem_oficial = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
+origens_permitidas = [
+    origem_oficial
 ]
 
-front_url_azure = os.getenv("FRONTEND_URL")
-if front_url_azure:
-    origins.append(front_url_azure.rstrip("/"))
+# 2. Exceção para Ambiente de Desenvolvimento
+# Só ativa o localhost se a variável AMBIENTE for 'dev'
+if os.getenv("AMBIENTE") == "dev":
+    origens_permitidas.extend([
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ])
 
+# 3. Aplicação do Filtro na API (Rigoroso)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_origin_regex=".*",
+    allow_origins=origens_permitidas,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -571,7 +590,9 @@ def testar_template_html(payload: TesteTemplatePayload, usuario_email: str = Dep
 # ==========================================
 # 🤖 AUTENTICACAO (Login, Registros)
 # ==========================================
+
 @app.post("/api/login")
+@limiter.limit("5/minute") # 🛡️ Limite de 5 tentativas de login por minuto
 async def login(requisicao: LoginRequest, request: Request):
     try:
         engine = get_engine()
@@ -718,10 +739,11 @@ async def login(requisicao: LoginRequest, request: Request):
         )
     
 @app.post("/api/reenviar-confirmacao")
+@limiter.limit("3/minute") # 🛡️ Impede flood de e-mails
 async def reenviar_confirmacao(
     req: ReenviarEmailRequest, 
     request: Request, 
-    background_tasks: BackgroundTasks  # 🎯 Injeções necessárias adicionadas aqui!
+    background_tasks: BackgroundTasks
 ):
     try:
         engine = get_engine()
@@ -754,6 +776,7 @@ async def reenviar_confirmacao(
     
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
+    # (Mantido igual: GET de verificação via link não é atrativo para brute force direto)
     url_frontend = "http://localhost:5173/login" 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -772,61 +795,37 @@ def verificar_email(token: str):
 
 @app.get("/api/auth/sso-config")
 def get_sso_config():
+    # (Mantido igual)
     try:
         from sqlalchemy import text
         engine = get_engine()
         with engine.connect() as conn:
-            # 1. Busca a chave EXATA que acabámos de arrumar
             sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
-            
-            # 2. Busca as chaves da Microsoft
             email_cfg = conn.execute(text("SELECT TOP 1 tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
-            
-            # 🛡️ TRADUTOR UNIVERSAL: Converte o valor do banco para minúsculas e remove espaços
             valor_banco = str(sso_check).strip().lower() if sso_check else 'false'
-            
-            # Se for 'true', '1', 't', 'sim'... ele aceita como Ligado!
             is_ativo = valor_banco in ['true', '1', 't', 'y', 'sim']
             client_id = email_cfg.get("client_id") if email_cfg else None
             
-            # Print para nos ajudar a ver o que está a acontecer no terminal
-            print(f"🕵️ DEBUG LOGIN - Lendo do banco: '{valor_banco}' | Interpretou como LIGADO? {is_ativo}")
-            
-            # Se estiver desligado, avisa o Vue para esconder o botão
-            if not is_ativo:
-                return {"sso_ativo": False, "motivo": "desligado_no_banco"}
+            if not is_ativo: return {"sso_ativo": False, "motivo": "desligado_no_banco"}
+            if not client_id or str(client_id).strip() == "": return {"sso_ativo": False, "motivo": "falta_client_id"}
                 
-            # Se faltarem os IDs, esconde o botão para não dar erro na tela
-            if not client_id or str(client_id).strip() == "":
-                return {"sso_ativo": False, "motivo": "falta_client_id"}
-                
-            # Tudo verde! Manda mostrar o botão.
-            return {
-                "sso_ativo": True,
-                "tenant_id": str(email_cfg.get("tenant_id", "")).strip(),
-                "client_id": str(client_id).strip()
-            }
+            return {"sso_ativo": True, "tenant_id": str(email_cfg.get("tenant_id", "")).strip(), "client_id": str(client_id).strip()}
     except Exception as e:
-        print(f"❌ ERRO SSO-CONFIG: {e}")
         return {"sso_ativo": False, "erro": str(e)}
 
 @app.post("/api/auth/microsoft")
+@limiter.limit("5/minute") # 🛡️ Limite para tentativas de quebra de token
 async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
     print("\n=============================================")
     print(" 🚨 ALERTA: A ROTA DA MICROSOFT FOI CHAMADA!")
     print("=============================================\n")
     try:
         engine = get_engine()
-        
-        # Usamos begin() para garantir que os INSERTS e UPDATES façam commit automaticamente no final
         with engine.begin() as conn: 
-            
-            # 1. Verifica se o SSO está ligado nas configurações
             sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
             if not sso_check or str(sso_check).lower() != 'true':
                 raise HTTPException(status_code=403, detail="O Login com Microsoft está desativado pelo administrador.")
 
-            # 2. Vai à Microsoft verificar de quem é este token
             headers = {'Authorization': f'Bearer {payload.access_token}'}
             graph_response = requests.get('https://graph.microsoft.com/v1.0/me', headers=headers)
             
@@ -834,14 +833,10 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
                 raise HTTPException(status_code=401, detail="Token da Microsoft inválido ou expirado.")
                 
             microsoft_user = graph_response.json()
-            
-            # O email principal pode vir no mail ou no userPrincipalName
             user_email = (microsoft_user.get('mail') or microsoft_user.get('userPrincipalName') or "").lower()
 
-            # 3. BARREIRA DE DOMÍNIO
             validar_dominio_email(user_email, conn)
 
-            # 4. Verifica se a pessoa existe na base de dados
             user_db = conn.execute(text("""
                 SELECT usuario_id, nome, email, cargo, tipo, ativo 
                 FROM dbo.nps_usuarios 
@@ -849,32 +844,19 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             """), {"email": user_email}).mappings().first()
             
             if not user_db:
-                raise HTTPException(
-                    status_code=403, 
-                    detail=f"O e-mail corporativo '{user_email}' não está cadastrado. Solicite a criação da sua conta ao administrador do sistema."
-                )
+                raise HTTPException(status_code=403, detail=f"O e-mail corporativo '{user_email}' não está cadastrado. Solicite a criação da sua conta ao administrador do sistema.")
                 
             if not user_db["ativo"]:
-                raise HTTPException(
-                    status_code=403, 
-                    detail="A sua conta está temporariamente desativada."
-                )
+                raise HTTPException(status_code=403, detail="A sua conta está temporariamente desativada.")
 
-            # 5. Regista a Sessão e Gera o Token JWT nativo
             agora_utc = datetime.now(timezone.utc)
-            
             resultado_tempo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
             tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
             
             expire = agora_utc + timedelta(minutes=tempo_minutos)
-            to_encode = {
-                "sub": user_db["email"],
-                "exp": expire,
-                "tipo": user_db["tipo"]
-            }
+            to_encode = {"sub": user_db["email"], "exp": expire, "tipo": user_db["tipo"]}
             access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-            # 👇 6. CORRIGIDO: Grava a sessão na tabela REAL com as colunas certas
             ip_usuario = request.client.host
             user_agent = request.headers.get("user-agent", "Desconhecido")
             novo_token_id = str(uuid.uuid4()) 
@@ -883,48 +865,34 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
                 INSERT INTO dbo.nps_sessoes_ativas 
                 (usuario_id, token_id, dispositivo, ip_address, localizacao, criado_em, ultima_atividade, revogado) 
                 VALUES (:uid, :tid, :disp, :ip, 'Detetado Automaticamente', :agora, :agora, 0)
-            """), {
-                "uid": user_db["usuario_id"],
-                "tid": novo_token_id,
-                "ip": ip_usuario,
-                "disp": user_agent,
-                "agora": agora_utc
-            })
+            """), {"uid": user_db["usuario_id"], "tid": novo_token_id, "ip": ip_usuario, "disp": user_agent, "agora": agora_utc})
 
-            # 7. Regista Permissões e Atualiza Último Acesso
             sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": user_db["tipo"]}).fetchall()
             lista_permissoes = [row.chave for row in res_perm]
             
             conn.execute(text("UPDATE dbo.nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
             
-            # --- AUDITORIA: LOGIN SSO ---
-            registrar_log(
-                acao="LOGIN_SSO",
-                mensagem=f"Acesso via Microsoft Entra ID (SSO) realizado com sucesso.",
-                nivel="INFO",
-                usuario_id=user_db["usuario_id"]
-            )
+            registrar_log(acao="LOGIN_SSO", mensagem=f"Acesso via Microsoft Entra ID (SSO) realizado com sucesso.", nivel="INFO", usuario_id=user_db["usuario_id"])
 
             return {
-                "access_token": access_token,
-                "token_type": "bearer",
-                "nome": user_db["nome"],
-                "email": user_db["email"],
-                "cargo": user_db["cargo"],
-                "tipo": user_db["tipo"],
-                "permissoes": lista_permissoes,
-                "avatar": user_db.get("avatar_url") or "",
+                "access_token": access_token, "token_type": "bearer", "nome": user_db["nome"],
+                "email": user_db["email"], "cargo": user_db["cargo"], "tipo": user_db["tipo"],
+                "permissoes": lista_permissoes, "avatar": user_db.get("avatar_url") or "",
             }
 
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as e:
         print(f"Erro Auth Microsoft: {e}")
         raise HTTPException(status_code=500, detail="Erro interno no servidor de autenticação.")
     
 @app.post("/api/register")
-def registrar_usuario(requisicao: RegistroRequest, background_tasks: BackgroundTasks, request: Request):
+@limiter.limit("3/minute") # 🛡️ Impede a criação de contas fantasma em massa
+def registrar_usuario(
+    requisicao: RegistroRequest, 
+    background_tasks: BackgroundTasks, 
+    request: Request
+):
     engine = get_engine()
     
     with engine.begin() as conn:
@@ -947,7 +915,6 @@ def registrar_usuario(requisicao: RegistroRequest, background_tasks: BackgroundT
             "senha_hash": senha_hash
         })
         
-        # 👇 ENVIO DE E-MAIL EM BACKGROUND (Não trava a tela)
         url_backend = f"{request.url.scheme}://{request.url.netloc}"
         background_tasks.add_task(enviar_email_confirmacao, requisicao.email, SECRET_KEY, ALGORITHM, url_backend)
         
@@ -955,7 +922,12 @@ def registrar_usuario(requisicao: RegistroRequest, background_tasks: BackgroundT
 
 
 @app.post("/api/reset-password")
-async def resetar_senha(req: ResetPasswordRequest, background_tasks: BackgroundTasks):
+@limiter.limit("3/minute") # 🛡️ Protege a rota final de reset
+async def resetar_senha(
+    req: ResetPasswordRequest, 
+    request: Request, # 🛡️ INJEÇÃO OBRIGATÓRIA PARA O LIMITER
+    background_tasks: BackgroundTasks
+):
     from database import get_engine 
     engine = get_engine()
     
@@ -986,46 +958,43 @@ async def resetar_senha(req: ResetPasswordRequest, background_tasks: BackgroundT
             if resultado.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
             
-        # 🚀 DISPARA O E-MAIL DE CONFIRMAÇÃO EM SEGUNDO PLANO
         from services.email_svc import enviar_email_senha_alterada
         background_tasks.add_task(enviar_email_senha_alterada, email_usuario)
             
         return {"status": "success", "message": "Palavra-passe alterada com sucesso!"}
             
-    except HTTPException:
-        raise
+    except HTTPException: raise
     except Exception as e:
-        # 🚨 ALERTA TI: Falha ao escrever a nova senha na base de dados
         enviar_alerta_tecnico_teams(f"Falha ao atualizar a Hash de Palavra-passe no BD: {str(e)}")
         print(f"❌ Erro ao redefinir a palavra-passe no banco: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao guardar a nova palavra-passe.")
 
+
 @app.post("/api/esqueci-senha")
-async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_tasks: BackgroundTasks):
+@limiter.limit("3/minute") # 🛡️ Impede flood na caixa de correio do usuário
+async def solicitar_recuperacao(
+    requisicao: EsqueciSenhaRequest, 
+    request: Request, # 🛡️ INJEÇÃO OBRIGATÓRIA PARA O LIMITER LER O IP
+    background_tasks: BackgroundTasks
+):
     engine = get_engine()
-    
-    # 1. BLINDAGEM PYTHON: Remove espaços no início/fim e força tudo para minúsculas
     email_limpo = requisicao.email.strip().lower()
     
     try:
         with engine.connect() as conn:
-            # 2. BLINDAGEM SQL: LTRIM e RTRIM removem espaços no banco, LOWER iguala as letras
             query = text("""
                 SELECT email 
                 FROM dbo.nps_usuarios 
                 WHERE LOWER(LTRIM(RTRIM(email))) = :email
             """)
             
-            # Passamos o email_limpo para a query
             resultado = conn.execute(query, {"email": email_limpo}).mappings().first()
             
             if not resultado:
                 print(f"ℹ️ Recuperação solicitada para e-mail inexistente: '{email_limpo}'")
                 return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
 
-            # Usamos o e-mail exato devolvido pelo banco para garantir consistência
             email_banco = resultado['email']
-
             expira = datetime.utcnow() + timedelta(minutes=30)
             token = jwt.encode(
                 {"sub": email_banco, "exp": expira, "tipo": "reset"}, 
@@ -1034,14 +1003,11 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, background_task
             )
             
             print(f"📧 A disparar e-mail de recuperação para: {email_banco}")
-            
-            # 3. Integração com o novo email_svc.py premium (que agora recebe o token)
             background_tasks.add_task(enviar_email_recuperacao, email_banco, token)
                 
         return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
     
     except Exception as e:
-        # 🚨 ALERTA TI: Falha ao gerar o token JWT ou conectar à Base de Dados
         enviar_alerta_tecnico_teams(f"Falha ao gerar E-mail de Recuperação de Senha: {str(e)}")
         print(f"❌ ERRO CRÍTICO NO FORGOT PASSWORD: {str(e)}")
         traceback.print_exc()
@@ -3267,6 +3233,11 @@ async def atualizar_usuario(usuario_id: str, data: dict, admin_email: str = Depe
 @app.get("/api/config/email")
 async def buscar_config_email():
     try:
+        from database import get_engine
+        from sqlalchemy import text
+        from fastapi import HTTPException
+        from services.crypto_svc import decrypt_data 
+        
         engine = get_engine()
         with engine.connect() as conn:
             # 1. Busca as credenciais de e-mail
@@ -3275,11 +3246,17 @@ async def buscar_config_email():
             
             dados = dict(res._mapping) if res else {}
             
-            # 2. Busca o estado da Chave Mestra e do SSO
+            # 🎯 2. DESCRIPTOGRAFA PARA EXIBIR NO ECRÃ DO VUE.JS
+            if dados.get("client_secret"):
+                dados["client_secret"] = decrypt_data(dados["client_secret"])
+            if dados.get("refresh_token"):
+                dados["refresh_token"] = decrypt_data(dados["refresh_token"])
+            
+            # 3. Busca o estado da Chave Mestra e do SSO
             query_vars = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('envios_ativos', 'sso_microsoft_ativo')")
             res_vars = conn.execute(query_vars).fetchall()
             
-            # 👇 CORREÇÃO: O nome da variável devolvida ao Vue DEVE ser sso_microsoft_ativo
+            # O nome da variável devolvida ao Vue DEVE ser sso_microsoft_ativo
             dados["envios_ativos"] = True
             dados["sso_microsoft_ativo"] = False 
             
@@ -3287,37 +3264,57 @@ async def buscar_config_email():
                 if row.chave == 'envios_ativos':
                     dados["envios_ativos"] = str(row.valor).lower() == 'true'
                 elif row.chave == 'sso_microsoft_ativo':
-                    dados["sso_microsoft_ativo"] = str(row.valor).lower() == 'true' # 👇 CORREÇÃO AQUI TAMBÉM
+                    dados["sso_microsoft_ativo"] = str(row.valor).lower() == 'true' 
                 
             return dados
+            
     except Exception as e:
+        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
+
+from services.crypto_svc import encrypt_data, decrypt_data
 
 @app.post("/api/config/email")
 async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depends(exigir_admin)):
     engine = get_engine()
     try:
+        # 🎯 ENCRIPTAMOS o segredo se ele foi preenchido no formulário
+        secret_protegido = encrypt_data(config.client_secret) if config.client_secret else ""
+
         with engine.begin() as conn: 
             admin_id = conn.execute(
                 text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), 
                 {"e": admin_email}
             ).scalar()
 
-            # 1. Atualiza as credenciais da Microsoft (Mantém igual)
+            # 1. Atualiza as credenciais da Microsoft (Agora com proteção)
             existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes_email")).scalar()
             if existe:
                 conn.execute(text("""
                     UPDATE dbo.nps_configuracoes_email 
-                    SET tenant_id = :t, client_id = :c, client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
+                    SET tenant_id = :t, client_id = :c, 
+                        client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
                         email_remetente = :e, base_url_frontend = :b, atualizado_em = GETDATE()
-                """), {"t": config.tenant_id, "c": config.client_id, "s": config.client_secret, "e": config.email_remetente, "b": config.base_url_frontend})
+                """), {
+                    "t": config.tenant_id, 
+                    "c": config.client_id, 
+                    "s": secret_protegido, # 🛡️ Valor encriptado ou vazio
+                    "e": config.email_remetente, 
+                    "b": config.base_url_frontend
+                })
             else:
                 conn.execute(text("""
                     INSERT INTO dbo.nps_configuracoes_email (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
                     VALUES (:t, :c, :s, :e, :b, GETDATE())
-                """), {"t": config.tenant_id, "c": config.client_id, "s": config.client_secret, "e": config.email_remetente, "b": config.base_url_frontend})
+                """), {
+                    "t": config.tenant_id, 
+                    "c": config.client_id, 
+                    "s": secret_protegido, 
+                    "e": config.email_remetente, 
+                    "b": config.base_url_frontend
+                })
             
-            # --- PREPARAÇÃO DO UPSERT DE CONFIGURAÇÕES ---
+            # --- (O resto do seu código de logs e toggles permanece igual) ---
             sql_upsert_cfg = text("""
                 IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
                     UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
@@ -3325,45 +3322,22 @@ async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depe
                     INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
             """)
 
-            # ==============================================================
-            # TOGGLE 1: MOTOR DE DISPAROS DE E-MAIL
-            # ==============================================================
+            # Toggle: Motor
             estado_motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
             novo_motor = 'true' if config.envios_ativos else 'false'
-            
             if estado_motor != novo_motor:
-                registrar_log(
-                    acao="CONFIG_MOTOR",
-                    mensagem=f"O utilizador {'ATIVOU' if config.envios_ativos else 'DESATIVOU'} o Motor de Disparos de E-mail.",
-                    nivel="WARN",
-                    usuario_id=admin_id
-                )
+                registrar_log(acao="CONFIG_MOTOR", mensagem=f"O utilizador {'ATIVOU' if config.envios_ativos else 'DESATIVOU'} o Motor.", nivel="WARN", usuario_id=admin_id)
             conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": novo_motor})
 
-
-            # ==============================================================
-            # TOGGLE 2: ROBÔ AUTOMÁTICO (Background)
-            # ==============================================================
-            # Ajuste 'robo_ativo' para o nome da variável enviada pelo seu Vue.js
+            # Toggle: Robô
             estado_robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
-            
-            # Usamos getattr por segurança, caso a propriedade falhe
             novo_robo_bool = getattr(config, 'robo_ativo', False)
             novo_robo = 'true' if novo_robo_bool else 'false'
-
             if estado_robo != novo_robo:
-                registrar_log(
-                    acao="CONFIG_ROBO",
-                    mensagem=f"O utilizador {'ATIVOU' if novo_robo_bool else 'DESATIVOU'} o Robô Automático (Disparos em Background).",
-                    nivel="WARN",
-                    usuario_id=admin_id
-                )
+                registrar_log(acao="CONFIG_ROBO", mensagem=f"O utilizador {'ATIVOU' if novo_robo_bool else 'DESATIVOU'} o Robô.", nivel="WARN", usuario_id=admin_id)
             conn.execute(sql_upsert_cfg, {"chave": "robo_ativo", "valor": novo_robo})
 
-
-            # ==============================================================
-            # SSO MICROSOFT
-            # ==============================================================
+            # SSO
             conn.execute(sql_upsert_cfg, {"chave": "sso_microsoft_ativo", "valor": 'true' if config.sso_microsoft_ativo else 'false'})
 
         return {"status": "sucesso", "mensagem": "Configurações e auditoria atualizadas."}
@@ -3376,41 +3350,46 @@ async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depe
 async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
     engine = get_engine()
     with engine.connect() as conn:
-        config = conn.execute(text("""
+        config_row = conn.execute(text("""
             SELECT TOP 1 tenant_id, client_id, client_secret, base_url_frontend 
             FROM dbo.nps_configuracoes_email
         """)).fetchone()
         
-        if not config:
+        if not config_row:
             raise HTTPException(status_code=400, detail="Configurações não encontradas no banco.")
 
-        # 🟢 SINCRONIZAÇÃO: O Backend deve gerar a MESMA URI que o Frontend gerou
-        base_url = config.base_url_frontend.strip().rstrip('/')
+        config = dict(config_row._mapping)
+
+        # 🔓 DESCRIPTOGRAFIA: Recuperamos o segredo real para falar com a Microsoft
+        secret_real = decrypt_data(config['client_secret'])
+
+        base_url = config['base_url_frontend'].strip().rstrip('/')
         redirect_uri = f"{base_url}/configuracoes"
 
-        url = f"https://login.microsoftonline.com/{config.tenant_id}/oauth2/v2.0/token"
+        url = f"https://login.microsoftonline.com/{config['tenant_id']}/oauth2/v2.0/token"
         
         payload = {
-            'client_id': config.client_id,
-            'client_secret': config.client_secret, # Certifique-se que este é o VALOR e não o ID
+            'client_id': config['client_id'],
+            'client_secret': secret_real, # Enviamos o valor real (em memória)
             'code': requisicao.code,
             'grant_type': 'authorization_code',
             'redirect_uri': redirect_uri, 
             'scope': 'offline_access mail.send'
         }
                 
-        # Chamada para a Microsoft
         res_raw = requests.post(url, data=payload)
         res = res_raw.json()
 
-        # Se a Microsoft devolver erro, o log dirá exatamente porquê (Ex: invalid_client)
         if "refresh_token" not in res:
             print(f"❌ Erro Microsoft: {res}") 
             raise HTTPException(status_code=400, detail=res.get("error_description", "Falha no token"))
 
-        conn.execute(text("UPDATE dbo.nps_configuracoes_email SET refresh_token = :rt, atualizado_em = GETDATE()"), 
-                     {"rt": res["refresh_token"]})
-        conn.commit()
+        # 🎯 ENCRIPTOGRAFIA: Protegemos o token devolvido antes de o guardar no SQL
+        token_protegido = encrypt_data(res["refresh_token"])
+
+        with engine.begin() as conn_tx:
+            conn_tx.execute(text("UPDATE dbo.nps_configuracoes_email SET refresh_token = :rt, atualizado_em = GETDATE()"), 
+                         {"rt": token_protegido})
         
     return {"status": "conectado"}
 

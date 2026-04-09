@@ -82,6 +82,17 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
 
     # Busca o ID da empresa através do JOIN e cruza com a Fila de Disparos
     sql = f"""
+    -- 👇 CTE to get only the latest dispatch for each client
+    WITH LatestDisparo AS (
+        SELECT 
+            cliente_id,
+            data_envio_inicial,
+            data_ultimo_lembrete,
+            status,
+            lembretes_enviados,
+            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_envio_inicial, created_at) DESC) as rn
+        FROM dbo.nps_disparos
+    )
     SELECT TOP ({int(topn)})
         c.cliente_id, 
         c.nome, 
@@ -119,7 +130,8 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int) -> pd.DataFrame:
     LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
     LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id
     LEFT JOIN dbo.nps_cargos cg ON c.cargo_id = cg.id
-    LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+    -- 👇 Join with the CTE instead of the raw table, filtering for rn = 1
+    LEFT JOIN LatestDisparo d ON c.cliente_id = d.cliente_id AND d.rn = 1
     {where_sql}
     ORDER BY c.updated_at DESC;
     """

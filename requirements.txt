@@ -23,6 +23,7 @@ bcrypt
 pyjwt
 email-validator
 cryptography
+slowapi
 
 # ==========================================
 # 🛠️ UTILITÁRIOS E DADOS

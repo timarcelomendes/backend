@@ -1,7 +1,7 @@
 import os
 import re
 import requests
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 import urllib.parse
 from database import get_engine
 from fastapi import HTTPException
@@ -179,48 +179,60 @@ def enviar_email_recuperacao(email_destino, token):
     
     payload = {
         "message": {
-            "subject": "Recuperação de Palavra-passe - NPS Intelligence",
+            "subject": "Redefinição de Palavra-passe - NPS Intelligence",
             "body": {
                 "contentType": "HTML",
                 "content": f"""
                 <!DOCTYPE html>
                 <html>
-                <body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
-                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f8fafc; padding: 40px 20px;">
+                <head>
+                    <meta charset="utf-8">
+                </head>
+                <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f1f5f9; padding: 40px 20px;">
                         <tr>
                             <td align="center">
-                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 20px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; overflow: hidden;">
+                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden;">
                                     <tr>
-                                        <td align="center" style="padding: 40px 20px 20px 20px;">
-                                            <span style="font-size: 28px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
+                                        <td align="center" style="padding: 35px 20px 20px 20px; border-bottom: 1px solid #f8fafc;">
+                                            <span style="font-size: 26px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
                                                 NPS <span style="color: #f97316;">Intelligence</span>
                                             </span>
                                         </td>
                                     </tr>
                                     <tr>
-                                        <td style="padding: 0 40px 30px 40px; text-align: left;">
-                                            <h2 style="color: #0f172a; font-size: 20px; margin-bottom: 15px; font-weight: 800; letter-spacing: -0.5px;">Recuperação de Acesso</h2>
-                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin-bottom: 25px;">
-                                                Recebemos um pedido para repor a palavra-passe associada à sua conta corporativa. Clique no botão abaixo para criar uma nova palavra-passe de acesso à plataforma.
+                                        <td style="padding: 35px 40px 25px 40px; text-align: left;">
+                                            <h2 style="color: #0f172a; font-size: 22px; margin: 0 0 15px 0; font-weight: 800; letter-spacing: -0.5px;">Recuperação de Acesso</h2>
+                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 25px 0;">
+                                                Olá,<br><br>
+                                                Recebemos um pedido para repor a palavra-passe associada à sua conta. Se foi você que fez este pedido, clique no botão abaixo para escolher uma nova palavra-passe segura.
                                             </p>
-                                            <table width="100%" cellpadding="0" cellspacing="0">
+                                            
+                                            <table width="100%" border="0" cellspacing="0" cellpadding="0">
                                                 <tr>
                                                     <td align="center" style="padding: 10px 0 30px 0;">
-                                                        <a href="{link_recuperacao}" target="_blank" style="display: inline-block; background-color: #f97316; background-image: linear-gradient(to right, #f97316, #e11d48); color: #ffffff; font-size: 14px; font-weight: bold; text-decoration: none; padding: 16px 32px; border-radius: 12px; text-transform: uppercase; letter-spacing: 2px;">
-                                                            Criar Nova Palavra-passe
-                                                        </a>
+                                                        <table border="0" cellspacing="0" cellpadding="0">
+                                                            <tr>
+                                                                <td align="center" style="border-radius: 10px; background-color: #f97316;">
+                                                                    <a href="{link_recuperacao}" target="_blank" style="font-size: 15px; font-weight: bold; color: #ffffff; text-decoration: none; padding: 14px 30px; display: inline-block; border-radius: 10px; text-transform: uppercase; letter-spacing: 1px;">
+                                                                        Criar Nova Palavra-passe
+                                                                    </a>
+                                                                </td>
+                                                            </tr>
+                                                        </table>
                                                     </td>
                                                 </tr>
                                             </table>
-                                            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin-bottom: 0;">
-                                                <strong>Atenção:</strong> Este link é válido apenas por <strong>1 hora</strong>. Se o prazo expirar, terá de solicitar um novo link de recuperação.
+                                            
+                                            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin: 0; background-color: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #cbd5e1;">
+                                                <strong>Atenção:</strong> Por motivos de segurança, este link é válido apenas por <strong>1 hora</strong>.
                                             </p>
                                         </td>
                                     </tr>
                                     <tr>
-                                        <td style="background-color: #f1f5f9; padding: 25px 40px; border-top: 1px solid #e2e8f0;">
+                                        <td style="background-color: #f8fafc; padding: 25px 40px; border-top: 1px solid #e2e8f0;">
                                             <p style="margin: 0; color: #64748b; font-size: 12px; line-height: 1.5; text-align: center;">
-                                                Se não pediu a reposição da palavra-passe, pode ignorar este e-mail com segurança. A sua conta continuará protegida.
+                                                Se não solicitou a redefinição da sua palavra-passe, pode ignorar e apagar este e-mail com segurança. A sua conta permanecerá protegida.
                                             </p>
                                         </td>
                                     </tr>
@@ -254,33 +266,67 @@ def enviar_email_recuperacao(email_destino, token):
         registrar_log_disparo(email_destino, "Utilizador", "Erro", "Recuperação de Palavra-passe - NPS Intelligence", erro=str(e), url=link_recuperacao)
         return False
     
+
 def enviar_email_senha_alterada(email_destino):
+    """Envia o e-mail de confirmação de segurança com design corporativo."""
     access_token = get_valid_access_token()
     if not access_token:
         print("❌ Falha crítica: Não foi possível obter Access Token para confirmação de senha.")
         return False
 
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
+    
     payload = {
         "message": {
-            "subject": "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence",
+            "subject": "Aviso de Segurança: Palavra-passe Atualizada - NPS Intelligence",
             "body": {
                 "contentType": "HTML",
                 "content": f"""
-                <div style="font-family: sans-serif; color: #334155; max-width: 500px; padding: 25px; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
-                    <div style="text-align: center; margin-bottom: 20px;">
-                        <span style="font-size: 24px; font-weight: 900; color: #0f172a; font-style: italic;">NPS <span style="color: #f97316;">Intelligence</span></span>
-                    </div>
-                    <h2 style="color: #10b981; margin-top: 0;">Senha Alterada com Sucesso</h2>
-                    <p>Olá,</p>
-                    <p>Confirmamos que a senha da sua conta foi alterada recentemente.</p>
-                    <div style="margin: 30px 0; padding: 15px; background-color: #fef2f2; border-left: 4px solid #ef4444; border-radius: 4px;">
-                        <p style="margin: 0; color: #991b1b; font-size: 14px;">
-                            <strong>Não foi você?</strong><br>
-                            Se não solicitou esta alteração, contacte imediatamente o administrador do sistema.
-                        </p>
-                    </div>
-                </div>
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                </head>
+                <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f1f5f9; padding: 40px 20px;">
+                        <tr>
+                            <td align="center">
+                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden;">
+                                    <tr>
+                                        <td align="center" style="padding: 35px 20px 20px 20px; border-bottom: 1px solid #f8fafc;">
+                                            <span style="font-size: 26px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
+                                                NPS <span style="color: #f97316;">Intelligence</span>
+                                            </span>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 35px 40px 30px 40px; text-align: left;">
+                                            <h2 style="color: #0f172a; font-size: 22px; margin: 0 0 15px 0; font-weight: 800; letter-spacing: -0.5px;">Palavra-passe Atualizada</h2>
+                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 30px 0;">
+                                                Olá,<br><br>
+                                                A palavra-passe da sua conta foi alterada com sucesso. Já pode aceder novamente à plataforma com as suas novas credenciais.
+                                            </p>
+                                            
+                                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #fef2f2; border-left: 4px solid #ef4444; border-radius: 6px;">
+                                                <tr>
+                                                    <td style="padding: 15px 20px;">
+                                                        <p style="margin: 0 0 5px 0; color: #991b1b; font-size: 14px; font-weight: bold;">
+                                                            Não reconhece esta ação?
+                                                        </p>
+                                                        <p style="margin: 0; color: #991b1b; font-size: 13px; line-height: 1.5;">
+                                                            Se não foi você que alterou a palavra-passe, contacte o suporte ou o administrador de TI imediatamente para proteger a sua conta.
+                                                        </p>
+                                                    </td>
+                                                </tr>
+                                            </table>
+                                        </td>
+                                    </tr>
+                                </table>
+                            </td>
+                        </tr>
+                    </table>
+                </body>
+                </html>
                 """
             },
             "toRecipients": [{"emailAddress": {"address": email_destino}}]
@@ -431,14 +477,21 @@ def processar_disparos_nps():
         
 def disparar_convite_nps_especifico(cliente_ids: list, dominio_origem: str = None):
     if not cliente_ids: return
+    
     from database import get_engine
     engine = get_engine()
-    ids_formatados = ",".join([f"'{cid}'" for cid in cliente_ids])
-    sql_busca = text(f"SELECT c.cliente_id, c.email, c.nome, c.empresa, e.id AS empresa_id FROM dbo.nps_clientes c LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome WHERE c.cliente_id IN ({ids_formatados})")
+    
+    sql_busca = text("""
+        SELECT c.cliente_id, c.email, c.nome, c.empresa, e.id AS empresa_id 
+        FROM dbo.nps_clientes c 
+        LEFT JOIN dbo.nps_empresas e ON c.empresa = e.nome 
+        WHERE c.cliente_id IN :lista_ids
+    """).bindparams(bindparam('lista_ids', expanding=True))
     
     try:
         with engine.connect() as conn:
-            clientes = conn.execute(sql_busca).mappings().all()
+            clientes = conn.execute(sql_busca, {"lista_ids": cliente_ids}).mappings().all()
+            
         if not clientes: return
 
         access_token = get_valid_access_token() 
