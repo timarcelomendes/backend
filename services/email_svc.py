@@ -18,9 +18,9 @@ def registrar_log_disparo(email, nome, status, assunto, erro=None, cliente_id=No
         with engine.begin() as conn:
             sql = text("""
                 INSERT INTO dbo.nps_disparos 
-                (cliente_id, empresa_id, nome, email, status, survey_url, erro_msg, data_envio_inicial, created_at, lembretes_enviados)
+                (cliente_id, empresa_id, nome, email, status, assunto, survey_url, erro_msg, data_envio_inicial, created_at, lembretes_enviados)
                 VALUES 
-                (:cid, :eid, :nome, :email, :status, :url, :erro, GETDATE(), GETDATE(), 0)
+                (:cid, :eid, :nome, :email, :status, :assunto, :url, :erro, GETDATE(), GETDATE(), 0)
             """)
             conn.execute(sql, {
                 "cid": cliente_id,
@@ -28,6 +28,7 @@ def registrar_log_disparo(email, nome, status, assunto, erro=None, cliente_id=No
                 "nome": nome or "Utilizador Sistema",
                 "email": email,
                 "status": status,
+                "assunto": assunto,
                 "url": url,
                 "erro": str(erro) if erro else None
             })
@@ -647,14 +648,13 @@ import re
 
 def validar_senha_forte(password: str):
     """
-    Critérios:
-    - Mínimo 8 caracteres
-    - Pelo menos uma letra maiúscula
-    - Pelo menos um número
-    - Pelo menos um caractere especial (@$!%*?&)
+    Critérios de segurança atualizados para evitar estouro do Bcrypt
     """
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 8 caracteres.")
+    
+    if len(password) > 70:
+        raise HTTPException(status_code=400, detail="A senha é demasiado longa. O limite é de 70 caracteres.")
     
     if not re.search(r"[A-Z]", password):
         raise HTTPException(status_code=400, detail="A senha deve conter pelo menos uma letra maiúscula.")
@@ -663,4 +663,4 @@ def validar_senha_forte(password: str):
         raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um número.")
         
     if not re.search(r"[@$!%*?&]", password):
-        raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um caractere especial (@$!%*?&).")
+        raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um caractere especial.")
