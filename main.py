@@ -717,7 +717,14 @@ async def login(requisicao: LoginRequest, request: Request):
                 "exp": expire,
                 "tipo": resultado["tipo"]
             }
+
             access_token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+            avatar_final = ""
+            if resultado.get("avatar_url"):
+                base_url = str(request.base_url).rstrip("/")
+                db_path = resultado["avatar_url"]
+                avatar_final = db_path if db_path.startswith('http') else f"{base_url}{db_path}"
 
             sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
@@ -732,7 +739,7 @@ async def login(requisicao: LoginRequest, request: Request):
                 "cargo": resultado["cargo"],
                 "tipo": resultado["tipo"],
                 "permissoes": lista_permissoes,
-                "avatar": resultado.get("avatar_url") or "",
+                "avatar_url": avatar_final 
             }
 
     except HTTPException:
@@ -3583,44 +3590,46 @@ async def upload_meu_avatar(file: UploadFile = File(...), usuario_email: str = D
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            # 1. Pega os dados do usuário atual
+            # 1. Busca dados do utilizador
             user = conn.execute(text("SELECT usuario_id, avatar_url FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
             if not user:
-                raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+                raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
 
-            # 2. Prepara a pasta de Avatares
+            # 2. Pasta de destino
             AVATAR_PATH = "uploads/avatars"
             os.makedirs(AVATAR_PATH, exist_ok=True)
 
-            # 3. Gera um nome único e seguro para não substituir arquivos de outros
+            # 3. Nome único
             ext = os.path.splitext(file.filename)[1]
             novo_nome = f"avatar_{user['usuario_id']}_{uuid.uuid4().hex}{ext}"
-            caminho_completo = os.path.join(AVATAR_PATH, novo_nome)
+            caminho_fisico = os.path.join(AVATAR_PATH, novo_nome)
 
-            # 4. Salva a nova imagem no servidor
-            with open(caminho_completo, "wb") as buffer:
+            # 4. Grava o ficheiro no disco
+            with open(caminho_fisico, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-            # 5. Remove a foto antiga do servidor (Limpeza)
+            # 5. Limpeza da foto antiga (Lógica melhorada para caminhos relativos ou absolutos)
             if user.get('avatar_url'):
-                antigo_relativo = user['avatar_url'].split('/uploads/')[-1]
-                antigo_fisico = os.path.join("uploads", antigo_relativo)
-                if os.path.exists(antigo_fisico):
-                    try: os.remove(antigo_fisico)
+                # Extrai apenas o nome do ficheiro, ignorando se era localhost ou relativo
+                foto_antiga = user['avatar_url'].split('/')[-1]
+                caminho_antigo = os.path.join(AVATAR_PATH, foto_antiga)
+                if os.path.exists(caminho_antigo):
+                    try: os.remove(caminho_antigo)
                     except: pass
 
-            # 6. Salva a nova URL no Banco de Dados
-            base_url = str(request.base_url).rstrip("/")
-            url_publica = f"{base_url}/uploads/avatars/{novo_nome}"
+            # 🎯 6. Salva apenas o caminho relativo (Ex: /uploads/avatars/foto.jpg)
+            url_relativa = f"/uploads/avatars/{novo_nome}"
             
             conn.execute(text("UPDATE dbo.nps_usuarios SET avatar_url = :url WHERE usuario_id = :id"), 
-                         {"url": url_publica, "id": user['usuario_id']})
+                         {"url": url_relativa, "id": user['usuario_id']})
             
-            return {"status": "success", "avatar_url": url_publica}
+            # 7. Retorna a URL completa apenas para o Frontend exibir agora
+            base_url = str(request.base_url).rstrip("/")
+            return {"status": "success", "avatar_url": f"{base_url}{url_relativa}"}
             
     except Exception as e:
-        print(f"❌ Erro no upload do avatar: {e}")
-        raise HTTPException(status_code=500, detail="Erro interno ao salvar a imagem.")
+        print(f"❌ Erro no upload: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao processar imagem.")
 
 @app.delete("/api/usuarios/me/avatar")
 async def remover_meu_avatar(usuario_email: str = Depends(get_current_user)):
