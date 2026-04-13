@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 import shutil
 from fastapi.staticfiles import StaticFiles
 from fastapi import FastAPI, Request
-from slowapi import Limiter, _rate_limit_exceeded_handler # 🛡️ Import correto
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -40,23 +40,11 @@ from apscheduler.triggers.cron import CronTrigger
 
 # Importações Locais
 from database import get_engine, exec_sql
-from services.auth_utils import hash_password
-from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email, enviar_email_confirmacao, validar_senha_forte
+from services.email_svc import enviar_email_recuperacao, processar_disparos_nps, validar_dominio_email, enviar_email_confirmacao, validar_senha_forte, enviar_email_senha_alterada
 from services import clientes_svc, respostas_svc, dashboard_svc, importacao_svc
-from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams 
-from services.webhook_svc import processar_webhook_background
-
-# ==========================================
-# ⚙️ 1. CONFIGURAÇÕES E SEGURANÇA
-# ==========================================
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-if not SECRET_KEY:
-    raise RuntimeError("ERRO CRÍTICO: JWT_SECRET_KEY não configurada nas variáveis de ambiente.")
-
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 2
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+from services.teams_svc import enviar_resumo_matinal_gestores, enviar_alerta_tecnico_teams
+from services.auth_svc import oauth2_scheme, SECRET_KEY, ALGORITHM, get_current_user, hash_password, verify_password, create_access_token, exigir_admin, exigir_manager, pwd_context
+from routers import chat
 
 # ==========================================
 # ⏰ 2. LIFESPAN E SCHEDULERS
@@ -110,22 +98,21 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+# ==========================================
+# 🚀 REGISTO DE ROUTERS (Coloque Aqui)
+# ==========================================
+app.include_router(chat.router, prefix="/api")
 
-# 🛡️ REGISTO DO RATE LIMITER NO FASTAPI (O que faltava)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# 1. Lê a origem segura do ambiente do servidor (Produção)
-# Se não encontrar nada, o padrão é o localhost para não quebrar a sua máquina
 origem_oficial = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 
 origens_permitidas = [
     origem_oficial
 ]
 
-# 2. Exceção para Ambiente de Desenvolvimento
-# Só ativa o localhost se a variável AMBIENTE for 'dev'
 if os.getenv("AMBIENTE") == "dev":
     origens_permitidas.extend([
         "http://localhost:5173",
@@ -169,44 +156,6 @@ from fastapi import Depends, HTTPException, status
 from jose import jwt, JWTError, ExpiredSignatureError
 
 # ==========================================
-# 🔐 4. DEPENDÊNCIAS DE AUTENTICAÇÃO
-# ==========================================
-
-async def get_current_user_token_data(token: str = Depends(oauth2_scheme)):
-    """Descodifica o token, valida a expiração e devolve o payload completo"""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Sessão expirada ou inválida. Por favor, faça login novamente.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        # A validação de expiração (verify_exp=True) é o padrão, mas deixamos explícito
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": True})
-        
-        if payload.get("sub") is None:
-            raise credentials_exception
-            
-        return payload
-    except (ExpiredSignatureError, JWTError):
-        raise credentials_exception
-
-async def get_current_user(token_data: dict = Depends(get_current_user_token_data)):
-    """Devolve apenas o e-mail do utilizador (Para rotas comuns)"""
-    return token_data.get("sub")
-
-def exigir_admin(token_data: dict = Depends(get_current_user_token_data)):
-    """Protege a rota exigindo o cargo de Admin"""
-    if token_data.get("tipo") != "Admin":
-        raise HTTPException(status_code=403, detail="Acesso negado. Apenas Administradores.")
-    return token_data.get("sub")
-
-def exigir_manager(token_data: dict = Depends(get_current_user_token_data)):
-    """Protege a rota exigindo o cargo de Manager ou Admin"""
-    if token_data.get("tipo") not in ["Admin", "Manager"]:
-        raise HTTPException(status_code=403, detail="Acesso negado. Requer nível Manager ou superior.")
-    return token_data.get("sub")
-
-# ==========================================
 # 📦 5. SCHEMAS (Pydantic Models)
 # Validam os dados que chegam do Frontend
 # ==========================================
@@ -219,6 +168,7 @@ class AcaoCriar(BaseModel):
     descricao: Optional[str] = ""
     prioridade: Optional[str] = "Alta"
     prazo_limite: Optional[str] = None
+    resolucao: Optional[str] = None
 
 class AcaoAtualizar(BaseModel):
     status: Optional[str] = None
@@ -227,6 +177,7 @@ class AcaoAtualizar(BaseModel):
     prazo_limite: Optional[str] = None
     gestor_id: Optional[int] = None
     empresa_id: Optional[int] = None
+    resolucao: Optional[str] = None
 
 class BasicoSchema(BaseModel):
     nome: str
@@ -709,9 +660,12 @@ async def login(requisicao: LoginRequest, request: Request):
 
             conn.commit() 
 
+            # 🎯 1. Define o delta correto
             expires_delta = timedelta(days=30) if requisicao.remember else timedelta(minutes=tempo_minutos)
 
-            expire = datetime.utcnow() + timedelta(hours=8)
+            # 🎯 2. Usa o delta no cálculo da expiração (em vez das 8 horas fixas)
+            expire = datetime.utcnow() + expires_delta 
+
             to_encode = {
                 "sub": resultado["email"],
                 "exp": expire,
@@ -943,6 +897,7 @@ def registrar_usuario(
         background_tasks.add_task(
             enviar_email_confirmacao, 
             requisicao.email, 
+            requisicao.nome,
             SECRET_KEY, 
             ALGORITHM, 
             url_frontend, 
@@ -955,7 +910,7 @@ def registrar_usuario(
 @limiter.limit("3/minute") # 🛡️ Protege a rota final de reset
 async def resetar_senha(
     req: ResetPasswordRequest, 
-    request: Request, # 🛡️ INJEÇÃO OBRIGATÓRIA PARA O LIMITER
+    request: Request, 
     background_tasks: BackgroundTasks
 ):
     from database import get_engine 
@@ -992,8 +947,15 @@ async def resetar_senha(
             if resultado.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
             
+            res_user = conn.execute(
+                text("SELECT nome FROM dbo.nps_usuarios WHERE email = :email"),
+                {"email": email_usuario}
+            ).mappings().first()
+            
+            nome_usuario = res_user['nome'] if res_user else "Utilizador"
+
         from services.email_svc import enviar_email_senha_alterada
-        background_tasks.add_task(enviar_email_senha_alterada, email_usuario)
+        background_tasks.add_task(enviar_email_senha_alterada, email_usuario, nome_usuario)
             
         return {"status": "success", "message": "Palavra-passe alterada com sucesso!"}
             
@@ -1005,18 +967,15 @@ async def resetar_senha(
 
 @app.post("/api/esqueci-senha")
 @limiter.limit("3/minute")
-async def solicitar_recuperacao(
-    requisicao: EsqueciSenhaRequest, 
-    request: Request,
-    background_tasks: BackgroundTasks
-):
+async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, request: Request, background_tasks: BackgroundTasks):
     engine = get_engine()
     email_limpo = requisicao.email.strip().lower()
     
     try:
         with engine.connect() as conn:
+            # 🎯 CORREÇÃO: Adicionado 'nome' no SELECT
             query = text("""
-                SELECT email 
+                SELECT email, nome 
                 FROM dbo.nps_usuarios 
                 WHERE LOWER(LTRIM(RTRIM(email))) = :email
             """)
@@ -1024,51 +983,39 @@ async def solicitar_recuperacao(
             resultado = conn.execute(query, {"email": email_limpo}).mappings().first()
             
             if not resultado:
-                print(f"ℹ️ Recuperação solicitada para e-mail inexistente: '{email_limpo}'")
-                return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
+                return {"mensagem": "Se o e-mail existir, você receberá um link em breve."}
 
             email_banco = resultado['email']
-            expira = datetime.utcnow() + timedelta(minutes=30)
+            nome_banco = resultado['nome']
+            
             token = jwt.encode(
-                {"sub": email_banco, "exp": expira, "tipo": "reset"}, 
-                SECRET_KEY, 
-                algorithm=ALGORITHM
+                {"sub": email_banco, "exp": datetime.utcnow() + timedelta(minutes=30), "tipo": "reset"}, 
+                SECRET_KEY, algorithm=ALGORITHM
             )
             
-            print(f"📧 A disparar e-mail de recuperação para: {email_banco}")
-            enviar_email_recuperacao(email_banco, token)
+            # 🎯 DISPARO COM NOME REAL
+            background_tasks.add_task(enviar_email_recuperacao, email_banco, nome_banco, token)
                 
-        return {"mensagem": "Se o e-mail existir no nosso sistema, receberá um link de recuperação em breve."}
-    
+        return {"mensagem": "E-mail de recuperação enviado."}
     except Exception as e:
-        enviar_alerta_tecnico_teams(f"Falha ao gerar E-mail de Recuperação de Senha: {str(e)}")
-        print(f"❌ ERRO CRÍTICO NO FORGOT PASSWORD: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Erro interno ao processar recuperação.")
+        print(f"❌ Erro: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno.")
 
 @app.post("/api/usuarios/alterar-senha")
-async def alterar_minha_senha(requisicao: AlterarSenhaRequest, usuario_email: str = Depends(get_current_user)):
-    
+async def alterar_minha_senha(requisicao: AlterarSenhaRequest, background_tasks: BackgroundTasks, usuario_email: str = Depends(get_current_user)):    
     validar_senha_forte(requisicao.nova_senha)
 
     engine = get_engine()
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         user = conn.execute(
-            text("SELECT senha_hash FROM dbo.nps_usuarios WHERE email = :email"),
+            text("SELECT nome FROM dbo.nps_usuarios WHERE email = :email"),
             {"email": usuario_email}
-        ).fetchone()
+        ).mappings().first()
 
-        if not bcrypt.checkpw(requisicao.senha_atual.encode('utf-8'), user.senha_hash.encode('utf-8')):
-            raise HTTPException(status_code=400, detail="A senha atual está incorreta.")
-
-        # 2. Se a senha atual estiver certa E a nova for forte, fazemos o Hash
         novo_hash = bcrypt.hashpw(requisicao.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        conn.execute(text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE email = :email"), {"hash": novo_hash, "email": usuario_email})
         
-        conn.execute(
-            text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE email = :email"),
-            {"hash": novo_hash, "email": usuario_email}
-        )
-        conn.commit()
+        background_tasks.add_task(enviar_email_senha_alterada, usuario_email, user['nome'])
         
     return {"message": "Senha alterada com sucesso!"}
 
@@ -2516,6 +2463,33 @@ def update_cliente_route(cliente_id: str, payload: ClienteUpdate):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat/clientes-recentes")
+async def obter_clientes_recentes(usuario = Depends(get_current_user)):
+    """Busca as 3 últimas empresas que tiveram interações de NPS"""
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            # Query otimizada para performance
+            sql = text("""
+                SELECT TOP 3 empresa 
+                FROM (
+                    SELECT empresa, MAX(created_at) as ultima_interacao
+                    FROM dbo.nps_respostas 
+                    WHERE empresa IS NOT NULL 
+                      AND empresa <> '' 
+                      AND excluido = 0
+                    GROUP BY empresa
+                ) AS t
+                ORDER BY ultima_interacao DESC
+            """)
+            
+            res = conn.execute(sql).mappings().all()
+            return [r['empresa'] for r in res]
+            
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar atalhos no SQL: {e}")
+        return []
     
 # ==========================================
 # 🛑 ROTAS PARA ATIVAR / INATIVAR PESSOAS E EMPRESAS
@@ -4270,12 +4244,17 @@ def criar_acao(acao: AcaoCriar):
         with engine.begin() as conn:
             sql = text("""
                 INSERT INTO dbo.nps_acoes 
-                (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite)
-                VALUES (:rid, :eid, :gid, :t, :d, :p, :pl)
+                (resposta_id, empresa_id, gestor_id, titulo, descricao, resolucao, prioridade, prazo_limite)
+                VALUES (:rid, :eid, :gid, :t, :d, :resol, :p, :pl)
             """)
             conn.execute(sql, {
-                "rid": acao.resposta_id, "eid": acao.empresa_id, "gid": acao.gestor_id,
-                "t": acao.titulo, "d": acao.descricao, "p": acao.prioridade, 
+                "rid": acao.resposta_id, 
+                "eid": acao.empresa_id, 
+                "gid": acao.gestor_id,
+                "t": acao.titulo, 
+                "d": acao.descricao, 
+                "resol": acao.resolucao, # 🎯 Persistindo resolucao
+                "p": acao.prioridade, 
                 "pl": acao.prazo_limite if acao.prazo_limite else None
             })
         return {"status": "success", "message": "Ação criada com sucesso!"}
@@ -4300,10 +4279,19 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
                 
             condicao = " WHERE " + " AND ".join(filtros) if filtros else ""
 
-            # 👇 A QUERY DEFINITIVA: Traz a foto e dá prioridade ao gestor da ação!
+            # String SQL limpa (sem emojis ou comentários internos que quebram o driver)
             sql = text(f"""
                 SELECT 
-                    a.*,
+                    a.id,
+                    a.titulo,
+                    a.descricao,
+                    a.resolucao,
+                    a.status,
+                    a.prioridade,
+                    a.prazo_limite,
+                    a.gestor_id,
+                    a.empresa_id,
+                    a.created_at,
                     COALESCE(e.nome, r.empresa, c.empresa, 'Conta Geral') as empresa_nome,
                     COALESCE(g.nome, e.gestor, 'Sem Gestor') as gestor_nome,
                     g.avatar as gestor_avatar,
@@ -4328,7 +4316,7 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
             return [dict(r) for r in resultados]
     except Exception as e:
         print(f"ERRO CRÍTICO SQL: {str(e)}")
-        raise HTTPException(status_code=500, detail="Erro interno ao processar a listagem de ações.")
+        raise HTTPException(status_code=500, detail="Erro ao listar ações. Verifique se a coluna 'resolucao' existe no banco.")
 
 @app.put("/api/acoes/{acao_id}")
 def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
@@ -4340,16 +4328,22 @@ def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
                 SET status = COALESCE(:s, status),
                     prioridade = COALESCE(:p, prioridade),
                     descricao = COALESCE(:d, descricao),
+                    resolucao = COALESCE(:resol, resolucao), -- 🎯 Persistindo resolucao
                     prazo_limite = COALESCE(:pl, prazo_limite),
                     gestor_id = COALESCE(:gid, gestor_id),
-                    empresa_id = COALESCE(:eid, empresa_id), -- 👈 ADICIONADO PARA ATUALIZAR EMPRESA
+                    empresa_id = COALESCE(:eid, empresa_id),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = :id
             """)
             conn.execute(sql, {
-                "id": acao_id, "s": acao.status, "p": acao.prioridade, 
-                "d": acao.descricao, "pl": acao.prazo_limite, 
-                "gid": acao.gestor_id, "eid": acao.empresa_id # 👈 PASSANDO O PARÂMETRO
+                "id": acao_id, 
+                "s": acao.status, 
+                "p": acao.prioridade, 
+                "d": acao.descricao, 
+                "resol": acao.resolucao,
+                "pl": acao.prazo_limite, 
+                "gid": acao.gestor_id, 
+                "eid": acao.empresa_id
             })
         return {"status": "success", "message": "Ação atualizada!"}
     except Exception as e:
@@ -4393,7 +4387,7 @@ def corrigir_historico_nomes(tabela: str, coluna: str, de_nome: str, para_nome: 
 # ==========================================
 
 @app.get("/api/logs")
-def listar_logs(usuario = Depends(exigir_admin)):
+def listar_logs(usuario: Any = Depends(exigir_admin)):
     """Retorna os logs de auditoria do sistema (Últimos 200)"""
     try:
         engine = get_engine()
@@ -4410,23 +4404,23 @@ def listar_logs(usuario = Depends(exigir_admin)):
                 LEFT JOIN dbo.nps_usuarios u ON l.usuario_id = u.usuario_id
                 ORDER BY l.data_criacao DESC
             """)
-            resultados = conn.execute(query).mappings().fetchall()
             
-            logs_formatados = []
-            for r in resultados:
-                logs_formatados.append({
+            resultados = conn.execute(query).mappings().all()
+            
+            return [
+                {
                     "id": r["id"],
                     "nivel": r["nivel"],
                     "acao": r["acao"],
                     "mensagem": r["mensagem"],
-                    "usuario_nome": r["usuario_nome"] or "Sistema/Robô",
+                    "usuario_nome": r["usuario_nome"] or "🤖 Sistema",
                     "data_criacao": r["data_criacao"].isoformat() if r["data_criacao"] else None
-                })
-                
-            return logs_formatados
+                }
+                for r in resultados
+            ]
     except Exception as e:
-        print(f"Erro ao buscar logs: {e}")
-        raise HTTPException(status_code=500, detail="Não foi possível carregar os logs.")
+        print(f"❌ ERRO CRÍTICO LOGS: {str(e)}")
+        return []
     
 def registrar_log(acao: str, mensagem: str, nivel: str = 'INFO', usuario_id: int = None):
     """
@@ -4454,52 +4448,44 @@ def registrar_log(acao: str, mensagem: str, nivel: str = 'INFO', usuario_id: int
         print(f"🚨 Falha crítica ao gravar log no banco: {e}")
 
 @app.get("/api/logs/emails")
-async def listar_logs_emails(topn: int = 1000):
+def listar_logs_emails():
     try:
-        from database import get_engine
-        import pandas as pd
-        from sqlalchemy import text
-        
         engine = get_engine()
-        
-        # 🎯 QUERY ADAPTADA PARA A SUA TABELA nps_disparos
-        sql = text(f"""
-            SELECT TOP ({topn})
+        # 🎯 Alteramos para usar a coluna REAL 'assunto' e melhorar a 'mensagem'
+        sql = text("""
+            SELECT 
                 id, 
-                nome as nome_cliente,
+                nome as nome_cliente, 
                 email as destinatario, 
-                
-                -- 1. Cria um assunto dinâmico baseado no facto de ser o 1º envio ou um lembrete
-                CASE 
-                    WHEN lembretes_enviados > 0 THEN 'Lembrete de Pesquisa NPS (' + CAST(lembretes_enviados AS VARCHAR) + ')'
-                    ELSE 'Convite de Pesquisa NPS' 
-                END as assunto, 
+                -- 1. Usa o assunto gravado no banco. Se for nulo, tenta identificar pelo link
+                COALESCE(assunto, 
+                    CASE 
+                        WHEN survey_url LIKE '%verificar-email%' THEN 'Verificação de Conta'
+                        WHEN survey_url LIKE '%redefinir-senha%' THEN 'Recuperação de Acesso'
+                        WHEN survey_url LIKE '%fillout%' THEN 'Convite de Pesquisa NPS'
+                        ELSE 'Notificação de Sistema' 
+                    END
+                ) as assunto, 
                 
                 status, 
                 
-                -- 2. Junta as informações vitais num log técnico para aparecer no pop-up do frontend
+                -- 2. Monta o log técnico para o modal do Frontend
                 CONCAT(
-                    '📍 URL de Destino: ', COALESCE(survey_url, 'N/A'), CHAR(10), CHAR(10),
-                    '🔄 Lembretes Enviados: ', CAST(COALESCE(lembretes_enviados, 0) AS VARCHAR), CHAR(10),
-                    '📅 Último Lembrete: ', COALESCE(CONVERT(VARCHAR, data_ultimo_lembrete, 120), 'N/A'), CHAR(10), CHAR(10),
-                    '⚠️ Registo de Erro: ', COALESCE(erro_msg, 'Nenhum erro registado. Disparo com sucesso.')
+                    '📧 Assunto: ', COALESCE(assunto, 'N/A'), CHAR(10),
+                    '📍 URL/Link: ', COALESCE(survey_url, 'N/A'), CHAR(10), CHAR(10),
+                    '⚠️ Log de Erro: ', COALESCE(erro_msg, 'Disparo realizado com sucesso.')
                 ) as mensagem, 
                 
-                -- 3. Escolhe a data mais relevante (envio, agendamento ou criação)
-                COALESCE(data_envio_inicial, data_agendamento, created_at) as data_envio
-                
+                COALESCE(data_envio_inicial, created_at) as data_envio
             FROM dbo.nps_disparos
-            ORDER BY COALESCE(data_envio_inicial, data_agendamento, created_at) DESC
+            ORDER BY created_at DESC
         """)
         
         with engine.connect() as conn:
-            df = pd.read_sql(sql, conn)
+            # Usando mappings().all() para garantir compatibilidade com o que o Vue espera
+            resultados = conn.execute(sql).mappings().all()
+            return [dict(r) for r in resultados]
             
-        # Retorna a lista de dicionários para o Vue.js exibir na tabela
-        return df.fillna("").to_dict(orient="records")
-        
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        from fastapi import HTTPException
+        print(f"❌ Erro ao listar logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))

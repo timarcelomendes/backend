@@ -12,6 +12,9 @@ def registrar_log_disparo(email, nome, status, assunto, erro=None, cliente_id=No
     """
     Função unificada para gravar qualquer disparo de e-mail na tabela nps_disparos.
     """
+    c_id = None if str(cliente_id).strip() == "" else cliente_id
+    e_id = None if str(empresa_id).strip() == "" else empresa_id
+
     try:
         from database import get_engine
         engine = get_engine()
@@ -29,11 +32,12 @@ def registrar_log_disparo(email, nome, status, assunto, erro=None, cliente_id=No
                 "email": email,
                 "status": status,
                 "assunto": assunto,
-                "url": url,
-                "erro": str(erro) if erro else None
+                "url": url if url else "", 
+                "erro": str(erro) if erro else "" 
             })
     except Exception as e:
-        print(f"⚠️ Falha ao registar log de e-mail para {email}: {e}")
+        # Deixa o erro evidente no console para debug rápido
+        print(f"❌ ERRO GRAVE NO LOG DE E-MAIL para {email}: {str(e)}")
 
 def obter_regras_dinamicas():
     """Lê as parametrizações de negócio da base de dados"""
@@ -167,17 +171,21 @@ def get_valid_access_token():
         return None
     return gerar_access_token(config)
 
-def enviar_email_recuperacao(email_destino, token):
+def enviar_email_recuperacao(email_destino, nome_usuario, token):
     """Envia o e-mail com o link de recuperação de palavra-passe com design premium."""
     access_token = get_valid_access_token()
     if not access_token:
         print("❌ Falha crítica: Não foi possível obter Access Token para recuperação de senha.")
         return False
 
+    # 🎯 Define o remetente correto baseado na sua configuração do Graph
     url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip('/') 
     link_recuperacao = f"{frontend_url}/redefinir-senha?token={token}"
     
+    # Se o nome vier vazio por algum motivo, usamos uma saudação genérica amigável
+    saudacao_nome = nome_usuario if nome_usuario else "Utilizador"
+
     payload = {
         "message": {
             "subject": "Redefinição de Palavra-passe - NPS Intelligence",
@@ -186,54 +194,35 @@ def enviar_email_recuperacao(email_destino, token):
                 "content": f"""
                 <!DOCTYPE html>
                 <html>
-                <head>
-                    <meta charset="utf-8">
-                </head>
-                <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+                <head><meta charset="utf-8"></head>
+                <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: Arial, sans-serif;">
                     <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f1f5f9; padding: 40px 20px;">
                         <tr>
                             <td align="center">
-                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden;">
+                                <table width="100%" style="max-width: 500px; background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden;">
                                     <tr>
-                                        <td align="center" style="padding: 35px 20px 20px 20px; border-bottom: 1px solid #f8fafc;">
-                                            <span style="font-size: 26px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
+                                        <td align="center" style="padding: 30px; border-bottom: 1px solid #f8fafc;">
+                                            <span style="font-size: 24px; font-weight: 900; color: #0f172a; font-style: italic;">
                                                 NPS <span style="color: #f97316;">Intelligence</span>
                                             </span>
                                         </td>
                                     </tr>
                                     <tr>
-                                        <td style="padding: 35px 40px 25px 40px; text-align: left;">
-                                            <h2 style="color: #0f172a; font-size: 22px; margin: 0 0 15px 0; font-weight: 800; letter-spacing: -0.5px;">Recuperação de Acesso</h2>
-                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 25px 0;">
-                                                Olá,<br><br>
-                                                Recebemos um pedido para repor a palavra-passe associada à sua conta. Se foi você que fez este pedido, clique no botão abaixo para escolher uma nova palavra-passe segura.
+                                        <td style="padding: 40px; text-align: left;">
+                                            <h2 style="color: #0f172a; font-size: 20px; margin-bottom: 15px;">Recuperação de Acesso</h2>
+                                            <p style="color: #475569; font-size: 15px; line-height: 1.6;">
+                                                Olá, <strong>{saudacao_nome}</strong>,<br><br>
+                                                Recebemos um pedido para repor a palavra-passe da sua conta. Clique no botão abaixo para prosseguir:
                                             </p>
                                             
-                                            <table width="100%" border="0" cellspacing="0" cellpadding="0">
-                                                <tr>
-                                                    <td align="center" style="padding: 10px 0 30px 0;">
-                                                        <table border="0" cellspacing="0" cellpadding="0">
-                                                            <tr>
-                                                                <td align="center" style="border-radius: 10px; background-color: #f97316;">
-                                                                    <a href="{link_recuperacao}" target="_blank" style="font-size: 15px; font-weight: bold; color: #ffffff; text-decoration: none; padding: 14px 30px; display: inline-block; border-radius: 10px; text-transform: uppercase; letter-spacing: 1px;">
-                                                                        Criar Nova Palavra-passe
-                                                                    </a>
-                                                                </td>
-                                                            </tr>
-                                                        </table>
-                                                    </td>
-                                                </tr>
-                                            </table>
+                                            <div style="text-align: center; margin: 30px 0;">
+                                                <a href="{link_recuperacao}" style="background-color: #f97316; color: #ffffff; padding: 14px 25px; text-decoration: none; border-radius: 10px; font-weight: bold; display: inline-block; text-transform: uppercase; font-size: 13px;">
+                                                    Criar Nova Palavra-passe
+                                                </a>
+                                            </div>
                                             
-                                            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin: 0; background-color: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #cbd5e1;">
-                                                <strong>Atenção:</strong> Por motivos de segurança, este link é válido apenas por <strong>1 hora</strong>.
-                                            </p>
-                                        </td>
-                                    </tr>
-                                    <tr>
-                                        <td style="background-color: #f8fafc; padding: 25px 40px; border-top: 1px solid #e2e8f0;">
-                                            <p style="margin: 0; color: #64748b; font-size: 12px; line-height: 1.5; text-align: center;">
-                                                Se não solicitou a redefinição da sua palavra-passe, pode ignorar e apagar este e-mail com segurança. A sua conta permanecerá protegida.
+                                            <p style="color: #64748b; font-size: 13px; background-color: #f8fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #f97316;">
+                                                <strong>Atenção:</strong> Este link expira em 30 minutos por motivos de segurança.
                                             </p>
                                         </td>
                                     </tr>
@@ -254,99 +243,78 @@ def enviar_email_recuperacao(email_destino, token):
 
     try:
         response = requests.post(url_send, json=payload, headers=headers)
-        if response.status_code == 202:
-            print(f"✅ E-mail de recuperação enviado para {email_destino}")
-            registrar_log_disparo(email_destino, "Utilizador", "Enviado", "Recuperação de Palavra-passe - NPS Intelligence", url=link_recuperacao)
-            return True
-        else:
-            print(f"❌ Erro Graph API ({response.status_code}): {response.text}")
-            registrar_log_disparo(email_destino, "Utilizador", "Erro", "Recuperação de Palavra-passe - NPS Intelligence", erro=response.text, url=link_recuperacao)
-            return False
+        
+        # 🎯 REGISTRO DE LOG COM O NOME REAL DO BANCO
+        status = "Enviado" if response.status_code == 202 else "Erro"
+        erro_msg = None if response.status_code == 202 else response.text
+        
+        registrar_log_disparo(
+            email_destino, 
+            saudacao_nome, # 👈 Aqui o log deixa de ser genérico!
+            status, 
+            "Recuperação de Palavra-passe", 
+            erro=erro_msg, 
+            url=link_recuperacao
+        )
+        
+        return response.status_code == 202
     except Exception as e:
-        print(f"❌ Falha no disparo de recuperação: {e}")
-        registrar_log_disparo(email_destino, "Utilizador", "Erro", "Recuperação de Palavra-passe - NPS Intelligence", erro=str(e), url=link_recuperacao)
+        registrar_log_disparo(email_destino, saudacao_nome, "Erro", "Recuperação de Palavra-passe", erro=str(e), url=link_recuperacao)
         return False
     
 
-def enviar_email_senha_alterada(email_destino):
-    """Envia o e-mail de confirmação de segurança com design corporativo."""
-    access_token = get_valid_access_token()
-    if not access_token:
-        print("❌ Falha crítica: Não foi possível obter Access Token para confirmação de senha.")
-        return False
-
-    url_send = "https://graph.microsoft.com/v1.0/me/sendMail"
-    
-    payload = {
-        "message": {
-            "subject": "Aviso de Segurança: Palavra-passe Atualizada - NPS Intelligence",
-            "body": {
-                "contentType": "HTML",
-                "content": f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="utf-8">
-                </head>
-                <body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
-                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f1f5f9; padding: 40px 20px;">
-                        <tr>
-                            <td align="center">
-                                <table width="100%" max-width="500" cellpadding="0" cellspacing="0" style="max-width: 500px; background-color: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; overflow: hidden;">
-                                    <tr>
-                                        <td align="center" style="padding: 35px 20px 20px 20px; border-bottom: 1px solid #f8fafc;">
-                                            <span style="font-size: 26px; font-weight: 900; color: #0f172a; font-style: italic; letter-spacing: -1px;">
-                                                NPS <span style="color: #f97316;">Intelligence</span>
-                                            </span>
-                                        </td>
-                                    </tr>
-                                    <tr>
-                                        <td style="padding: 35px 40px 30px 40px; text-align: left;">
-                                            <h2 style="color: #0f172a; font-size: 22px; margin: 0 0 15px 0; font-weight: 800; letter-spacing: -0.5px;">Palavra-passe Atualizada</h2>
-                                            <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0 0 30px 0;">
-                                                Olá,<br><br>
-                                                A palavra-passe da sua conta foi alterada com sucesso. Já pode aceder novamente à plataforma com as suas novas credenciais.
-                                            </p>
-                                            
-                                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #fef2f2; border-left: 4px solid #ef4444; border-radius: 6px;">
-                                                <tr>
-                                                    <td style="padding: 15px 20px;">
-                                                        <p style="margin: 0 0 5px 0; color: #991b1b; font-size: 14px; font-weight: bold;">
-                                                            Não reconhece esta ação?
-                                                        </p>
-                                                        <p style="margin: 0; color: #991b1b; font-size: 13px; line-height: 1.5;">
-                                                            Se não foi você que alterou a palavra-passe, contacte o suporte ou o administrador de TI imediatamente para proteger a sua conta.
-                                                        </p>
-                                                    </td>
-                                                </tr>
-                                            </table>
-                                        </td>
-                                    </tr>
-                                </table>
-                            </td>
-                        </tr>
-                    </table>
-                </body>
-                </html>
-                """
-            },
-            "toRecipients": [{"emailAddress": {"address": email_destino}}]
-        },
-        "saveToSentItems": "true"
-    }
-
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
-
+def enviar_email_senha_alterada(email_destino: str, nome_usuario: str):
+    """
+    Envia um aviso de segurança informando que a senha foi alterada.
+    """
     try:
-        response = requests.post(url_send, json=payload, headers=headers)
-        if response.status_code == 202:
-            registrar_log_disparo(email_destino, "Utilizador", "Enviado", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence")
-            return True
-        else:
-            registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=response.text)
-            return False
+        access_token = get_valid_access_token()
+        if not access_token: return False
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            config = conn.execute(text("SELECT email_remetente FROM dbo.nps_configuracoes_email")).mappings().first()
+            if not config or not config["email_remetente"]: return False
+
+            send_url = f"https://graph.microsoft.com/v1.0/users/{config['email_remetente']}/sendMail"
+            
+            html_content = f"""
+            <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+                <h2 style="color: #0f172a;">Aviso de Segurança</h2>
+                <p>Olá, <strong>{nome_usuario}</strong>,</p>
+                <p>Informamos que a sua palavra-passe no <strong>NPS Intelligence</strong> foi alterada com sucesso.</p>
+                <p style="background-color: #fff7ed; padding: 15px; border-radius: 8px; border-left: 4px solid #f97316; color: #9a3412;">
+                    <strong>Não foi você?</strong> Se não realizou esta alteração, entre em contacto com o administrador imediatamente.
+                </p>
+                <p style="font-size: 12px; color: #64748b; margin-top: 20px;">Este é um e-mail automático, por favor não responda.</p>
+            </div>
+            """
+
+            email_body = {
+                "message": {
+                    "subject": "Segurança: Palavra-passe Alterada - NPS Intelligence",
+                    "body": {"contentType": "HTML", "content": html_content},
+                    "toRecipients": [{"emailAddress": {"address": email_destino}}]
+                }
+            }
+            
+            headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+            res = requests.post(send_url, json=email_body, headers=headers)
+            
+            # 🎯 REGISTRO DE LOG COM O NOME REAL
+            status = "Enviado" if res.status_code == 202 else "Erro"
+            registrar_log_disparo(
+                email_destino, 
+                nome_usuario, 
+                status, 
+                "Aviso: Senha Alterada", 
+                erro=res.text if status == "Erro" else None
+            )
+            return res.status_code == 202
+
     except Exception as e:
-        registrar_log_disparo(email_destino, "Utilizador", "Erro", "Aviso de Segurança: A sua senha foi alterada - NPS Intelligence", erro=str(e))
+        # 🎯 LOG MESMO EM CASO DE FALHA TÉCNICA
+        registrar_log_disparo(email_destino, nome_usuario, "Erro", "Aviso: Senha Alterada", erro=str(e))
         return False
     
 def enviar_email_teste(email_destino):
@@ -593,7 +561,7 @@ def validar_dominio_email(email: str, conn):
     except IndexError:
         raise HTTPException(status_code=400, detail="O formato do e-mail é inválido.")
 
-def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str, url_frontend: str, url_backend: str):
+def enviar_email_confirmacao(email_destino: str, nome_usuario: str, secret_key: str, algorithm: str, url_frontend: str, url_backend: str):
     expire = datetime.now(timezone.utc) + timedelta(hours=24)
     
     # 🎯 1. EMBUTIR A URL DO SITE NO TOKEN
@@ -601,12 +569,11 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
         "sub": email_destino, 
         "exp": expire, 
         "tipo_token": "confirmacao_email",
-        "origin": url_frontend  # 👈 O token memoriza de onde o utilizador veio!
+        "origin": url_frontend  # O token memoriza de onde o utilizador veio!
     }
     token = jwt.encode(payload, secret_key, algorithm=algorithm)
     
     # 🎯 2. O LINK DO E-MAIL APONTA PARA A API (Backend)
-    # O clique vai bater no Python primeiro, para ele poder validar o token
     link_confirmacao = f"{url_backend.rstrip('/')}/api/auth/verificar-email?token={token}"
 
     try:
@@ -620,32 +587,41 @@ def enviar_email_confirmacao(email_destino: str, secret_key: str, algorithm: str
 
             send_url = f"https://graph.microsoft.com/v1.0/users/{config['email_remetente']}/sendMail"
             
+            # Melhoria de UX: Saudação personalizada no HTML
             html_content = f"""
             <div style="font-family: Arial, sans-serif; max-width: 500px; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
                 <h2 style="color: #1e293b;">Confirme o seu e-mail</h2>
-                <p>Olá! Recebemos um pedido de registo no NPS Intelligence com este e-mail.</p>
+                <p>Olá, <strong>{nome_usuario}</strong>!</p>
+                <p>Recebemos um pedido de registo no NPS Intelligence com este e-mail.</p>
                 <p>Para comprovar a titularidade da conta, por favor clique no botão abaixo:</p>
                 <a href="{link_confirmacao}" style="display: inline-block; background-color: #f97316; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 20px 0;">Verificar Meu E-mail</a>
+                <p style="font-size: 12px; color: #64748b;">Se não solicitou este registo, pode ignorar este e-mail.</p>
             </div>
             """
 
-            email_body = {"message": {"subject": "Confirme o seu e-mail - NPS Intelligence", "body": {"contentType": "HTML", "content": html_content}, "toRecipients": [{"emailAddress": {"address": email_destino}}]}, "saveToSentItems": "true"}
+            email_body = {
+                "message": {
+                    "subject": "Confirme o seu e-mail - NPS Intelligence", 
+                    "body": {"contentType": "HTML", "content": html_content}, 
+                    "toRecipients": [{"emailAddress": {"address": email_destino}}]
+                }, 
+                "saveToSentItems": "true"
+            }
             headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
             res_email = requests.post(send_url, json=email_body, headers=headers)
             
+            # 🎯 3. REGISTRO DE LOG COM O NOME REAL
             if res_email.status_code == 202:
-                registrar_log_disparo(email_destino, "Novo Registo", "Enviado", "Confirme o seu e-mail - NPS Intelligence", url=link_confirmacao)
+                registrar_log_disparo(email_destino, nome_usuario, "Enviado", "Confirme o seu e-mail", url=link_confirmacao)
                 return True
             else:
-                registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=res_email.text, url=link_confirmacao)
+                registrar_log_disparo(email_destino, nome_usuario, "Erro", "Confirme o seu e-mail", erro=res_email.text, url=link_confirmacao)
                 return False
 
     except Exception as e:
-        registrar_log_disparo(email_destino, "Novo Registo", "Erro", "Confirme o seu e-mail - NPS Intelligence", erro=str(e), url=link_confirmacao)
+        registrar_log_disparo(email_destino, nome_usuario, "Erro", "Confirme o seu e-mail", erro=str(e), url=link_confirmacao)
         return False
     
-import re
-
 def validar_senha_forte(password: str):
     """
     Critérios de segurança atualizados para evitar estouro do Bcrypt
