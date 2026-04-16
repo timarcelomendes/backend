@@ -34,7 +34,7 @@ def get_kpis_data(periodo_dias: int, empresa_sel: str) -> pd.DataFrame:
           ELSE NULL
         END AS periodo,
         nota
-      FROM dbo.nps_respostas
+      FROM nps_respostas
       WHERE deleted_at IS NULL AND data_resposta IS NOT NULL {empresa_where}
     ),
     agg AS (
@@ -49,5 +49,5 @@ def get_kpis_data(periodo_dias: int, empresa_sel: str) -> pd.DataFrame:
     return read_df(sql_kpis, params_base)
 
 def get_empresas_disponiveis() -> list:
-    df_emp = read_df("SELECT DISTINCT empresa FROM dbo.nps_respostas WHERE deleted_at IS NULL AND empresa IS NOT NULL AND LTRIM(RTRIM(empresa)) <> '' ORDER BY empresa ASC;")
+    df_emp = read_df("SELECT DISTINCT empresa FROM nps_respostas WHERE deleted_at IS NULL AND empresa IS NOT NULL AND TRIM(empresa) <> '' ORDER BY empresa ASC;")
     return ["Todas"] + df_emp["empresa"].dropna().astype(str).tolist() if not df_emp.empty else ["Todas"]

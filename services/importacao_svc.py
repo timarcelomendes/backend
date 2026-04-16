@@ -32,7 +32,7 @@ def import_clientes_df(df):
         for _, row in df.iterrows():
             conn.execute(
                 text("""
-                    INSERT INTO dbo.nps_clientes (nome, email, empresa, perfil_decisor, segmento, ativo)
+                    INSERT INTO nps_clientes (nome, email, empresa, perfil_decisor, segmento, ativo)
                     VALUES (:nome, :email, :empresa, :perfil_decisor, :segmento, 1)
                 """),
                 {

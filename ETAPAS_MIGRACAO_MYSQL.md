@@ -1,4 +1,4 @@
-# Etapas da Migracao para MySQL
+﻿# Etapas da Migracao para MySQL
 
 Objetivo:
 Executar a troca do backend de SQL Server para MySQL de forma controlada, validando cada fase antes de avancar.
@@ -13,23 +13,13 @@ Status geral:
 - [x] Etapa 1 - Ambiente MySQL pronto
 - [x] Etapa 2 - Configuracao de conexao no backend
 - [x] Etapa 3 - Conversao inicial de queries criticas
-- [ ] Etapa 4 - Ajuste das queries de relatorios e filtros
+- [x] Etapa 4 - Ajuste das queries de relatorios e filtros
 - [ ] Etapa 5 - Testes funcionais por modulo
 - [ ] Etapa 6 - Validacao final de consistencia
 - [ ] Etapa 7 - Go-live
 
 ---
 
-## Etapa 0 - Baseline e backup
-
-Status: [x]
-
-Objetivo:
-Congelar referencia atual antes das mudancas.
-
-Checklist:
-- [x] Confirmar que o MySQL possui todas as tabelas e contagens equivalentes.
-- [x] Exportar backup do MySQL atual.
 - [x] Registrar hash/versao atual do codigo para rollback.
 
 Validacao esperada:
@@ -122,19 +112,19 @@ Validacao esperada:
 
 ## Etapa 4 - Ajuste das queries de relatorios e filtros
 
-Status: [ ]
+Status: [x]
 
 Objetivo:
 Corrigir consultas mais densas (dashboard, funis, segmentacoes, analiticos).
 
 Checklist:
-- [ ] Revisar consultas com subqueries de TOP 1 e trocar por ORDER BY ... LIMIT 1.
-- [ ] Revisar consultas de periodos (3, 6, 12 meses) para equivalencia com MySQL.
-- [ ] Revisar filtros de texto e null-safe comparators.
+- [x] Revisar consultas com subqueries de TOP 1 e trocar por ORDER BY ... LIMIT 1.
+- [x] Revisar consultas de periodos (3, 6, 12 meses) para equivalencia com MySQL.
+- [x] Revisar filtros de texto e null-safe comparators.
 
 Validacao esperada:
-- [ ] Numeros de dashboard batem com referencia do SQL Server para amostras conhecidas.
-- [ ] Filtros por periodo, companhia e empresa retornam dados esperados.
+- [x] Numeros de dashboard batem com referencia do SQL Server para amostras conhecidas.
+- [x] Filtros por periodo, companhia e empresa retornam dados esperados.
 
 ---
 
@@ -208,3 +198,6 @@ Preencha durante a migracao:
 - Bloqueios encontrados:
 - Decisoes tomadas:
 - Resultado final:
+
+
+

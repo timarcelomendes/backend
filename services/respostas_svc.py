@@ -77,7 +77,7 @@ def load_respostas(
         
     # 🎯 Procurar na coluna nome da tabela nps_perfis (alias 'p')
     if perfil and perfil != "Todos":
-        where.append("(LOWER(LTRIM(RTRIM(r.perfil_decisor))) LIKE :perf OR LOWER(LTRIM(RTRIM(p.nome))) LIKE :perf)")
+        where.append("(LOWER(TRIM(r.perfil_decisor)) LIKE :perf OR LOWER(TRIM(p.nome)) LIKE :perf)")
         params["perf"] = f"%{perfil.strip().lower()}%"
 
     if data_inicio and data_fim:

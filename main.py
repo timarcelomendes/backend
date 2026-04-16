@@ -977,7 +977,7 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, request: Reques
             query = text("""
                 SELECT email, nome 
                 FROM nps_usuarios 
-                WHERE LOWER(LTRIM(RTRIM(email))) = :email
+                WHERE LOWER(TRIM(email)) = :email
             """)
             
             resultado = conn.execute(query, {"email": email_limpo}).mappings().first()
@@ -3738,11 +3738,11 @@ def build_bi_filters(periodo: str, segmento: str, arr: str, safra: str):
     # 4. SAFRA / TEMPO DE CASA (Assumindo que a empresa tem coluna 'created_at')
     # Se a sua coluna se chamar 'data_criacao', altere abaixo:
     if safra == "0-3 Meses (Onboarding)":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) <= 3")
+        where_clauses.append("TIMESTAMPDIFF(MONTH, COALESCE(e.created_at, NOW()), NOW()) <= 3")
     elif safra == "3-12 Meses":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) > 3 AND DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) <= 12")
+        where_clauses.append("TIMESTAMPDIFF(MONTH, COALESCE(e.created_at, NOW()), NOW()) > 3 AND TIMESTAMPDIFF(MONTH, COALESCE(e.created_at, NOW()), NOW()) <= 12")
     elif safra == "+1 Ano":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) > 12")
+        where_clauses.append("TIMESTAMPDIFF(MONTH, COALESCE(e.created_at, NOW()), NOW()) > 12")
 
     where_sql = " AND ".join(where_clauses)
     return where_sql, params
@@ -3849,9 +3849,9 @@ async def get_bi_safra(periodo: str = Query("Últimos 6 Meses"), segmento: str =
             sql = text(f"""
                 SELECT 
                     CASE 
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
                         ELSE '+1 Ano'
                     END as safra_grupo,
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
@@ -3862,9 +3862,9 @@ async def get_bi_safra(periodo: str = Query("Últimos 6 Meses"), segmento: str =
                 WHERE {where_sql}
                 GROUP BY 
                     CASE 
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
-                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
+                        WHEN TIMESTAMPDIFF(MONTH, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
                         ELSE '+1 Ano'
                     END
             """)
@@ -4152,7 +4152,7 @@ def obter_dados_operacionais(
             # 2. SLA Médio de Fechamento (Ajustado para usar os params corretamente)
             sql_sla = text("""
                 SELECT 
-                    AVG(CAST(DATEDIFF(minute, created_at, updated_at) AS FLOAT) / 60.0 / 24.0) as sla_real_dias
+                    AVG(CAST(TIMESTAMPDIFF(MINUTE, created_at, updated_at) AS FLOAT) / 60.0 / 24.0) as sla_real_dias
                 FROM nps_acoes 
                 WHERE status = 'Concluído' 
                   AND updated_at IS NOT NULL 
@@ -4203,7 +4203,7 @@ def relatorio_clientes_inativos(usuario_email: str = Depends(get_current_user)):
                     c.email as cliente_email,
                     -- Pega a data mais recente de interação (envio ou resposta)
                     MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) as data_envio,
-                    DATEDIFF(day, MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)), NOW()) as dias_sem_resposta
+                    TIMESTAMPDIFF(DAY, MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)), NOW()) as dias_sem_resposta
                 FROM nps_clientes c
                 LEFT JOIN nps_empresas e ON c.empresa_id = e.id
                 LEFT JOIN nps_disparos d ON c.cliente_id = d.cliente_id

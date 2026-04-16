@@ -11,12 +11,12 @@ def enviar_alerta_teams(resposta_id: str, cliente_id: str, nome: str, email: str
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query_webhook = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_webhook_url'")
+            query_webhook = text("SELECT valor FROM nps_configuracoes WHERE chave = 'teams_webhook_url'")
             webhook_url = conn.execute(query_webhook).scalar()
             
             perfil, segmento = "-", "-"
             if cliente_id:
-                query_cli = text("SELECT perfil_decisor, segmento FROM dbo.nps_clientes WHERE cliente_id = :cid")
+                query_cli = text("SELECT perfil_decisor, segmento FROM nps_clientes WHERE cliente_id = :cid")
                 res_cli = conn.execute(query_cli, {"cid": cliente_id}).fetchone()
                 if res_cli:
                     perfil = res_cli.perfil_decisor or "-"
@@ -137,7 +137,7 @@ def enviar_resumo_matinal_gestores():
             # Procura todos os gestores que têm um webhook configurado
             query_gestores = text("""
                 SELECT id, nome, teams_webhook 
-                FROM dbo.nps_gestores 
+                FROM nps_gestores 
                 WHERE teams_webhook IS NOT NULL AND teams_webhook != ''
             """)
             gestores = conn.execute(query_gestores).fetchall()
@@ -146,7 +146,7 @@ def enviar_resumo_matinal_gestores():
                 # Busca os tickets pendentes/atrasados deste gestor
                 query_tickets = text("""
                     SELECT id, descricao, prioridade, prazo_limite
-                    FROM dbo.nps_acoes
+                    FROM nps_acoes
                     WHERE gestor_id = :gid AND status != 'Concluído'
                     ORDER BY prazo_limite ASC
                 """)
@@ -260,7 +260,7 @@ def enviar_alerta_tecnico_teams(mensagem_erro: str):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_alerts_webhook'")
+            query = text("SELECT valor FROM nps_configuracoes WHERE chave = 'teams_alerts_webhook'")
             webhook_url = conn.execute(query).scalar()
     except Exception as db_err:
         print(f"❌ Erro ao buscar 'teams_alerts_webhook' no banco de dados: {db_err}")
