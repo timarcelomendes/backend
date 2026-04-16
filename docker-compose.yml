@@ -1,0 +1,11 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nps-backend
+    env_file:
+      - ./.env
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    restart: unless-stopped
