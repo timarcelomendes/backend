@@ -1,0 +1,10 @@
+timestamp=20260416_114134
+backup_file=nps_baseline_20260416_113929.sql
+compare_log=compare_stage0_20260416_114134.log
+compare_exit=1
+tables_compared=16
+row_count_diffs=0
+git_head=14599bb84420c82083942750973751954ff86e9e
+git_status_start
+ M Dockerfile  M docker-compose.yml  M requirements.txt ?? ETAPAS_MIGRACAO_MYSQL.md ?? backups/ ?? compare_full_migration.py ?? migrate_to_mysql.py
+git_status_end

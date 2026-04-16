@@ -9,3 +9,21 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    container_name: nps-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-NpsRoot2026!}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-nps}
+      MYSQL_USER: ${MYSQL_USER:-nps_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-NpsMySQL2026!}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
