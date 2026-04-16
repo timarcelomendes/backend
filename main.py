@@ -1330,7 +1330,11 @@ def acionar_gestor_endpoint(req: AlertaGestorRequest):
 # ==========================================
 
 @app.post("/api/usuarios")
-def criar_usuario(usuario: UsuarioCreate):
+async def criar_usuario(
+    usuario: UsuarioCreate, 
+    background_tasks: BackgroundTasks, # 👈 Adicionado
+    request: Request                  # 👈 Adicionado
+):
     engine = get_engine()
     with engine.connect() as conn:
         
@@ -1345,8 +1349,8 @@ def criar_usuario(usuario: UsuarioCreate):
         senha_hash = bcrypt.hashpw(bytes_senha, salt).decode('utf-8')
         
         insert_query = text("""
-            INSERT INTO dbo.nps_usuarios (nome, email, senha_hash, cargo, ativo)
-            VALUES (:nome, :email, :senha_hash, :cargo, 1)
+            INSERT INTO dbo.nps_usuarios (nome, email, senha_hash, cargo, ativo, email_verificado)
+            VALUES (:nome, :email, :senha_hash, :cargo, 1, 0)
         """)
         
         conn.execute(insert_query, {
@@ -1356,10 +1360,25 @@ def criar_usuario(usuario: UsuarioCreate):
             "cargo": usuario.cargo,
         })
         conn.commit() 
+
+        url_frontend = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        url_backend = f"{request.url.scheme}://{request.url.netloc}"
+        
+        from services.email_svc import enviar_email_confirmacao
+
+        background_tasks.add_task(
+            enviar_email_confirmacao, 
+            usuario.email, 
+            usuario.nome, 
+            SECRET_KEY, 
+            ALGORITHM, 
+            url_frontend, 
+            url_backend 
+        )
         
         return {
             "status": "success", 
-            "mensagem": f"Operador {usuario.nome} criado com sucesso!"
+            "mensagem": f"Operador {usuario.nome} criado com sucesso e e-mail de confirmação enviado!"
         }
     
 @app.get("/api/usuarios")
