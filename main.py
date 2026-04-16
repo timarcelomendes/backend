@@ -729,10 +729,20 @@ async def reenviar_confirmacao(
             if user['email_verificado'] == True or user['email_verificado'] == 1: 
                 raise HTTPException(status_code=400, detail="O seu e-mail já foi confirmado! Agora basta aguardar a aprovação de um Administrador no painel.")
             
+            url_frontend = os.getenv("FRONTEND_URL", "http://localhost:5173")
             url_backend = f"{request.url.scheme}://{request.url.netloc}"
+            
             from services.email_svc import enviar_email_confirmacao
             
-            background_tasks.add_task(enviar_email_confirmacao, user['email'], SECRET_KEY, ALGORITHM, url_backend)
+            background_tasks.add_task(
+                enviar_email_confirmacao, 
+                user['email'],       # 1. email_destino
+                user['nome'],        # 2. nome_usuario
+                SECRET_KEY,          # 3. secret_key
+                ALGORITHM,           # 4. algorithm
+                url_frontend,        # 5. url_frontend
+                url_backend          # 6. url_backend
+            )
             
             return {"mensagem": "E-mail de confirmação reenviado com sucesso!"}
             
@@ -742,8 +752,6 @@ async def reenviar_confirmacao(
         print(f"Erro ao reenviar e-mail: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao tentar reenviar o e-mail.")
     
-from fastapi.responses import RedirectResponse
-
 @app.get("/api/auth/verificar-email")
 def verificar_email(token: str):
     try:
