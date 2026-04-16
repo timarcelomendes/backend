@@ -25,7 +25,7 @@ def obter_regras_dinamicas():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html')")
+            query = text("SELECT chave, valor FROM nps_configuracoes WHERE chave IN ('sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias', 'fillout_campos', 'email_template_html')")
             for linha in conn.execute(query).fetchall():
                 if linha.chave in ['sla_detrator_dias', 'sla_neutro_dias', 'sla_promotor_dias']:
                     regras[linha.chave] = int(linha.valor) if linha.valor else regras[linha.chave]
@@ -93,49 +93,50 @@ def load_respostas(
 
     sql = f"""
     WITH BaseHistorico AS (
-        SELECT 
+        SELECT
             *,
             LAG(nota) OVER (PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) ASC, created_at ASC) as nota_anterior
-        FROM dbo.nps_respostas
+        FROM nps_respostas
         {'WHERE excluido = 0' if not incluir_excluidas else ''}
     )
-    SELECT TOP ({int(topn)})
-        r.resposta_id, 
+    SELECT
+        r.resposta_id,
         r.cliente_id AS resposta_cliente_id,
-        c.nome AS cliente_nome, 
-        
+        c.nome AS cliente_nome,
+
         COALESCE(
-            NULLIF(LTRIM(RTRIM(e.nome)), ''), 
-            NULLIF(LTRIM(RTRIM(r.empresa)), ''), 
-            NULLIF(LTRIM(RTRIM(c.empresa)), '')
+            NULLIF(TRIM(e.nome), ''),
+            NULLIF(TRIM(r.empresa), ''),
+            NULLIF(TRIM(c.empresa), '')
         ) AS empresa,
-        
+
         e.id AS empresa_id,
         e.gestor_id AS gestor_id,
         comp.nome AS companhia,
-        COALESCE(r.perfil_decisor, p.nome) AS perfil_cliente,  
-        
+        COALESCE(r.perfil_decisor, p.nome) AS perfil_cliente,
+
         r.nota,
         r.nota_anterior,
-        r.motivo, 
-        r.categoria, 
-        r.canal, 
-        r.expectativas, 
-        r.o_que_faltava, 
+        r.motivo,
+        r.categoria,
+        r.canal,
+        r.expectativas,
+        r.o_que_faltava,
         r.jira_issue_url,
-        r.created_at,                        
-        r.data_resposta,                     
+        r.created_at,
+        r.data_resposta,
         COALESCE(r.data_resposta, r.created_at) AS data_exibicao,
         r.excluido,
-        (SELECT TOP 1 id FROM dbo.nps_acoes WHERE resposta_id = r.resposta_id) AS acao_vinculada
-        
+        (SELECT id FROM nps_acoes WHERE resposta_id = r.resposta_id ORDER BY created_at DESC LIMIT 1) AS acao_vinculada
+
     FROM BaseHistorico r
-    LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-    LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
-    LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
-    LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
+    LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+    LEFT JOIN nps_perfis p ON c.perfil_id = p.id
+    LEFT JOIN nps_empresas e ON r.empresa_id = e.id
+    LEFT JOIN nps_companhias comp ON e.companhia_id = comp.id
     {where_sql}
     ORDER BY COALESCE(r.data_resposta, r.created_at) DESC, r.created_at DESC
+    LIMIT {int(topn)}
     """
     
     df = read_df(sql, params)
@@ -147,7 +148,7 @@ def load_respostas(
 
 def update_resposta(resposta_id: str, nota: int, categoria: str, motivo: str, canal: str, expectativas: str, o_que_faltava: str):
     sql = """
-    UPDATE dbo.nps_respostas SET 
+    UPDATE nps_respostas SET
         nota=:nota, categoria=:categoria, motivo=:motivo, canal=:canal,
         expectativas=:expectativas, o_que_faltava=:o_que_faltava
     WHERE resposta_id=:resposta_id;
@@ -159,10 +160,10 @@ def update_resposta(resposta_id: str, nota: int, categoria: str, motivo: str, ca
     })
 
 def soft_delete(resposta_id: str):
-    exec_sql("UPDATE dbo.nps_respostas SET excluido = 1 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
+    exec_sql("UPDATE nps_respostas SET excluido = 1 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
 def restore(resposta_id: str):
-    exec_sql("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
+    exec_sql("UPDATE nps_respostas SET excluido = 0 WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
 def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empresa_nome: str, motivo: str):
     """
@@ -203,13 +204,13 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             emp_id_real = empresa_id
 
             if emp_id_real and emp_id_real > 0:
-                query_dados = text("SELECT gestor_id FROM dbo.nps_empresas WHERE id = :eid")
+                query_dados = text("SELECT gestor_id FROM nps_empresas WHERE id = :eid")
                 res = conn.execute(query_dados, {"eid": emp_id_real}).fetchone()
                 if res: 
                     gestor_id_encontrado = res.gestor_id
 
             elif empresa_nome:
-                query_dados = text("SELECT id, gestor_id FROM dbo.nps_empresas WHERE nome = :nome")
+                query_dados = text("SELECT id, gestor_id FROM nps_empresas WHERE nome = :nome")
                 res = conn.execute(query_dados, {"nome": empresa_nome}).fetchone()
                 if res:
                     emp_id_real = res.id
@@ -224,10 +225,11 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             historico_str = ""
             try:
                 query_hist = text("""
-                    SELECT TOP 5 resposta_id, nota, motivo, created_at 
-                    FROM dbo.nps_respostas 
+                    SELECT resposta_id, nota, motivo, created_at
+                    FROM nps_respostas
                     WHERE empresa_id = :eid OR (empresa = :enome AND empresa IS NOT NULL AND empresa != '')
                     ORDER BY created_at DESC
+                    LIMIT 5
                 """)
                 res_hist = conn.execute(query_hist, {
                     "eid": emp_id_real if emp_id_real else -1, 
@@ -257,7 +259,7 @@ def processar_acao_automatica(resposta_id: str, nota: int, empresa_id: int, empr
             
             chave_api = None
             try:
-                res_chave = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'OPENAI_API_KEY'")).fetchone()
+                res_chave = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'OPENAI_API_KEY'")).fetchone()
                 if res_chave and res_chave.valor:
                     chave_api = res_chave.valor.strip()
             except Exception:
@@ -296,7 +298,7 @@ Comece a sua resposta exatamente com a frase: '🤖 Análise Gauge AI:' e não i
             # 7. Inserir na Tabela do Kanban (Sem a coluna companhia)
             # ==========================================
             sql_insert = text("""
-                INSERT INTO dbo.nps_acoes 
+                INSERT INTO nps_acoes 
                 (resposta_id, empresa_id, gestor_id, titulo, descricao, prioridade, prazo_limite, status, created_at, updated_at)
                 VALUES 
                 (:rid, :eid, :gid, :t, :d, :p, :pl, 'Pendente', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -382,20 +384,20 @@ def processar_webhook_fillout(payload: dict):
         resposta_id = f"F-{cliente_id}-{uuid.uuid4().hex[:8].upper()}"
 
         with engine.begin() as conn:
-            sql_check = text("SELECT 1 FROM dbo.nps_respostas WHERE submission_id = :sub_id")
+            sql_check = text("SELECT 1 FROM nps_respostas WHERE submission_id = :sub_id")
             if conn.execute(sql_check, {"sub_id": submission_id}).scalar():
                 print(f"⚠️ Webhook ignorado: Submissão {submission_id} já existe.")
                 return {"status": "ignorado", "motivo": "duplicado"}
 
             sql_insert = text("""
-                INSERT INTO dbo.nps_respostas (
+                INSERT INTO nps_respostas (
                     resposta_id, cliente_id, email, empresa, empresa_id,
                     data_resposta, nota, categoria, motivo, canal,
                     form_id, submission_id, created_at, expectativas, o_que_faltava
                 ) VALUES (
                     :rid, :cid, :email, :emp, :eid,
-                    CAST(GETDATE() AS DATE), :nota, :cat, :motivo, 'Fillout',
-                    :fid, :sub_id, SYSUTCDATETIME(), :exp, :falta
+                    CURDATE(), :nota, :cat, :motivo, 'Fillout',
+                    :fid, :sub_id, UTC_TIMESTAMP(6), :exp, :falta
                 )
             """)
             conn.execute(sql_insert, {
@@ -406,8 +408,8 @@ def processar_webhook_fillout(payload: dict):
             
             if cliente_id:
                 sql_update_cli = text("""
-                    UPDATE dbo.nps_clientes 
-                    SET status_envio = 'Respondido', updated_at = SYSUTCDATETIME() 
+                    UPDATE nps_clientes
+                    SET status_envio = 'Respondido', updated_at = UTC_TIMESTAMP(6)
                     WHERE cliente_id = :cid
                 """)
                 conn.execute(sql_update_cli, {"cid": cliente_id})

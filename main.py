@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'teams_horario_resumo'")).scalar()
+            res = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'teams_horario_resumo'")).scalar()
             if res and ":" in res:
                 hora_teams, minuto_teams = map(int, res.split(":"))
     except Exception as e:
@@ -378,7 +378,7 @@ def get_integracoes(usuario_email: str = Depends(get_current_user)):
         
         engine = get_engine()
         with engine.connect() as conn:
-            query = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('teams_webhook_url', 'teams_alerts_webhook')")
+            query = text("SELECT chave, valor FROM nps_configuracoes WHERE chave IN ('teams_webhook_url', 'teams_alerts_webhook')")
             rows = conn.execute(query).fetchall()
             
             config = {row.chave: row.valor for row in rows}
@@ -403,12 +403,12 @@ def update_integracoes(config: IntegracoesUpdate, usuario_email: str = Depends(g
         with engine.begin() as conn:
             # Lógica de Upsert otimizada (incluindo o updated_at da sua rota antiga)
             sql_upsert = text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                    UPDATE dbo.nps_configuracoes 
+                IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = :chave)
+                    UPDATE nps_configuracoes 
                     SET valor = :valor, updated_at = CURRENT_TIMESTAMP 
                     WHERE chave = :chave
                 ELSE
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) 
+                    INSERT INTO nps_configuracoes (chave, valor, updated_at) 
                     VALUES (:chave, :valor, CURRENT_TIMESTAMP)
             """)
             
@@ -431,7 +431,7 @@ def obter_regras(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql = text("SELECT chave, valor FROM dbo.nps_configuracoes")
+            sql = text("SELECT chave, valor FROM nps_configuracoes")
             result = conn.execute(sql).fetchall()
             
             configuracoes = {linha[0]: linha[1] for linha in result}
@@ -451,10 +451,10 @@ def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get
         engine = get_engine()
         with engine.begin() as conn:
             # Busca o ID do utilizador logado para o log
-            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+            uid = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
 
             # --- AUDITORIA: VERIFICA SE O ROBÔ LIGOU OU DESLIGOU ---
-            estado_robo_antigo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
+            estado_robo_antigo = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
             novo_robo_str = 'true' if payload.robo_ativo else 'false'
 
             # Se o estado for diferente do que estava no banco, grava o log!
@@ -469,10 +469,10 @@ def salvar_regras(payload: RegrasNegocioConfig, usuario_email: str = Depends(get
             # Salva todas as regras no banco (incluindo o robo_ativo)
             configuracoes = payload.dict()
             sql = text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = :chave)
+                    UPDATE nps_configuracoes SET valor = :valor, updated_at = NOW() WHERE chave = :chave
                 ELSE
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
+                    INSERT INTO nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, NOW())
             """)
             
             for chave, valor in configuracoes.items():
@@ -559,7 +559,7 @@ async def login(requisicao: LoginRequest, request: Request):
             
             query = text("""
                 SELECT usuario_id, nome, email, senha_hash, cargo, tipo, ativo, avatar_url, email_verificado
-                FROM dbo.nps_usuarios 
+                FROM nps_usuarios 
                 WHERE email = :email
             """)
             resultado = conn.execute(query, {"email": requisicao.email}).mappings().first()
@@ -616,7 +616,7 @@ async def login(requisicao: LoginRequest, request: Request):
             dispositivo_amigavel = f"{tipo_disp} • {user_agent[:30]}..."
 
             check_sessao = conn.execute(text("""
-                SELECT id FROM dbo.nps_sessoes_ativas 
+                SELECT id FROM nps_sessoes_ativas 
                 WHERE usuario_id = :uid AND ip_address = :ip AND dispositivo = :disp AND revogado = 0
             """), {
                 "uid": resultado["usuario_id"],
@@ -628,13 +628,13 @@ async def login(requisicao: LoginRequest, request: Request):
 
             if check_sessao:
                 conn.execute(text("""
-                    UPDATE dbo.nps_sessoes_ativas 
+                    UPDATE nps_sessoes_ativas 
                     SET criado_em = :agora 
                     WHERE id = :sid
                 """), {"agora": agora_utc, "sid": check_sessao.id})
             else:
                 conn.execute(text("""
-                    INSERT INTO dbo.nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
+                    INSERT INTO nps_sessoes_ativas (usuario_id, dispositivo, ip_address, localizacao, criado_em, revogado)
                     VALUES (:uid, :disp, :ip, 'Detetado Automaticamente', :agora, 0)
                 """), {
                     "uid": resultado["usuario_id"],
@@ -644,7 +644,7 @@ async def login(requisicao: LoginRequest, request: Request):
                 })
             
             conn.execute(text("""
-                UPDATE dbo.nps_usuarios 
+                UPDATE nps_usuarios 
                 SET ultimo_acesso = :agora
                 WHERE usuario_id = :uid
             """), {
@@ -653,7 +653,7 @@ async def login(requisicao: LoginRequest, request: Request):
             })
             
             resultado_tempo = conn.execute(text(
-                "SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'"
+                "SELECT valor FROM nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'"
             )).scalar()
             
             tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
@@ -680,7 +680,7 @@ async def login(requisicao: LoginRequest, request: Request):
                 db_path = resultado["avatar_url"]
                 avatar_final = db_path if db_path.startswith('http') else f"{base_url}{db_path}"
 
-            sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
+            sql_perm = text("SELECT chave FROM nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": resultado["tipo"]}).fetchall()
             
             lista_permissoes = [row.chave for row in res_perm]
@@ -717,7 +717,7 @@ async def reenviar_confirmacao(
         engine = get_engine()
         with engine.connect() as conn:
 
-            query = text("SELECT usuario_id, nome, email, ativo, email_verificado FROM dbo.nps_usuarios WHERE email = :email")
+            query = text("SELECT usuario_id, nome, email, ativo, email_verificado FROM nps_usuarios WHERE email = :email")
             user = conn.execute(query, {"email": req.email.strip()}).mappings().first()
 
             if not user:
@@ -757,7 +757,7 @@ def verificar_email(token: str):
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(
-                text("UPDATE dbo.nps_usuarios SET email_verificado = 1, ativo = 0 WHERE email = :email"),
+                text("UPDATE nps_usuarios SET email_verificado = 1, ativo = 0 WHERE email = :email"),
                 {"email": email}
             )
             print(f"✅ Usuário {email} verificado com sucesso.")
@@ -774,8 +774,8 @@ def get_sso_config():
         from sqlalchemy import text
         engine = get_engine()
         with engine.connect() as conn:
-            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
-            email_cfg = conn.execute(text("SELECT TOP 1 tenant_id, client_id FROM dbo.nps_configuracoes_email")).mappings().first()
+            sso_check = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
+            email_cfg = conn.execute(text("SELECT tenant_id, client_id FROM nps_configuracoes_email LIMIT 1")).mappings().first()
             valor_banco = str(sso_check).strip().lower() if sso_check else 'false'
             is_ativo = valor_banco in ['true', '1', 't', 'y', 'sim']
             client_id = email_cfg.get("client_id") if email_cfg else None
@@ -796,7 +796,7 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
     try:
         engine = get_engine()
         with engine.begin() as conn: 
-            sso_check = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
+            sso_check = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'sso_microsoft_ativo'")).scalar()
             if not sso_check or str(sso_check).lower() != 'true':
                 raise HTTPException(status_code=403, detail="O Login com Microsoft está desativado pelo administrador.")
 
@@ -813,7 +813,7 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
 
             user_db = conn.execute(text("""
                 SELECT usuario_id, nome, email, cargo, tipo, ativo 
-                FROM dbo.nps_usuarios 
+                FROM nps_usuarios 
                 WHERE email = :email
             """), {"email": user_email}).mappings().first()
             
@@ -824,7 +824,7 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
                 raise HTTPException(status_code=403, detail="A sua conta está temporariamente desativada.")
 
             agora_utc = datetime.now(timezone.utc)
-            resultado_tempo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
+            resultado_tempo = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")).scalar()
             tempo_minutos = int(resultado_tempo) if resultado_tempo and str(resultado_tempo).isdigit() else 60
             
             expire = agora_utc + timedelta(minutes=tempo_minutos)
@@ -836,16 +836,16 @@ async def login_microsoft(payload: MicrosoftAuthPayload, request: Request):
             novo_token_id = str(uuid.uuid4()) 
             
             conn.execute(text("""
-                INSERT INTO dbo.nps_sessoes_ativas 
+                INSERT INTO nps_sessoes_ativas 
                 (usuario_id, token_id, dispositivo, ip_address, localizacao, criado_em, ultima_atividade, revogado) 
                 VALUES (:uid, :tid, :disp, :ip, 'Detetado Automaticamente', :agora, :agora, 0)
             """), {"uid": user_db["usuario_id"], "tid": novo_token_id, "ip": ip_usuario, "disp": user_agent, "agora": agora_utc})
 
-            sql_perm = text("SELECT chave FROM dbo.nps_permissoes WHERE perfil = :perfil")
+            sql_perm = text("SELECT chave FROM nps_permissoes WHERE perfil = :perfil")
             res_perm = conn.execute(sql_perm, {"perfil": user_db["tipo"]}).fetchall()
             lista_permissoes = [row.chave for row in res_perm]
             
-            conn.execute(text("UPDATE dbo.nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
+            conn.execute(text("UPDATE nps_usuarios SET ultimo_acesso = :agora WHERE usuario_id = :uid"), {"agora": agora_utc, "uid": user_db["usuario_id"]})
             
             registrar_log(acao="LOGIN_SSO", mensagem=f"Acesso via Microsoft Entra ID (SSO) realizado com sucesso.", nivel="INFO", usuario_id=user_db["usuario_id"])
 
@@ -873,14 +873,14 @@ def registrar_usuario(
     with engine.begin() as conn:
         validar_dominio_email(requisicao.email, conn)
         
-        query_check = text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email")
+        query_check = text("SELECT usuario_id FROM nps_usuarios WHERE email = :email")
         if conn.execute(query_check, {"email": requisicao.email}).fetchone():
             raise HTTPException(status_code=400, detail="Este e-mail já possui uma conta associada.")
         
         senha_hash = bcrypt.hashpw(requisicao.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         
         query_insert = text("""
-            INSERT INTO dbo.nps_usuarios (nome, email, senha_hash, cargo, ativo, tipo)
+            INSERT INTO nps_usuarios (nome, email, senha_hash, cargo, ativo, tipo)
             VALUES (:nome, :email, :senha_hash, 'Analista', 0, 'Usuário')
         """)
         
@@ -935,7 +935,7 @@ async def resetar_senha(
         
         with engine.begin() as conn:
             query_update = text("""
-                UPDATE dbo.nps_usuarios 
+                UPDATE nps_usuarios 
                 SET senha_hash = :senha_hash
                 WHERE email = :email
             """)
@@ -948,7 +948,7 @@ async def resetar_senha(
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
             
             res_user = conn.execute(
-                text("SELECT nome FROM dbo.nps_usuarios WHERE email = :email"),
+                text("SELECT nome FROM nps_usuarios WHERE email = :email"),
                 {"email": email_usuario}
             ).mappings().first()
             
@@ -976,7 +976,7 @@ async def solicitar_recuperacao(requisicao: EsqueciSenhaRequest, request: Reques
             # 🎯 CORREÇÃO: Adicionado 'nome' no SELECT
             query = text("""
                 SELECT email, nome 
-                FROM dbo.nps_usuarios 
+                FROM nps_usuarios 
                 WHERE LOWER(LTRIM(RTRIM(email))) = :email
             """)
             
@@ -1008,12 +1008,12 @@ async def alterar_minha_senha(requisicao: AlterarSenhaRequest, background_tasks:
     engine = get_engine()
     with engine.begin() as conn:
         user = conn.execute(
-            text("SELECT nome FROM dbo.nps_usuarios WHERE email = :email"),
+            text("SELECT nome FROM nps_usuarios WHERE email = :email"),
             {"email": usuario_email}
         ).mappings().first()
 
         novo_hash = bcrypt.hashpw(requisicao.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-        conn.execute(text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE email = :email"), {"hash": novo_hash, "email": usuario_email})
+        conn.execute(text("UPDATE nps_usuarios SET senha_hash = :hash WHERE email = :email"), {"hash": novo_hash, "email": usuario_email})
         
         background_tasks.add_task(enviar_email_senha_alterada, usuario_email, user['nome'])
         
@@ -1029,7 +1029,7 @@ async def reset_manual_senha(usuario_id: str):
     try:
         with engine.connect() as conn:
             conn.execute(
-                text("UPDATE dbo.nps_usuarios SET senha_hash = :hash WHERE usuario_id = :id"),
+                text("UPDATE nps_usuarios SET senha_hash = :hash WHERE usuario_id = :id"),
                 {"hash": senha_hash, "id": usuario_id}
             )
             conn.commit()
@@ -1048,7 +1048,7 @@ def excluir_usuario(usuario_id: str, admin_email: str = Depends(exigir_admin)):
             
             # 1. Pega o ID do Administrador logado usando o e-mail do token
             admin_id = conn.execute(
-                text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email"),
+                text("SELECT usuario_id FROM nps_usuarios WHERE email = :email"),
                 {"email": admin_email}
             ).scalar()
 
@@ -1058,7 +1058,7 @@ def excluir_usuario(usuario_id: str, admin_email: str = Depends(exigir_admin)):
 
             # 3. Verifica qual é o tipo de conta que estamos a tentar excluir
             usuario_alvo = conn.execute(
-                text("SELECT tipo FROM dbo.nps_usuarios WHERE usuario_id = :id"),
+                text("SELECT tipo FROM nps_usuarios WHERE usuario_id = :id"),
                 {"id": usuario_id}
             ).mappings().first()
 
@@ -1068,17 +1068,17 @@ def excluir_usuario(usuario_id: str, admin_email: str = Depends(exigir_admin)):
             # 4. Trava do Último Admin
             if str(usuario_alvo["tipo"]).lower() == 'admin':
                 total_admins = conn.execute(
-                    text("SELECT COUNT(usuario_id) FROM dbo.nps_usuarios WHERE LOWER(tipo) = 'admin' AND ativo = 1")
+                    text("SELECT COUNT(usuario_id) FROM nps_usuarios WHERE LOWER(tipo) = 'admin' AND ativo = 1")
                 ).scalar()
 
                 if total_admins <= 1:
                     raise HTTPException(status_code=400, detail="Operação bloqueada: Este é o último administrador ativo do sistema.")
 
             # 5. Limpa as sessões ativas do usuário (para não dar erro de Chave Estrangeira - FK)
-            conn.execute(text("DELETE FROM dbo.nps_sessoes_ativas WHERE usuario_id = :id"), {"id": usuario_id})
+            conn.execute(text("DELETE FROM nps_sessoes_ativas WHERE usuario_id = :id"), {"id": usuario_id})
             
             # 6. Exclui o usuário definitivamente
-            conn.execute(text("DELETE FROM dbo.nps_usuarios WHERE usuario_id = :id"), {"id": usuario_id})
+            conn.execute(text("DELETE FROM nps_usuarios WHERE usuario_id = :id"), {"id": usuario_id})
 
             # 7. Registra a exclusão no nosso Log de Auditoria
             registrar_log(
@@ -1106,7 +1106,7 @@ def listar_permissoes(usuario = Depends(exigir_admin)):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            res = conn.execute(text("SELECT perfil, chave FROM dbo.nps_permissoes")).fetchall()
+            res = conn.execute(text("SELECT perfil, chave FROM nps_permissoes")).fetchall()
             
             # Inicializa a estrutura
             permissoes = {"Viewer": [], "Manager": []}
@@ -1131,11 +1131,11 @@ def atualizar_permissoes(payload: List[PermissaoUpdate], usuario = Depends(exigi
                     continue
                     
                 # 1. Apaga as permissões antigas do perfil
-                conn.execute(text("DELETE FROM dbo.nps_permissoes WHERE perfil = :p"), {"p": item.perfil})
+                conn.execute(text("DELETE FROM nps_permissoes WHERE perfil = :p"), {"p": item.perfil})
                 
                 # 2. Insere as novas opções selecionadas
                 if item.chaves and len(item.chaves) > 0:
-                    sql_insert = text("INSERT INTO dbo.nps_permissoes (perfil, chave) VALUES (:p, :c)")
+                    sql_insert = text("INSERT INTO nps_permissoes (perfil, chave) VALUES (:p, :c)")
                     for chave in item.chaves:
                         conn.execute(sql_insert, {"p": item.perfil, "c": chave})
                         
@@ -1152,7 +1152,7 @@ async def get_configuracoes():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            resultado = conn.execute(text("SELECT chave, valor FROM dbo.nps_configuracoes")).fetchall()
+            resultado = conn.execute(text("SELECT chave, valor FROM nps_configuracoes")).fetchall()
             configs = {row.chave: row.valor for row in resultado}
             return {"status": "success", "data": configs}
     except Exception as e:
@@ -1166,10 +1166,10 @@ async def save_configuracoes(configs: List[ConfigItem]):
             for item in configs:
                 # O SEGREDO: Upsert em vez de Update simples
                 conn.execute(text("""
-                    IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                        UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                    IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = :chave)
+                        UPDATE nps_configuracoes SET valor = :valor, updated_at = NOW() WHERE chave = :chave
                     ELSE
-                        INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
+                        INSERT INTO nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, NOW())
                 """), {"valor": item.valor, "chave": item.chave})
         return {"status": "success", "detail": "Configurações salvas!"}
     except Exception as e:
@@ -1186,9 +1186,9 @@ async def get_magic_ai_insights():
         
         # 1. Puxa as configurações diretamente do Banco de Dados
         with engine.connect() as conn:
-            api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
-            ai_model = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
-            ai_temp = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'ai_temperature'")).scalar() or "0.4"
+            api_key = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
+            ai_model = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'openai_model'")).scalar() or "gpt-4o-mini"
+            ai_temp = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'ai_temperature'")).scalar() or "0.4"
             
             if not api_key or api_key.strip() == "":
                 return {
@@ -1202,10 +1202,11 @@ async def get_magic_ai_insights():
 
             # 2. Busca os comentários reais
             sql = """
-                SELECT TOP 100 nota, motivo, categoria 
-                FROM dbo.nps_respostas 
+                SELECT nota, motivo, categoria
+                FROM nps_respostas 
                 WHERE motivo IS NOT NULL AND motivo != '' AND excluido = 0
                 ORDER BY created_at DESC
+                LIMIT 100
             """
             df = pd.read_sql(text(sql), conn)
 
@@ -1245,7 +1246,7 @@ async def get_magic_ai_insights():
 def enviar_email_alerta_gestor(empresa: str, gestor_nome: str, gestor_email: str, nps: int):
     engine = get_engine()
     with engine.connect() as conn:
-        cfg = conn.execute(text("SELECT TOP 1 tenant_id, client_id, client_secret, email_remetente, refresh_token FROM dbo.nps_configuracoes_email")).fetchone()
+        cfg = conn.execute(text("SELECT tenant_id, client_id, client_secret, email_remetente, refresh_token FROM nps_configuracoes_email LIMIT 1")).fetchone()
         if not cfg or not cfg.refresh_token:
             raise Exception("O sistema de e-mail não está autenticado. Vá às Configurações e conecte a conta Microsoft.")
         cfg = dict(cfg._mapping)
@@ -1270,7 +1271,7 @@ def enviar_email_alerta_gestor(empresa: str, gestor_nome: str, gestor_email: str
     # Opcional: Atualizar o refresh_token se a Microsoft enviou um novo
     if "refresh_token" in token_json:
         with engine.begin() as conn:
-            conn.execute(text("UPDATE dbo.nps_configuracoes_email SET refresh_token = :rt, atualizado_em = GETDATE()"), {"rt": token_json["refresh_token"]})
+            conn.execute(text("UPDATE nps_configuracoes_email SET refresh_token = :rt, atualizado_em = NOW()"), {"rt": token_json["refresh_token"]})
 
     # 2. Template do E-mail
     corpo_html = f"""
@@ -1307,7 +1308,7 @@ def enviar_email_alerta_gestor(empresa: str, gestor_nome: str, gestor_email: str
 def acionar_gestor_endpoint(req: AlertaGestorRequest):
     engine = get_engine()
     with engine.connect() as conn:
-        gestor_db = conn.execute(text("SELECT email FROM dbo.nps_gestores WHERE nome = :nome"), {"nome": req.gestor}).fetchone()
+        gestor_db = conn.execute(text("SELECT email FROM nps_gestores WHERE nome = :nome"), {"nome": req.gestor}).fetchone()
         if not gestor_db or not gestor_db.email:
             raise HTTPException(status_code=400, detail="Gestor sem e-mail configurado.")
             
@@ -1326,7 +1327,7 @@ def criar_usuario(usuario: UsuarioCreate):
     engine = get_engine()
     with engine.connect() as conn:
         
-        check_query = text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :email")
+        check_query = text("SELECT usuario_id FROM nps_usuarios WHERE email = :email")
         existe = conn.execute(check_query, {"email": usuario.email}).fetchone()
         
         if existe:
@@ -1337,7 +1338,7 @@ def criar_usuario(usuario: UsuarioCreate):
         senha_hash = bcrypt.hashpw(bytes_senha, salt).decode('utf-8')
         
         insert_query = text("""
-            INSERT INTO dbo.nps_usuarios (nome, email, senha_hash, cargo, ativo)
+            INSERT INTO nps_usuarios (nome, email, senha_hash, cargo, ativo)
             VALUES (:nome, :email, :senha_hash, :cargo, 1)
         """)
         
@@ -1361,7 +1362,7 @@ async def listar_operadores():
         with engine.connect() as conn:
             query = text("""
                 SELECT usuario_id, nome, email, cargo, tipo, ativo, ultimo_acesso, email_verificado
-                FROM dbo.nps_usuarios 
+                FROM nps_usuarios 
                 ORDER BY nome ASC
             """)
             result = conn.execute(query).mappings().all()
@@ -1409,7 +1410,7 @@ def get_dashboard_kpis(
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
             
             # Filtro de Empresa
@@ -1436,12 +1437,12 @@ def get_dashboard_kpis(
 
             # --- 3. PROCESSAMENTO DE PALAVRAS MAIS USADAS ---
             sql_termos = text(f"""
-                SELECT CAST(r.motivo AS NVARCHAR(MAX)) as comentario
-                FROM dbo.nps_respostas r
-                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                SELECT CAST(r.motivo AS CHAR) as comentario
+                FROM nps_respostas r
+                {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_filtro} 
-                { "AND" if condicao_filtro else "WHERE" } r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 3
+                { "AND" if condicao_filtro else "WHERE" } r.motivo IS NOT NULL AND CHAR_LENGTH(CAST(r.motivo AS CHAR)) > 3
             """)
             
             comentarios_raw = conn.execute(sql_termos, parametros).scalars().all()
@@ -1470,10 +1471,10 @@ def get_dashboard_kpis(
                     SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' AND r.nota >= 9 THEN 1 ELSE 0 END) as decisor_promotores,
                     SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' AND r.nota <= 6 THEN 1 ELSE 0 END) as decisor_detratores,
                     SUM(CASE WHEN LOWER(p.nome) LIKE '%decisor%' THEN 1 ELSE 0 END) as decisor_total
-                FROM dbo.nps_respostas r
-                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
-                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
+                FROM nps_respostas r
+                {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN nps_perfis p ON c.perfil_id = p.id
                 {condicao_filtro};
             """)
                     
@@ -1496,12 +1497,12 @@ def get_dashboard_kpis(
             # --- 5. CÁLCULO REVENUE AT RISK ---
             sql_rev = text(f"""
                 SELECT SUM(emp_out.valor_contrato) as risco
-                FROM dbo.nps_empresas emp_out
+                FROM nps_empresas emp_out
                 WHERE emp_out.id IN (
                     SELECT DISTINCT COALESCE(r.empresa_id, c.empresa_id)
-                    FROM dbo.nps_respostas r
-                    INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                    FROM nps_respostas r
+                    INNER JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                    LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                     WHERE r.nota <= 6  
                     {condicao_filtro_and}
                 )
@@ -1510,17 +1511,18 @@ def get_dashboard_kpis(
                 
             # --- 6. FEEDBACKS RECENTES ---
             sql_feedbacks = text(f"""
-                SELECT TOP 10 
-                    r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario, 
+                SELECT
+                    r.nota, CAST(r.motivo AS CHAR) as comentario,
                     r.created_at, r.jira_issue_url,
                     c.nome as cliente, e.nome as empresa, p.nome as perfil_decisor
-                FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
-                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
-                WHERE r.motivo IS NOT NULL AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0
+                FROM nps_respostas r
+                INNER JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN nps_perfis p ON c.perfil_id = p.id
+                WHERE r.motivo IS NOT NULL AND CHAR_LENGTH(CAST(r.motivo AS CHAR)) > 0
                 {condicao_filtro_and} 
-                ORDER BY r.created_at DESC;
+                ORDER BY r.created_at DESC
+                LIMIT 10;
             """)
             
             feedbacks_raw = conn.execute(sql_feedbacks, parametros).mappings().all()
@@ -1550,7 +1552,7 @@ def get_dashboard_kpis(
                     SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
                            -- 🎯 CORREÇÃO: Substituir resposta_id por created_at para desempatar pela hora exata
                            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, created_at DESC) as rn
-                    FROM dbo.nps_respostas
+                    FROM nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
                 )
                 SELECT 
@@ -1560,8 +1562,8 @@ def get_dashboard_kpis(
                     atual.nota as nota_atual
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
-                {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
+                {tipo_join} nps_clientes c ON atual.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1 
                   AND anterior.nota <= 6 
                   AND atual.nota >= 9     
@@ -1588,7 +1590,7 @@ def get_dashboard_kpis(
             filtros_sql_ant.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql_ant.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql_ant.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
                 params_ant["companhia"] = companhia
             
             if empresa:
@@ -1621,9 +1623,9 @@ def get_dashboard_kpis(
                     COUNT(r.resposta_id) as total,
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as prom,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detr
-                FROM dbo.nps_respostas r
-                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                FROM nps_respostas r
+                {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_ant};
             """)
             
@@ -1636,14 +1638,14 @@ def get_dashboard_kpis(
 
             # 8. TÓPICOS CRÍTICOS ---
             sql_todos_comentarios = text(f"""
-                SELECT r.nota, CAST(r.motivo AS NVARCHAR(MAX)) as comentario
-                FROM dbo.nps_respostas r
-                {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                SELECT r.nota, CAST(r.motivo AS CHAR) as comentario
+                FROM nps_respostas r
+                {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao_filtro}
                 { "AND" if condicao_filtro else "WHERE" } 
                     r.motivo IS NOT NULL 
-                    AND LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0 
+                    AND CHAR_LENGTH(CAST(r.motivo AS CHAR)) > 0 
                     AND r.excluido = 0
             """)
             
@@ -1676,7 +1678,7 @@ def get_dashboard_kpis(
                     SELECT cliente_id, nota, data_resposta, created_at, empresa_id,
                            -- 🎯 CORREÇÃO: Substituir resposta_id por created_at para desempatar pela hora exata
                            ROW_NUMBER() OVER(PARTITION BY cliente_id ORDER BY COALESCE(data_resposta, created_at) DESC, created_at DESC) as rn
-                    FROM dbo.nps_respostas
+                    FROM nps_respostas
                     WHERE excluido = 0 AND cliente_id IS NOT NULL AND cliente_id <> ''
                 )
                 SELECT 
@@ -1687,8 +1689,8 @@ def get_dashboard_kpis(
                     CASE WHEN anterior.nota >= 9 AND atual.nota <= 6 THEN 1 ELSE 0 END as queda_drastica
                 FROM Historico atual
                 JOIN Historico anterior ON atual.cliente_id = anterior.cliente_id AND anterior.rn = 2
-                {tipo_join} dbo.nps_clientes c ON atual.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
+                {tipo_join} nps_clientes c ON atual.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(atual.empresa_id, c.empresa_id) = e.id
                 WHERE atual.rn = 1 
                   AND anterior.nota >= 9 
                   AND atual.nota <= 8     
@@ -1755,8 +1757,8 @@ def get_dashboard_detalhes(
             params["apenas_ativos"] = 1 if apenas_ativos else 0
 
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql_c.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
-                filtros_sql_puro.append("empresa_id IN (SELECT id FROM dbo.nps_empresas WHERE companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia))")
+                filtros_sql_c.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
+                filtros_sql_puro.append("empresa_id IN (SELECT id FROM nps_empresas WHERE companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia))")
                 params["companhia"] = companhia
 
             if empresa:
@@ -1766,7 +1768,7 @@ def get_dashboard_detalhes(
                     filtros_sql_puro.append("empresa_id IS NULL")
                 else:
                     filtros_sql_c.append("e.nome = :empresa")
-                    filtros_sql_puro.append("empresa_id = (SELECT id FROM dbo.nps_empresas WHERE nome = :empresa)")
+                    filtros_sql_puro.append("empresa_id = (SELECT id FROM nps_empresas WHERE nome = :empresa)")
 
             if data_inicio and data_fim:
                 filtros_sql_c.append("COALESCE(r.data_resposta, r.created_at) >= :data_inicio")
@@ -1795,20 +1797,20 @@ def get_dashboard_detalhes(
                     COUNT(r.resposta_id) as total,
                     MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
                     
-                    (SELECT TOP 1 a.id FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_id,
-                    (SELECT TOP 1 a.status FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_status,
+                    (SELECT a.id FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_id,
+                    (SELECT a.status FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_status,
                     -- 🎯 A LINHA ABAIXO FOI ADICIONADA PARA TRAZER A DATA PARA O RADAR:
-                    (SELECT TOP 1 a.created_at FROM dbo.nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC) as acao_criada_em,
+                    (SELECT a.created_at FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_criada_em,
 
                     ROUND(
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
                         (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
                     ) as nps
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id 
-                LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id 
-                LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
+                FROM nps_respostas r
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id 
+                LEFT JOIN nps_segmentos s ON c.segmento_id = s.id 
+                LEFT JOIN nps_gestores g ON e.gestor_id = g.id
                 
                 {str_filtro_c}
                 AND (:apenas_ativos = 0 OR e.ativo = 1)
@@ -1822,11 +1824,11 @@ def get_dashboard_detalhes(
 
             sql_taxa = text(f"""
                 SELECT 
-                    (SELECT COUNT(*) FROM dbo.nps_clientes {str_filtro_puro}) as total_convidados,
+                    (SELECT COUNT(*) FROM nps_clientes {str_filtro_puro}) as total_convidados,
                     (SELECT COUNT(DISTINCT r.cliente_id) 
-                     FROM dbo.nps_respostas r
-                     LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                     LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                     FROM nps_respostas r
+                     LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                     LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                      {str_filtro_c}) as total_responderam
             """)
             
@@ -1857,7 +1859,7 @@ def get_dashboard_trend(
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql_set = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
+            sql_set = text("SELECT valor FROM nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")
             config_valor = conn.execute(sql_set).scalar()
             tipo_join = "LEFT JOIN"
 
@@ -1868,7 +1870,7 @@ def get_dashboard_trend(
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1 OR COALESCE(r.empresa_id, c.empresa_id) IS NULL)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
                 params["companhia"] = companhia
                 
             if empresa:
@@ -1888,17 +1890,18 @@ def get_dashboard_trend(
 
             sql_trend = text(f"""
                 WITH UltimosMeses AS (
-                    SELECT TOP 6
+                    SELECT
                         LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) as mes,
                         COUNT(r.resposta_id) as total,
                         SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                         SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
-                    FROM dbo.nps_respostas r
-                    {tipo_join} dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                    LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                    FROM nps_respostas r
+                    {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
+                    LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                     {condicao}
                     GROUP BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7)
                     ORDER BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) DESC
+                    LIMIT 6
                 )
                 SELECT * FROM UltimosMeses ORDER BY mes ASC;
             """)
@@ -1943,14 +1946,14 @@ def get_nuvem_palavras(
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            filtros_sql = ["r.nota <= 6", "r.motivo IS NOT NULL", "LEN(CAST(r.motivo AS NVARCHAR(MAX))) > 0", "(r.excluido = 0 OR r.excluido IS NULL)"]
+            filtros_sql = ["r.nota <= 6", "r.motivo IS NOT NULL", "CHAR_LENGTH(CAST(r.motivo AS CHAR)) > 0", "(r.excluido = 0 OR r.excluido IS NULL)"]
             params = {}
             
             params["apenas_ativos"] = 1 if apenas_ativos else 0
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
                 params["companhia"] = companhia
                 
             if empresa:
@@ -1969,10 +1972,10 @@ def get_nuvem_palavras(
             condicao = " WHERE " + " AND ".join(filtros_sql)
 
             sql = text(f"""
-                SELECT CAST(r.motivo AS NVARCHAR(MAX)) as motivo
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                SELECT CAST(r.motivo AS CHAR) as motivo
+                FROM nps_respostas r
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                 {condicao}
             """)
             
@@ -2013,7 +2016,7 @@ def exportar_dashboard(
             filtros_sql.append("(:apenas_ativos = 0 OR e.ativo = 1)")
             
             if companhia and companhia != "Todas as Companhias":
-                filtros_sql.append("e.companhia_id IN (SELECT id FROM dbo.nps_companhias WHERE nome = :companhia)")
+                filtros_sql.append("e.companhia_id IN (SELECT id FROM nps_companhias WHERE nome = :companhia)")
                 parametros["companhia"] = companhia
                 
             if empresa:
@@ -2048,11 +2051,11 @@ def exportar_dashboard(
                     r.motivo as Comentario,
                     r.categoria as Categoria,
                     COALESCE(r.data_resposta, r.created_at) as Data_Resposta
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
-                LEFT JOIN dbo.nps_perfis p ON c.perfil_id = p.id
-                LEFT JOIN dbo.nps_segmentos s ON c.segmento_id = s.id
+                FROM nps_respostas r
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
+                LEFT JOIN nps_perfis p ON c.perfil_id = p.id
+                LEFT JOIN nps_segmentos s ON c.segmento_id = s.id
                 {condicao_filtro}
                 ORDER BY Data_Resposta DESC
             """)
@@ -2075,7 +2078,7 @@ def get_lista_companhias():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql = text("SELECT nome FROM dbo.nps_companhias ORDER BY nome")
+            sql = text("SELECT nome FROM nps_companhias ORDER BY nome")
             resultados = conn.execute(sql).scalars().all()
             
             return ["Todas as Companhias"] + list(resultados)
@@ -2098,7 +2101,7 @@ def listar_empresas():
                     empresa as nome, 
                     COUNT(cliente_id) as total_contatos,
                     SUM(COALESCE(valor_contrato, 0)) as arr_total
-                FROM dbo.nps_clientes
+                FROM nps_clientes
                 WHERE empresa IS NOT NULL AND empresa <> ''
                 GROUP BY empresa
                 ORDER BY arr_total DESC
@@ -2117,7 +2120,7 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
     @app.post(route_path)
     def salvar(item: schema): # type: ignore  
         with get_engine().begin() as conn:
-            if table_name == 'dbo.nps_gestores': 
+            if table_name == 'nps_gestores': 
                 conn.execute(text(f"INSERT INTO {table_name} (nome, papel, email, teams_webhook, avatar) VALUES (:n, :p, :e, :t, :a)"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 
@@ -2134,7 +2137,7 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
         with get_engine().begin() as conn:
             nome_antigo = conn.execute(text(f"SELECT nome FROM {table_name} WHERE id=:id"), {"id": item_id}).scalar()
             
-            if table_name == 'dbo.nps_gestores': 
+            if table_name == 'nps_gestores': 
                 conn.execute(text(f"UPDATE {table_name} SET nome=:n, papel=:p, email=:e, teams_webhook=:t, avatar=:a WHERE id=:id"), {
                     "n": item.nome, 
                     "p": getattr(item, 'papel', ''), 
@@ -2148,12 +2151,12 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
             
             if nome_antigo and str(nome_antigo) != str(item.nome):
                 # 👇 Os clientes SUMIRAM daqui porque agora apontam para o ID!
-                if table_name == 'dbo.nps_segmentos':
-                    conn.execute(text("UPDATE dbo.nps_empresas SET segmento=:novo WHERE segmento=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
-                elif table_name == 'dbo.nps_gestores':
-                    conn.execute(text("UPDATE dbo.nps_empresas SET gestor=:novo WHERE gestor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
-                elif table_name == 'dbo.nps_companhias':
-                    conn.execute(text("UPDATE dbo.nps_empresas SET companhia=:novo WHERE companhia=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                if table_name == 'nps_segmentos':
+                    conn.execute(text("UPDATE nps_empresas SET segmento=:novo WHERE segmento=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'nps_gestores':
+                    conn.execute(text("UPDATE nps_empresas SET gestor=:novo WHERE gestor=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
+                elif table_name == 'nps_companhias':
+                    conn.execute(text("UPDATE nps_empresas SET companhia=:novo WHERE companhia=:antigo"), {"novo": item.nome, "antigo": nome_antigo})
 
         return {"status": "success"}
         
@@ -2163,11 +2166,11 @@ def crud_factory(route_path, table_name, schema=BasicoSchema):
         return {"message": "Removido"}
 
 # Estas 4 linhas substituem dezenas de rotas antigas e ativam todos os menus!
-crud_factory("/api/cadastros/segmentos", "dbo.nps_segmentos")
-crud_factory("/api/cadastros/perfis", "dbo.nps_perfis")
-crud_factory("/api/cadastros/cargos", "dbo.nps_cargos")
-crud_factory("/api/cadastros/gestores", "dbo.nps_gestores", GestorSchema)
-crud_factory("/api/cadastros/companhias", "dbo.nps_companhias")
+crud_factory("/api/cadastros/segmentos", "nps_segmentos")
+crud_factory("/api/cadastros/perfis", "nps_perfis")
+crud_factory("/api/cadastros/cargos", "nps_cargos")
+crud_factory("/api/cadastros/gestores", "nps_gestores", GestorSchema)
+crud_factory("/api/cadastros/companhias", "nps_companhias")
     
 # --- ROTAS DE GESTORES DE CONTA ---
 @app.get("/api/gestores")
@@ -2175,7 +2178,7 @@ async def get_lista_gestores():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql = text("SELECT id, nome, email FROM dbo.usuarios WHERE ativo = 1")
+            sql = text("SELECT id, nome, email FROM usuarios WHERE ativo = 1")
             resultados = conn.execute(sql).mappings().all()
             
             gestores = [{"id": r['id'], "nome": r['nome'], "email": r['email']} for r in resultados if r['email']]
@@ -2239,9 +2242,9 @@ async def listar_empresas():
                 g.nome as gestor, e.gestor_id,
                 comp.nome as companhia, e.companhia_id,
                 e.ativo -- 👈 ADICIONADO AQUI!
-            FROM dbo.nps_empresas e
-            LEFT JOIN dbo.nps_gestores g ON e.gestor_id = g.id
-            LEFT JOIN dbo.nps_companhias comp ON e.companhia_id = comp.id
+            FROM nps_empresas e
+            LEFT JOIN nps_gestores g ON e.gestor_id = g.id
+            LEFT JOIN nps_companhias comp ON e.companhia_id = comp.id
             ORDER BY e.nome ASC
         """)
         return conn.execute(sql).mappings().all()
@@ -2252,7 +2255,7 @@ def save_empresa(emp: EmpresaSchema):
         engine = get_engine()
         with engine.begin() as conn:
             sql_insert = text("""
-                INSERT INTO dbo.nps_empresas 
+                INSERT INTO nps_empresas 
                 (nome, segmento, valor_contrato, gestor, gestor_id, companhia_id) 
                 VALUES (:n, :s, :v, :g, :gid, :cid)
             """)
@@ -2273,7 +2276,7 @@ def update_empresa(empresa_id: int, emp: EmpresaSchema):
     engine = get_engine()
     with engine.begin() as conn: 
         sql_update = text("""
-            UPDATE dbo.nps_empresas 
+            UPDATE nps_empresas 
             SET nome=:n, segmento=:s, valor_contrato=:v, gestor=:g, gestor_id=:gid, companhia_id=:cid 
             WHERE id=:id
         """)
@@ -2294,9 +2297,9 @@ def delete_empresa(empresa_id: int, admin_email: str = Depends(exigir_admin)):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+            admin_id = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
 
-            conn.execute(text("DELETE FROM dbo.nps_empresas WHERE id = :id"), {"id": empresa_id})
+            conn.execute(text("DELETE FROM nps_empresas WHERE id = :id"), {"id": empresa_id})
             conn.commit()
 
             # --- AUDITORIA ---
@@ -2319,13 +2322,13 @@ def auto_cadastrar_referencias(cargo: str, empresa: str, perfil_decisor: str, ge
     engine = get_engine()
     with engine.begin() as conn:
         if cargo and cargo.strip():
-            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_cargos WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_cargos (nome) VALUES (:nome) END"), {"nome": cargo.strip()})
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM nps_cargos WHERE nome = :nome) BEGIN INSERT INTO nps_cargos (nome) VALUES (:nome) END"), {"nome": cargo.strip()})
         if empresa and empresa.strip():
-            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_empresas WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_empresas (nome, segmento, valor_contrato) VALUES (:nome, '', 0) END"), {"nome": empresa.strip()})
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM nps_empresas WHERE nome = :nome) BEGIN INSERT INTO nps_empresas (nome, segmento, valor_contrato) VALUES (:nome, '', 0) END"), {"nome": empresa.strip()})
         if perfil_decisor and perfil_decisor.strip():
-            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_perfis WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_perfis (nome) VALUES (:nome) END"), {"nome": perfil_decisor.strip()})
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM nps_perfis WHERE nome = :nome) BEGIN INSERT INTO nps_perfis (nome) VALUES (:nome) END"), {"nome": perfil_decisor.strip()})
         if gestor and gestor.strip():
-            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM dbo.nps_gestores WHERE nome = :nome) BEGIN INSERT INTO dbo.nps_gestores (nome, papel, email) VALUES (:nome, '', '') END"), {"nome": gestor.strip()})
+            conn.execute(text("IF NOT EXISTS (SELECT 1 FROM nps_gestores WHERE nome = :nome) BEGIN INSERT INTO nps_gestores (nome, papel, email) VALUES (:nome, '', '') END"), {"nome": gestor.strip()})
 
 @app.get("/api/clientes")
 def list_clientes(
@@ -2377,7 +2380,7 @@ def forcar_envio_lote(payload: LoteEnvio, request: Request, background_tasks: Ba
 
         engine = get_engine()
         with engine.connect() as conn:
-            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+            uid = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
 
         from services.email_svc import disparar_convite_nps_especifico
         # Passamos o domínio como segundo argumento
@@ -2402,7 +2405,7 @@ def delete_cliente_route(cliente_id: str, delete_respostas: bool = True, usuario
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            uid = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
+            uid = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": usuario_email}).scalar()
 
         # O serviço apaga e devolve o status
         ok, msg = clientes_svc.delete_cliente(cliente_id, delete_respostas)
@@ -2472,16 +2475,17 @@ async def obter_clientes_recentes(usuario = Depends(get_current_user)):
         with engine.connect() as conn:
             # Query otimizada para performance
             sql = text("""
-                SELECT TOP 3 empresa 
+                SELECT empresa
                 FROM (
                     SELECT empresa, MAX(created_at) as ultima_interacao
-                    FROM dbo.nps_respostas 
+                    FROM nps_respostas 
                     WHERE empresa IS NOT NULL 
                       AND empresa <> '' 
                       AND excluido = 0
                     GROUP BY empresa
                 ) AS t
                 ORDER BY ultima_interacao DESC
+                LIMIT 3
             """)
             
             res = conn.execute(sql).mappings().all()
@@ -2503,7 +2507,7 @@ def alterar_status_cliente(cliente_id: str, payload: dict):
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(text("""
-                UPDATE dbo.nps_clientes 
+                UPDATE nps_clientes 
                 SET ativo = :a, updated_at = CURRENT_TIMESTAMP 
                 WHERE cliente_id = :id
             """), {"a": ativo, "id": cliente_id})
@@ -2518,7 +2522,7 @@ def alterar_status_empresa(empresa_id: int, payload: dict):
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(text("""
-                UPDATE dbo.nps_empresas 
+                UPDATE nps_empresas 
                 SET ativo = :a 
                 WHERE id = :id
             """), {"a": ativo, "id": empresa_id})
@@ -2594,7 +2598,7 @@ def update_resposta_route(resposta_id: str, payload: RespostaUpdate):
         with engine.begin() as conn:
             # 2. ATUALIZAÇÃO NO BANCO DE DADOS
             sql = text("""
-                UPDATE dbo.nps_respostas 
+                UPDATE nps_respostas 
                 SET nota = :nota, 
                     categoria = :categoria, 
                     motivo = :motivo, 
@@ -2629,7 +2633,7 @@ async def soft_delete_resposta_route(resposta_id: str):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            conn.execute(text("UPDATE dbo.nps_respostas SET excluido = 1 WHERE resposta_id = :id"), {"id": resposta_id})
+            conn.execute(text("UPDATE nps_respostas SET excluido = 1 WHERE resposta_id = :id"), {"id": resposta_id})
         return {"status": "success", "detail": "Arquivado com sucesso"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2639,7 +2643,7 @@ async def restore_resposta_route(resposta_id: str):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            conn.execute(text("UPDATE dbo.nps_respostas SET excluido = 0 WHERE resposta_id = :id"), {"id": resposta_id})
+            conn.execute(text("UPDATE nps_respostas SET excluido = 0 WHERE resposta_id = :id"), {"id": resposta_id})
         return {"status": "success", "detail": "Restaurado com sucesso"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2655,7 +2659,7 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 
         with engine.begin() as conn:
             # 2. Obter o nome da empresa associada a este cliente
-            sql_cliente = text("SELECT empresa FROM dbo.nps_clientes WHERE cliente_id = :cliente_id")
+            sql_cliente = text("SELECT empresa FROM nps_clientes WHERE cliente_id = :cliente_id")
             resultado_cliente = conn.execute(sql_cliente, {"cliente_id": resp.cliente_id}).fetchone()
             
             if not resultado_cliente:
@@ -2665,9 +2669,9 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 
             # 3. Inserir a resposta (Agora com o resposta_id obrigatório e fuso horário corrigido)
             sql_insert = text("""
-                INSERT INTO dbo.nps_respostas 
+                INSERT INTO nps_respostas 
                 (resposta_id, cliente_id, empresa, nota, motivo, canal, data_resposta, created_at, excluido) 
-                VALUES (:res_id, :cliente_id, :empresa, :nota, :motivo, :canal, SYSUTCDATETIME(), SYSUTCDATETIME(), 0)
+                VALUES (:res_id, :cliente_id, :empresa, :nota, :motivo, :canal, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0)
             """)
             conn.execute(sql_insert, {
                 "res_id": novo_id_resposta,
@@ -2680,29 +2684,29 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
 
             # 4. INTERROMPER A RÉGUA DE LEMBRETES (Status 'Respondido' para o robô não enviar mais)
             sql_update_disparo = text("""
-                UPDATE dbo.nps_disparos 
-                SET status = 'Respondido', updated_at = SYSUTCDATETIME()
+                UPDATE nps_disparos 
+                SET status = 'Respondido', updated_at = UTC_TIMESTAMP(6)
                 WHERE cliente_id = :cliente_id AND status <> 'Respondido'
             """)
             conn.execute(sql_update_disparo, {"cliente_id": resp.cliente_id})
             
             # Atualizar status no cadastro do cliente
             sql_update_cliente = text("""
-                UPDATE dbo.nps_clientes 
-                SET status_envio = 'Respondido', updated_at = SYSUTCDATETIME()
+                UPDATE nps_clientes 
+                SET status_envio = 'Respondido', updated_at = UTC_TIMESTAMP(6)
                 WHERE cliente_id = :cliente_id
             """)
             conn.execute(sql_update_cliente, {"cliente_id": resp.cliente_id})
 
             # 5. CRIAR AÇÃO AUTOMÁTICA PARA DETRATORES
             if resp.nota <= 6:
-                sql_empresa_id = text("SELECT id FROM dbo.nps_empresas WHERE nome = :nome")
+                sql_empresa_id = text("SELECT id FROM nps_empresas WHERE nome = :nome")
                 res_emp = conn.execute(sql_empresa_id, {"nome": empresa_nome}).fetchone()
                 
                 if res_emp:
                     sql_acao = text("""
-                        INSERT INTO dbo.nps_acoes (empresa_id, resposta_id, descricao, prioridade, status, data_criacao)
-                        VALUES (:emp_id, :res_id, :desc, 'Alta', 'Pendente', SYSUTCDATETIME())
+                        INSERT INTO nps_acoes (empresa_id, resposta_id, descricao, prioridade, status, data_criacao)
+                        VALUES (:emp_id, :res_id, :desc, 'Alta', 'Pendente', UTC_TIMESTAMP(6))
                     """)
                     desc = f"Tratar Detrator (Nota {resp.nota}). Feedback inserido manualmente via {resp.canal}."
                     conn.execute(sql_acao, {
@@ -2727,14 +2731,14 @@ def excluir_resposta_definitiva(resposta_id: str, admin_email: str = Depends(exi
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+            admin_id = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
             
-            check = conn.execute(text("SELECT resposta_id FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id}).fetchone()
+            check = conn.execute(text("SELECT resposta_id FROM nps_respostas WHERE resposta_id = :id"), {"id": resposta_id}).fetchone()
             if not check:
                 raise HTTPException(status_code=404, detail="Resposta não encontrada.")
             
-            conn.execute(text("DELETE FROM dbo.nps_acoes WHERE resposta_id = :id"), {"id": resposta_id})
-            conn.execute(text("DELETE FROM dbo.nps_respostas WHERE resposta_id = :id"), {"id": resposta_id})
+            conn.execute(text("DELETE FROM nps_acoes WHERE resposta_id = :id"), {"id": resposta_id})
+            conn.execute(text("DELETE FROM nps_respostas WHERE resposta_id = :id"), {"id": resposta_id})
             
             # --- AUDITORIA ---
             registrar_log(
@@ -2836,32 +2840,32 @@ async def processar_importacao(payload: dict):
             
             # Cria/Atualiza Empresas
             for emp_nome in empresas_unicas:
-                check_emp = conn.execute(text("SELECT id FROM dbo.nps_empresas WHERE LOWER(nome) = LOWER(:nome)"), {"nome": emp_nome}).fetchone()
+                check_emp = conn.execute(text("SELECT id FROM nps_empresas WHERE LOWER(nome) = LOWER(:nome)"), {"nome": emp_nome}).fetchone()
                 if not check_emp:
-                    conn.execute(text("INSERT INTO dbo.nps_empresas (nome, companhia_id, created_at) VALUES (:nome, :comp_id, CURRENT_TIMESTAMP)"), {"nome": emp_nome, "comp_id": companhia_id_selecionada})
+                    conn.execute(text("INSERT INTO nps_empresas (nome, companhia_id, created_at) VALUES (:nome, :comp_id, CURRENT_TIMESTAMP)"), {"nome": emp_nome, "comp_id": companhia_id_selecionada})
                 elif overwrite and companhia_id_selecionada:
-                    conn.execute(text("UPDATE dbo.nps_empresas SET companhia_id = :comp_id WHERE id = :id"), {"comp_id": companhia_id_selecionada, "id": check_emp.id})
+                    conn.execute(text("UPDATE nps_empresas SET companhia_id = :comp_id WHERE id = :id"), {"comp_id": companhia_id_selecionada, "id": check_emp.id})
 
             # Cria Cargos novos
             for c_nome in cargos_unicos:
-                if not conn.execute(text("SELECT id FROM dbo.nps_cargos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": c_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_cargos (nome) VALUES (:nome)"), {"nome": c_nome})
+                if not conn.execute(text("SELECT id FROM nps_cargos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": c_nome}).fetchone():
+                    conn.execute(text("INSERT INTO nps_cargos (nome) VALUES (:nome)"), {"nome": c_nome})
 
             # Cria Segmentos novos
             for s_nome in segmentos_unicos:
-                if not conn.execute(text("SELECT id FROM dbo.nps_segmentos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": s_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_segmentos (nome) VALUES (:nome)"), {"nome": s_nome})
+                if not conn.execute(text("SELECT id FROM nps_segmentos WHERE LOWER(nome) = LOWER(:nome)"), {"nome": s_nome}).fetchone():
+                    conn.execute(text("INSERT INTO nps_segmentos (nome) VALUES (:nome)"), {"nome": s_nome})
                     
             # Cria Perfis novos
             for p_nome in perfis_unicos:
-                if not conn.execute(text("SELECT id FROM dbo.nps_perfis WHERE LOWER(nome) = LOWER(:nome)"), {"nome": p_nome}).fetchone():
-                    conn.execute(text("INSERT INTO dbo.nps_perfis (nome) VALUES (:nome)"), {"nome": p_nome})
+                if not conn.execute(text("SELECT id FROM nps_perfis WHERE LOWER(nome) = LOWER(:nome)"), {"nome": p_nome}).fetchone():
+                    conn.execute(text("INSERT INTO nps_perfis (nome) VALUES (:nome)"), {"nome": p_nome})
 
             # 💡 A GRANDE MAGIA: Mapeamento Dinâmico Texto -> ID
-            mapa_empresas = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_empresas")).fetchall()}
-            mapa_cargos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_cargos")).fetchall()}
-            mapa_segmentos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_segmentos")).fetchall()}
-            mapa_perfis = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM dbo.nps_perfis")).fetchall()}
+            mapa_empresas = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM nps_empresas")).fetchall()}
+            mapa_cargos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM nps_cargos")).fetchall()}
+            mapa_segmentos = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM nps_segmentos")).fetchall()}
+            mapa_perfis = {str(r.nome).strip().lower(): r.id for r in conn.execute(text("SELECT id, nome FROM nps_perfis")).fetchall()}
             
             # ==========================================
             # 🧑‍💼 2. IMPORTAÇÃO DE BASE DE CLIENTES
@@ -2908,7 +2912,7 @@ async def processar_importacao(payload: dict):
                         continue
 
                     where_sql = " AND ".join(where_clauses)
-                    existente = conn.execute(text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {where_sql}"), params_busca).fetchone()
+                    existente = conn.execute(text(f"SELECT cliente_id FROM nps_clientes WHERE {where_sql}"), params_busca).fetchone()
 
                     email = str(c.get("email", c.get("e-mail", c.get("email_cliente", "")))).strip().lower()
                     
@@ -2937,7 +2941,7 @@ async def processar_importacao(payload: dict):
                             params_save["cid"] = existente.cliente_id
                             # A query de UPDATE agora grava apenas os IDs!
                             update_sql = text("""
-                                UPDATE dbo.nps_clientes 
+                                UPDATE nps_clientes 
                                 SET nome = COALESCE(:nome, nome), 
                                     email = COALESCE(NULLIF(:email, ''), email),
                                     empresa_id = COALESCE(:empresa_id, empresa_id), 
@@ -2957,7 +2961,7 @@ async def processar_importacao(payload: dict):
                         params_save["cliente_id"] = str(random.randint(100000000, 999999999))
                         # A query de INSERT agora grava apenas os IDs!
                         insert_sql = text("""
-                            INSERT INTO dbo.nps_clientes (
+                            INSERT INTO nps_clientes (
                                 cliente_id, nome, email, empresa_id, cargo_id, 
                                 perfil_id, segmento_id, ativo, ultimo_envio, status_envio,
                                 created_at, updated_at
@@ -2965,7 +2969,7 @@ async def processar_importacao(payload: dict):
                             VALUES (
                                 :cliente_id, :nome, :email, :empresa_id, :cargo_id, 
                                 :perfil_id, :segmento_id, :ativo, :ultimo_envio, 'Pendente',
-                                SYSUTCDATETIME(), SYSUTCDATETIME()
+                                UTC_TIMESTAMP(6), UTC_TIMESTAMP(6)
                             )
                         """)
                         conn.execute(insert_sql, params_save)
@@ -3024,7 +3028,7 @@ async def processar_importacao(payload: dict):
                         detalhes_erros.append({"email": email_atual, "motivo": "Falta coluna de identificação."})
                         continue
                         
-                    cliente_existente = conn.execute(text(f"SELECT cliente_id FROM dbo.nps_clientes WHERE {' AND '.join(where_clauses)}"), params_cliente).fetchone()
+                    cliente_existente = conn.execute(text(f"SELECT cliente_id FROM nps_clientes WHERE {' AND '.join(where_clauses)}"), params_cliente).fetchone()
 
                     if not cliente_existente:
                         ignored_count += 1 
@@ -3055,7 +3059,7 @@ async def processar_importacao(payload: dict):
                                 params_resp[param_name] = val
                                 
                         if not has_null_resp:
-                            resp_existente = conn.execute(text(f"SELECT resposta_id FROM dbo.nps_respostas WHERE {' AND '.join(where_resp)}"), params_resp).fetchone()
+                            resp_existente = conn.execute(text(f"SELECT resposta_id FROM nps_respostas WHERE {' AND '.join(where_resp)}"), params_resp).fetchone()
                             if resp_existente:
                                 resposta_existente_id = resp_existente.resposta_id
 
@@ -3066,7 +3070,7 @@ async def processar_importacao(payload: dict):
                     if resposta_existente_id:
                         if overwrite:
                             update_sql = text("""
-                                UPDATE dbo.nps_respostas
+                                UPDATE nps_respostas
                                 SET nota = :nota, motivo = :motivo, categoria = :categoria,
                                     data_resposta = COALESCE(:dt_resp, data_resposta),
                                     empresa = COALESCE(NULLIF(:empresa, ''), empresa),
@@ -3084,14 +3088,14 @@ async def processar_importacao(payload: dict):
                             detalhes_erros.append({"email": email_atual, "motivo": "Resposta já existe e overwrite=False."})
                     else:
                         insert_sql = text("""
-                            INSERT INTO dbo.nps_respostas (
+                            INSERT INTO nps_respostas (
                                 resposta_id, cliente_id, nota, motivo, categoria, 
                                 canal, excluido, data_resposta, created_at,
                                 empresa, empresa_id
                             )
                             VALUES (
                                 :rid, :cid, :nota, :motivo, :categoria, 
-                                'Importacao_Manual', 0, :dt_resp, SYSUTCDATETIME(),
+                                'Importacao_Manual', 0, :dt_resp, UTC_TIMESTAMP(6),
                                 :empresa, :empresa_id
                             )
                         """)
@@ -3121,20 +3125,20 @@ def limpar_dados_em_massa(tipo: str, usuario = Depends(get_current_user)):
         with engine.begin() as conn:
             if tipo == 'respostas':
                 # Apaga apenas as respostas (mantém os clientes e empresas intactos)
-                conn.execute(text("DELETE FROM dbo.nps_respostas"))
+                conn.execute(text("DELETE FROM nps_respostas"))
                 msg = "Todas as respostas (NPS) foram apagadas com sucesso."
                 
             elif tipo == 'clientes':
                 # Para apagar clientes, OBRIGATORIAMENTE temos de apagar as respostas deles primeiro
-                conn.execute(text("DELETE FROM dbo.nps_respostas"))
-                conn.execute(text("DELETE FROM dbo.nps_clientes"))
+                conn.execute(text("DELETE FROM nps_respostas"))
+                conn.execute(text("DELETE FROM nps_clientes"))
                 msg = "Todos os clientes e respostas foram apagados com sucesso."
                 
             elif tipo == 'empresas':
                 # 👇 NOVA OPÇÃO: Para apagar empresas, apagamos a cadeia inteira
-                conn.execute(text("DELETE FROM dbo.nps_respostas"))
-                conn.execute(text("DELETE FROM dbo.nps_clientes"))
-                conn.execute(text("DELETE FROM dbo.nps_empresas"))
+                conn.execute(text("DELETE FROM nps_respostas"))
+                conn.execute(text("DELETE FROM nps_clientes"))
+                conn.execute(text("DELETE FROM nps_empresas"))
                 msg = "Toda a base (Empresas, Clientes e Respostas) foi limpa com sucesso."
                 
             else:
@@ -3178,7 +3182,7 @@ def check_status():
 def get_setting_mostrar():
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")).scalar()
+        res = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")).scalar()
         return {"valor": res == 'true'}
 
 @app.post("/api/settings/mostrar-sem-cliente")
@@ -3186,14 +3190,14 @@ def update_setting_mostrar(payload: SettingUpdate):
     engine = get_engine()
     with engine.connect() as conn:
         val_str = 'true' if payload.valor else 'false'
-        conn.execute(text("UPDATE dbo.nps_configuracoes SET valor = :v WHERE chave = 'mostrar_sem_cliente'"), {"v": val_str})
+        conn.execute(text("UPDATE nps_configuracoes SET valor = :v WHERE chave = 'mostrar_sem_cliente'"), {"v": val_str})
         conn.commit()
         return {"status": "success"}
 
 def obter_tipo_join():
     engine = get_engine()
     with engine.connect() as conn:
-        res = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")).scalar()
+        res = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'mostrar_sem_cliente'")).scalar()
         return "LEFT JOIN" if res == 'true' else "INNER JOIN"
     
 # ==========================================
@@ -3206,10 +3210,10 @@ async def atualizar_usuario(usuario_id: str, data: dict, admin_email: str = Depe
         engine = get_engine()
         with engine.begin() as conn:
             # Busca o ID do Admin que está a aprovar
-            admin_id = conn.execute(text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
+            admin_id = conn.execute(text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), {"e": admin_email}).scalar()
 
             query = text("""
-                UPDATE dbo.nps_usuarios 
+                UPDATE nps_usuarios 
                 SET nome = :nome, email = :email, cargo = :cargo, ativo = :ativo, tipo = :tipo 
                 WHERE usuario_id = :id
             """)
@@ -3221,7 +3225,7 @@ async def atualizar_usuario(usuario_id: str, data: dict, admin_email: str = Depe
             password = data.get("password")
             if password and password.strip():
                 senha_hash = hash_password(password)
-                conn.execute(text("UPDATE dbo.nps_usuarios SET senha_hash = :h WHERE usuario_id = :id"), {"h": senha_hash, "id": usuario_id})
+                conn.execute(text("UPDATE nps_usuarios SET senha_hash = :h WHERE usuario_id = :id"), {"h": senha_hash, "id": usuario_id})
             
             # --- AUDITORIA ---
             if str(data.get("ativo")) in ['1', 'true', 'True']:
@@ -3253,7 +3257,7 @@ async def buscar_config_email():
         engine = get_engine()
         with engine.connect() as conn:
             # 1. Busca as credenciais de e-mail
-            query = text("SELECT TOP 1 * FROM dbo.nps_configuracoes_email")
+            query = text("SELECT * FROM nps_configuracoes_email LIMIT 1")
             res = conn.execute(query).fetchone()
             
             dados = dict(res._mapping) if res else {}
@@ -3265,7 +3269,7 @@ async def buscar_config_email():
                 dados["refresh_token"] = decrypt_data(dados["refresh_token"])
             
             # 3. Busca o estado da Chave Mestra e do SSO
-            query_vars = text("SELECT chave, valor FROM dbo.nps_configuracoes WHERE chave IN ('envios_ativos', 'sso_microsoft_ativo')")
+            query_vars = text("SELECT chave, valor FROM nps_configuracoes WHERE chave IN ('envios_ativos', 'sso_microsoft_ativo')")
             res_vars = conn.execute(query_vars).fetchall()
             
             # O nome da variável devolvida ao Vue DEVE ser sso_microsoft_ativo
@@ -3295,18 +3299,18 @@ async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depe
 
         with engine.begin() as conn: 
             admin_id = conn.execute(
-                text("SELECT usuario_id FROM dbo.nps_usuarios WHERE email = :e"), 
+                text("SELECT usuario_id FROM nps_usuarios WHERE email = :e"), 
                 {"e": admin_email}
             ).scalar()
 
             # 1. Atualiza as credenciais da Microsoft (Agora com proteção)
-            existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes_email")).scalar()
+            existe = conn.execute(text("SELECT 1 FROM nps_configuracoes_email")).scalar()
             if existe:
                 conn.execute(text("""
-                    UPDATE dbo.nps_configuracoes_email 
+                    UPDATE nps_configuracoes_email 
                     SET tenant_id = :t, client_id = :c, 
                         client_secret = CASE WHEN :s = '' THEN client_secret ELSE :s END, 
-                        email_remetente = :e, base_url_frontend = :b, atualizado_em = GETDATE()
+                        email_remetente = :e, base_url_frontend = :b, atualizado_em = NOW()
                 """), {
                     "t": config.tenant_id, 
                     "c": config.client_id, 
@@ -3316,8 +3320,8 @@ async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depe
                 })
             else:
                 conn.execute(text("""
-                    INSERT INTO dbo.nps_configuracoes_email (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
-                    VALUES (:t, :c, :s, :e, :b, GETDATE())
+                    INSERT INTO nps_configuracoes_email (tenant_id, client_id, client_secret, email_remetente, base_url_frontend, atualizado_em)
+                    VALUES (:t, :c, :s, :e, :b, NOW())
                 """), {
                     "t": config.tenant_id, 
                     "c": config.client_id, 
@@ -3328,21 +3332,21 @@ async def salvar_config_email(config: ConfigEmailSchema, admin_email: str = Depe
             
             # --- (O resto do seu código de logs e toggles permanece igual) ---
             sql_upsert_cfg = text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = :chave)
-                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = GETDATE() WHERE chave = :chave
+                IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = :chave)
+                    UPDATE nps_configuracoes SET valor = :valor, updated_at = NOW() WHERE chave = :chave
                 ELSE
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, GETDATE())
+                    INSERT INTO nps_configuracoes (chave, valor, updated_at) VALUES (:chave, :valor, NOW())
             """)
 
             # Toggle: Motor
-            estado_motor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
+            estado_motor = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'envios_ativos'")).scalar()
             novo_motor = 'true' if config.envios_ativos else 'false'
             if estado_motor != novo_motor:
                 registrar_log(acao="CONFIG_MOTOR", mensagem=f"O utilizador {'ATIVOU' if config.envios_ativos else 'DESATIVOU'} o Motor.", nivel="WARN", usuario_id=admin_id)
             conn.execute(sql_upsert_cfg, {"chave": "envios_ativos", "valor": novo_motor})
 
             # Toggle: Robô
-            estado_robo = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
+            estado_robo = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'robo_ativo'")).scalar()
             novo_robo_bool = getattr(config, 'robo_ativo', False)
             novo_robo = 'true' if novo_robo_bool else 'false'
             if estado_robo != novo_robo:
@@ -3363,8 +3367,9 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
     engine = get_engine()
     with engine.connect() as conn:
         config_row = conn.execute(text("""
-            SELECT TOP 1 tenant_id, client_id, client_secret
-            FROM dbo.nps_configuracoes_email
+            SELECT tenant_id, client_id, client_secret
+            FROM nps_configuracoes_email
+            LIMIT 1
         """)).fetchone()
         
         if not config_row:
@@ -3403,7 +3408,7 @@ async def autorizar_microsoft(requisicao: AutorizarEmailRequest):
         token_protegido = encrypt_data(res["refresh_token"])
 
         with engine.begin() as conn_tx:
-            conn_tx.execute(text("UPDATE dbo.nps_configuracoes_email SET refresh_token = :rt, atualizado_em = GETDATE()"), 
+            conn_tx.execute(text("UPDATE nps_configuracoes_email SET refresh_token = :rt, atualizado_em = NOW()"), 
                          {"rt": token_protegido})
         
     return {"status": "conectado"}
@@ -3432,7 +3437,7 @@ def get_dominios():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            valor = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
+            valor = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
             return {"dominios": valor if valor else ""}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3443,13 +3448,13 @@ def update_dominios(dados: DominiosUpdate):
         engine = get_engine()
         with engine.begin() as conn:
             # Verifica se a chave já existe
-            existe = conn.execute(text("SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
+            existe = conn.execute(text("SELECT 1 FROM nps_configuracoes WHERE chave = 'dominios_permitidos'")).scalar()
             
             if existe:
-                conn.execute(text("UPDATE dbo.nps_configuracoes SET valor = :valor WHERE chave = 'dominios_permitidos'"), {"valor": dados.dominios})
+                conn.execute(text("UPDATE nps_configuracoes SET valor = :valor WHERE chave = 'dominios_permitidos'"), {"valor": dados.dominios})
             else:
                 conn.execute(text("""
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, descricao) 
+                    INSERT INTO nps_configuracoes (chave, valor, descricao) 
                     VALUES ('dominios_permitidos', :valor, 'Lista de domínios permitidos')
                 """), {"valor": dados.dominios})
                 
@@ -3465,8 +3470,8 @@ def contar_elegiveis_nps():
         with engine.connect() as conn:
             sql = text("""
                 SELECT COUNT(*) 
-                FROM dbo.nps_clientes c
-                LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+                FROM nps_clientes c
+                LEFT JOIN nps_disparos d ON c.cliente_id = d.cliente_id
                 WHERE c.ativo = 1 
                 AND (
                     -- 1. Clientes que NUNCA receberam a pesquisa (campos de data nulos)
@@ -3475,9 +3480,9 @@ def contar_elegiveis_nps():
                     OR 
                     
                     -- 2. Clientes que já cumpriram o tempo de carência (recorrencia_dias)
-                    GETDATE() >= DATEADD(day, 
-                        ISNULL((SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'), 90), 
-                        COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)
+                    NOW() >= DATE_ADD(
+                        COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio),
+                        INTERVAL IFNULL((SELECT CAST(valor AS SIGNED) FROM nps_configuracoes WHERE chave = 'recorrencia_dias' LIMIT 1), 90) DAY
                     )
                 )
             """)
@@ -3565,7 +3570,7 @@ async def upload_meu_avatar(file: UploadFile = File(...), usuario_email: str = D
         engine = get_engine()
         with engine.begin() as conn:
             # 1. Busca dados do utilizador
-            user = conn.execute(text("SELECT usuario_id, avatar_url FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
+            user = conn.execute(text("SELECT usuario_id, avatar_url FROM nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
             if not user:
                 raise HTTPException(status_code=404, detail="Utilizador não encontrado.")
 
@@ -3594,7 +3599,7 @@ async def upload_meu_avatar(file: UploadFile = File(...), usuario_email: str = D
             # 🎯 6. Salva apenas o caminho relativo (Ex: /uploads/avatars/foto.jpg)
             url_relativa = f"/uploads/avatars/{novo_nome}"
             
-            conn.execute(text("UPDATE dbo.nps_usuarios SET avatar_url = :url WHERE usuario_id = :id"), 
+            conn.execute(text("UPDATE nps_usuarios SET avatar_url = :url WHERE usuario_id = :id"), 
                          {"url": url_relativa, "id": user['usuario_id']})
             
             # 7. Retorna a URL completa apenas para o Frontend exibir agora
@@ -3611,7 +3616,7 @@ async def remover_meu_avatar(usuario_email: str = Depends(get_current_user)):
     try:
         engine = get_engine()
         with engine.begin() as conn:
-            user = conn.execute(text("SELECT usuario_id, avatar_url FROM dbo.nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
+            user = conn.execute(text("SELECT usuario_id, avatar_url FROM nps_usuarios WHERE email = :e"), {"e": usuario_email}).mappings().first()
             
             if user and user.get('avatar_url'):
                 # Tenta apagar o arquivo fisicamente
@@ -3622,7 +3627,7 @@ async def remover_meu_avatar(usuario_email: str = Depends(get_current_user)):
                     except: pass
                     
                 # Limpa a coluna no banco
-                conn.execute(text("UPDATE dbo.nps_usuarios SET avatar_url = NULL WHERE usuario_id = :id"), {"id": user['usuario_id']})
+                conn.execute(text("UPDATE nps_usuarios SET avatar_url = NULL WHERE usuario_id = :id"), {"id": user['usuario_id']})
                 
         return {"status": "success", "message": "Avatar removido"}
     except Exception as e:
@@ -3642,7 +3647,7 @@ async def listar_sessoes(usuario_id: int): # Em produção, pegamos o ID do Toke
             query = text("""
                 SELECT id, dispositivo, ip_address as ip, localizacao as local, 
                        criado_em as data, revogado
-                FROM dbo.nps_sessoes_ativas 
+                FROM nps_sessoes_ativas 
                 WHERE usuario_id = :uid AND revogado = 0
                 ORDER BY criado_em DESC
             """)
@@ -3657,7 +3662,7 @@ async def encerrar_sessao(sessao_id: int):
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            conn.execute(text("UPDATE dbo.nps_sessoes_ativas SET revogado = 1 WHERE id = :sid"), {"sid": sessao_id})
+            conn.execute(text("UPDATE nps_sessoes_ativas SET revogado = 1 WHERE id = :sid"), {"sid": sessao_id})
             conn.commit()
             return {"detail": "Sessão encerrada"}
     except Exception as e:
@@ -3673,7 +3678,7 @@ def obter_configuracoes_seguranca(usuario_email: str = Depends(get_current_user)
         engine = get_engine()
         with engine.connect() as conn:
             # Vai buscar o tempo atual ao banco de dados
-            query = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")
+            query = text("SELECT valor FROM nps_configuracoes WHERE chave = 'sessao_expiracao_minutos'")
             resultado = conn.execute(query).scalar()
             
             # Se não encontrar ou houver erro, assume 60 minutos por segurança
@@ -3691,10 +3696,10 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(text("""
-                IF EXISTS (SELECT 1 FROM dbo.nps_configuracoes WHERE chave = 'sessao_expiracao_minutos')
-                    UPDATE dbo.nps_configuracoes SET valor = :valor, updated_at = SYSUTCDATETIME() WHERE chave = 'sessao_expiracao_minutos'
+                IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = 'sessao_expiracao_minutos')
+                    UPDATE nps_configuracoes SET valor = :valor, updated_at = UTC_TIMESTAMP(6) WHERE chave = 'sessao_expiracao_minutos'
                 ELSE
-                    INSERT INTO dbo.nps_configuracoes (chave, valor, updated_at) VALUES ('sessao_expiracao_minutos', :valor, SYSUTCDATETIME())
+                    INSERT INTO nps_configuracoes (chave, valor, updated_at) VALUES ('sessao_expiracao_minutos', :valor, UTC_TIMESTAMP(6))
             """), {"valor": str(payload.tempo_minutos)})
             
         return {"status": "success", "message": "Tempo de sessão atualizado com sucesso!"}
@@ -3711,11 +3716,11 @@ def build_bi_filters(periodo: str, segmento: str, arr: str, safra: str):
 
     # 1. PERÍODO (Baseado na data da resposta)
     if periodo == "Últimos 3 Meses":
-        where_clauses.append("r.data_resposta >= DATEADD(month, -3, GETDATE())")
+        where_clauses.append("r.data_resposta >= DATE_SUB(NOW(), INTERVAL 3 MONTH)")
     elif periodo == "Últimos 6 Meses":
-        where_clauses.append("r.data_resposta >= DATEADD(month, -6, GETDATE())")
+        where_clauses.append("r.data_resposta >= DATE_SUB(NOW(), INTERVAL 6 MONTH)")
     elif periodo == "Este Ano":
-        where_clauses.append("YEAR(r.data_resposta) = YEAR(GETDATE())")
+        where_clauses.append("YEAR(r.data_resposta) = YEAR(NOW())")
 
     # 2. SEGMENTO
     if segmento != "Todos":
@@ -3733,11 +3738,11 @@ def build_bi_filters(periodo: str, segmento: str, arr: str, safra: str):
     # 4. SAFRA / TEMPO DE CASA (Assumindo que a empresa tem coluna 'created_at')
     # Se a sua coluna se chamar 'data_criacao', altere abaixo:
     if safra == "0-3 Meses (Onboarding)":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) <= 3")
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) <= 3")
     elif safra == "3-12 Meses":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) > 3 AND DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) <= 12")
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) > 3 AND DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) <= 12")
     elif safra == "+1 Ano":
-        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, GETDATE()), GETDATE()) > 12")
+        where_clauses.append("DATEDIFF(month, COALESCE(e.created_at, NOW()), NOW()) > 12")
 
     where_sql = " AND ".join(where_clauses)
     return where_sql, params
@@ -3759,9 +3764,9 @@ def obter_performance_gestor(gestor_id: int, usuario_email: str = Depends(get_cu
                     COUNT(r.resposta_id) as total,
                     COALESCE(SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END), 0) as promotores,
                     COALESCE(SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END), 0) as detratores
-                FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                INNER JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+                FROM nps_respostas r
+                INNER JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                INNER JOIN nps_empresas e ON c.empresa_id = e.id
                 WHERE e.gestor_id = :gestor_id
             """)
             res = conn.execute(sql_nps, {"gestor_id": gestor_id}).mappings().first()
@@ -3782,8 +3787,8 @@ def obter_performance_gestor(gestor_id: int, usuario_email: str = Depends(get_cu
                     e.nome,
                     COALESCE(AVG(CAST(r.nota AS FLOAT)), 0) as media_nota,
                     COUNT(r.resposta_id) as qtd_respostas
-                FROM dbo.nps_empresas e
-                LEFT JOIN dbo.nps_respostas r ON e.nome = r.empresa
+                FROM nps_empresas e
+                LEFT JOIN nps_respostas r ON e.nome = r.empresa
                 WHERE e.gestor_id = :gestor_id
                 GROUP BY e.nome
                 ORDER BY media_nota DESC
@@ -3818,8 +3823,8 @@ async def get_bi_scatter(periodo: str = Query("Últimos 6 Meses"), segmento: str
                     COALESCE(r.categoria, 'Sem Classificação') as tema,
                     COUNT(r.resposta_id) as frequencia,
                     AVG(CAST(r.nota AS FLOAT)) as nota_media
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                FROM nps_respostas r
+                LEFT JOIN nps_empresas e ON r.empresa_id = e.id
                 WHERE {where_sql} AND r.categoria IS NOT NULL
                 GROUP BY r.categoria
                 HAVING COUNT(r.resposta_id) > 1
@@ -3844,22 +3849,22 @@ async def get_bi_safra(periodo: str = Query("Últimos 6 Meses"), segmento: str =
             sql = text(f"""
                 SELECT 
                     CASE 
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 3 THEN '0-3 Meses'
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 6 THEN '3-6 Meses'
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 12 THEN '6-12 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
                         ELSE '+1 Ano'
                     END as safra_grupo,
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                     SUM(CASE WHEN r.nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) as neutros,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
-                FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                FROM nps_respostas r
+                INNER JOIN nps_empresas e ON r.empresa_id = e.id
                 WHERE {where_sql}
                 GROUP BY 
                     CASE 
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 3 THEN '0-3 Meses'
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 6 THEN '3-6 Meses'
-                        WHEN DATEDIFF(month, e.created_at, GETDATE()) <= 12 THEN '6-12 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 3 THEN '0-3 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 6 THEN '3-6 Meses'
+                        WHEN DATEDIFF(month, e.created_at, NOW()) <= 12 THEN '6-12 Meses'
                         ELSE '+1 Ano'
                     END
             """)
@@ -3903,8 +3908,8 @@ async def get_bi_risco(periodo: str = Query("Últimos 6 Meses"), segmento: str =
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores,
                     MAX(COALESCE(e.valor_contrato, 0)) as arr
-                FROM dbo.nps_respostas r
-                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                FROM nps_respostas r
+                INNER JOIN nps_empresas e ON r.empresa_id = e.id
                 WHERE {where_sql}
                 GROUP BY e.id, e.nome
             """)
@@ -3936,7 +3941,7 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
         
         engine = get_engine()
         with engine.connect() as conn:
-            api_key = conn.execute(text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
+            api_key = conn.execute(text("SELECT valor FROM nps_configuracoes WHERE chave = 'openai_api_key'")).scalar()
             
             if not api_key:
                 return {
@@ -3950,8 +3955,8 @@ async def get_bi_ia_reports(periodo: str = Query("Últimos 6 Meses"), segmento: 
                     COUNT(r.resposta_id) as total_respostas,
                     SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as total_detratores,
                     SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as total_promotores
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_empresas e ON r.empresa_id = e.id
+                FROM nps_respostas r
+                LEFT JOIN nps_empresas e ON r.empresa_id = e.id
                 WHERE {where_sql}
             """)
             dados = conn.execute(sql_contexto, params).mappings().first()
@@ -4019,9 +4024,9 @@ async def get_bi_segmento(periodo: str = Query("Últimos 6 Meses"), segmento: st
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
                         (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
                     ) as nps
-                FROM dbo.nps_respostas r
+                FROM nps_respostas r
                 -- O vínculo crucial é r.empresa_id -> e.id
-                INNER JOIN dbo.nps_empresas e ON r.empresa_id = e.id 
+                INNER JOIN nps_empresas e ON r.empresa_id = e.id 
                 WHERE {where_sql} 
                   AND (r.excluido = 0 OR r.excluido IS NULL)
                 GROUP BY COALESCE(e.segmento, 'Sem Segmento')
@@ -4060,9 +4065,9 @@ def relatorio_jornada(empresa: str, data_inicio: str = None, data_fim: str = Non
                         (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
                         (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
                     ) as nps_atual
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+                FROM nps_respostas r
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON c.empresa_id = e.id
 WHERE e.nome = :empresa
                 AND (r.excluido = 0 OR r.excluido IS NULL) -- 👈 O SEGREDO ESTÁ AQUI: Ignorar apagados!
                 {filtro_data}
@@ -4079,9 +4084,9 @@ WHERE e.nome = :empresa
                     r.motivo, 
                     COALESCE(r.data_resposta, r.created_at) as data_bruta, 
                     'E-mail' as canal -- 👈 CORRIGIDO: Removido o r.origem que causava o erro 207
-                FROM dbo.nps_respostas r
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
+                FROM nps_respostas r
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_empresas e ON c.empresa_id = e.id
                 WHERE e.nome = :empresa
                 AND (r.excluido = 0 OR r.excluido IS NULL)
                 {filtro_data}
@@ -4130,12 +4135,12 @@ def obter_dados_operacionais(
             sql_taxa = text("""
                 SELECT 
                     -- Denominador: Todos os clientes ativos (Base Real)
-                    (SELECT COUNT(*) FROM dbo.nps_clientes WHERE ativo = 1) as total_base,
+                    (SELECT COUNT(*) FROM nps_clientes WHERE ativo = 1) as total_base,
                     
                     -- Numerador: Respondentes únicos que estão ativos e dentro do período
                     (SELECT COUNT(DISTINCT r.cliente_id) 
-                     FROM dbo.nps_respostas r
-                     INNER JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
+                     FROM nps_respostas r
+                     INNER JOIN nps_clientes c ON r.cliente_id = c.cliente_id
                      WHERE c.ativo = 1 
                        AND r.excluido = 0
                        AND (:inicio IS NULL OR r.data_resposta >= :inicio)
@@ -4148,7 +4153,7 @@ def obter_dados_operacionais(
             sql_sla = text("""
                 SELECT 
                     AVG(CAST(DATEDIFF(minute, created_at, updated_at) AS FLOAT) / 60.0 / 24.0) as sla_real_dias
-                FROM dbo.nps_acoes 
+                FROM nps_acoes 
                 WHERE status = 'Concluído' 
                   AND updated_at IS NOT NULL 
                   AND updated_at >= created_at
@@ -4172,7 +4177,7 @@ def obter_lista_gestores_com_empresas(usuario_email: str = Depends(get_current_u
         with engine.connect() as conn:
             sql = text("""
                 SELECT id, nome 
-                FROM dbo.nps_gestores 
+                FROM nps_gestores 
                 ORDER BY nome
             """)
             result = conn.execute(sql).fetchall()
@@ -4186,7 +4191,7 @@ def relatorio_clientes_inativos(usuario_email: str = Depends(get_current_user)):
         engine = get_engine()
         with engine.connect() as conn:
             # 1. Puxa a regra de recorrência atual
-            sql_regra = text("SELECT TOP 1 TRY_CAST(valor AS INT) FROM dbo.nps_configuracoes WHERE chave = 'recorrencia_dias'")
+            sql_regra = text("SELECT CAST(valor AS SIGNED) FROM nps_configuracoes WHERE chave = 'recorrencia_dias' LIMIT 1")
             recorrencia_dias = conn.execute(sql_regra).scalar()
             recorrencia_dias = recorrencia_dias if recorrencia_dias is not None else 90
 
@@ -4198,17 +4203,17 @@ def relatorio_clientes_inativos(usuario_email: str = Depends(get_current_user)):
                     c.email as cliente_email,
                     -- Pega a data mais recente de interação (envio ou resposta)
                     MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)) as data_envio,
-                    DATEDIFF(day, MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)), GETDATE()) as dias_sem_resposta
-                FROM dbo.nps_clientes c
-                LEFT JOIN dbo.nps_empresas e ON c.empresa_id = e.id
-                LEFT JOIN dbo.nps_disparos d ON c.cliente_id = d.cliente_id
+                    DATEDIFF(day, MAX(COALESCE(d.data_ultimo_lembrete, d.data_envio_inicial, c.ultimo_envio)), NOW()) as dias_sem_resposta
+                FROM nps_clientes c
+                LEFT JOIN nps_empresas e ON c.empresa_id = e.id
+                LEFT JOIN nps_disparos d ON c.cliente_id = d.cliente_id
                 
                 -- 👇 A CORREÇÃO ENTRA AQUI NO WHERE 👇
                 WHERE c.ativo = 1 
                 AND (e.ativo = 1 OR e.ativo IS NULL) -- Garante que a empresa do cliente também não deu churn
                 
                 -- Filtros normais da sua query (exemplo):
-                -- AND DATEDIFF(day, ..., GETDATE()) > :recorrencia_dias
+                -- AND DATEDIFF(day, ..., NOW()) > :recorrencia_dias
                 
                 GROUP BY c.empresa, c.nome, c.email
                 ORDER BY dias_sem_resposta DESC
@@ -4243,7 +4248,7 @@ def criar_acao(acao: AcaoCriar):
         engine = get_engine()
         with engine.begin() as conn:
             sql = text("""
-                INSERT INTO dbo.nps_acoes 
+                INSERT INTO nps_acoes 
                 (resposta_id, empresa_id, gestor_id, titulo, descricao, resolucao, prioridade, prazo_limite)
                 VALUES (:rid, :eid, :gid, :t, :d, :resol, :p, :pl)
             """)
@@ -4296,11 +4301,11 @@ def listar_acoes(gestor_id: Optional[int] = None, status: Optional[str] = None):
                     COALESCE(g.nome, e.gestor, 'Sem Gestor') as gestor_nome,
                     g.avatar as gestor_avatar,
                     r.nota as resposta_nota
-                FROM dbo.nps_acoes a
-                LEFT JOIN dbo.nps_empresas e ON a.empresa_id = e.id
-                LEFT JOIN dbo.nps_respostas r ON a.resposta_id = r.resposta_id
-                LEFT JOIN dbo.nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN dbo.nps_gestores g ON a.gestor_id = g.id
+                FROM nps_acoes a
+                LEFT JOIN nps_empresas e ON a.empresa_id = e.id
+                LEFT JOIN nps_respostas r ON a.resposta_id = r.resposta_id
+                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                LEFT JOIN nps_gestores g ON a.gestor_id = g.id
                 {condicao}
                 ORDER BY 
                     CASE a.status 
@@ -4324,7 +4329,7 @@ def atualizar_acao(acao_id: int, acao: AcaoAtualizar):
         engine = get_engine()
         with engine.begin() as conn:
             sql = text("""
-                UPDATE dbo.nps_acoes 
+                UPDATE nps_acoes 
                 SET status = COALESCE(:s, status),
                     prioridade = COALESCE(:p, prioridade),
                     descricao = COALESCE(:d, descricao),
@@ -4356,7 +4361,7 @@ def excluir_acao(acao_id: int):
         engine = get_engine()
         with engine.begin() as conn:
             # Remove a ação pelo ID único
-            sql = text("DELETE FROM dbo.nps_acoes WHERE id = :id")
+            sql = text("DELETE FROM nps_acoes WHERE id = :id")
             conn.execute(sql, {"id": acao_id})
         return {"status": "success", "message": "Ação excluída com sucesso!"}
     except Exception as e:
@@ -4393,16 +4398,17 @@ def listar_logs(usuario: Any = Depends(exigir_admin)):
         engine = get_engine()
         with engine.connect() as conn:
             query = text("""
-                SELECT TOP 200 
+                SELECT
                     l.id, 
                     l.nivel, 
                     l.acao, 
                     l.mensagem, 
                     l.data_criacao,
                     u.nome as usuario_nome
-                FROM dbo.nps_logs l
-                LEFT JOIN dbo.nps_usuarios u ON l.usuario_id = u.usuario_id
+                FROM nps_logs l
+                LEFT JOIN nps_usuarios u ON l.usuario_id = u.usuario_id
                 ORDER BY l.data_criacao DESC
+                LIMIT 200
             """)
             
             resultados = conn.execute(query).mappings().all()
@@ -4434,7 +4440,7 @@ def registrar_log(acao: str, mensagem: str, nivel: str = 'INFO', usuario_id: int
         engine = get_engine()
         with engine.begin() as conn:  # .begin() faz o commit automático
             sql = text("""
-                INSERT INTO dbo.nps_logs (nivel, acao, mensagem, usuario_id)
+                INSERT INTO nps_logs (nivel, acao, mensagem, usuario_id)
                 VALUES (:nivel, :acao, :mensagem, :usuario_id)
             """)
             conn.execute(sql, {
@@ -4477,7 +4483,7 @@ def listar_logs_emails():
                 ) as mensagem, 
                 
                 COALESCE(data_envio_inicial, created_at) as data_envio
-            FROM dbo.nps_disparos
+            FROM nps_disparos
             ORDER BY created_at DESC
         """)
         
@@ -4489,3 +4495,5 @@ def listar_logs_emails():
     except Exception as e:
         print(f"❌ Erro ao listar logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+

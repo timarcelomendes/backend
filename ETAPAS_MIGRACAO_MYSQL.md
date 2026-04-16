@@ -10,9 +10,9 @@ Como usar:
 
 Status geral:
 - [x] Etapa 0 - Baseline e backup
-- [ ] Etapa 1 - Ambiente MySQL pronto
-- [ ] Etapa 2 - Configuracao de conexao no backend
-- [ ] Etapa 3 - Conversao inicial de queries criticas
+- [x] Etapa 1 - Ambiente MySQL pronto
+- [x] Etapa 2 - Configuracao de conexao no backend
+- [x] Etapa 3 - Conversao inicial de queries criticas
 - [ ] Etapa 4 - Ajuste das queries de relatorios e filtros
 - [ ] Etapa 5 - Testes funcionais por modulo
 - [ ] Etapa 6 - Validacao final de consistencia
@@ -40,25 +40,25 @@ Validacao esperada:
 
 ## Etapa 1 - Ambiente MySQL pronto
 
-Status: [ ]
+Status: [x]
 
 Objetivo:
 Garantir que o banco de destino esta estavel e acessivel.
 
 Checklist:
-- [ ] Subir servico MySQL.
-- [ ] Confirmar usuario, senha, schema e collation.
-- [ ] Confirmar acesso a partir do container do backend.
+- [x] Subir servico MySQL.
+- [x] Confirmar usuario, senha, schema e collation.
+- [x] Confirmar acesso a partir do container do backend.
 
 Validacao esperada:
-- [ ] Conexao MySQL funciona de dentro do backend.
-- [ ] As 16 tabelas nps_ existem no schema nps.
+- [x] Conexao MySQL funciona de dentro do backend.
+- [x] As 16 tabelas nps_ existem no schema nps.
 
 ---
 
 ## Etapa 2 - Configuracao de conexao no backend
 
-Status: [ ]
+Status: [x]
 
 Objetivo:
 Trocar a conexao padrao da API para MySQL.
@@ -70,21 +70,21 @@ Arquivos alvo:
 - Dockerfile
 
 Checklist:
-- [ ] Trocar engine SQLAlchemy para mysql+pymysql em database.py.
-- [ ] Ler variaveis MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD.
-- [ ] Manter variaveis MSSQL apenas para scripts de migracao/validacao (nao para runtime da API).
-- [ ] Garantir pymysql em requirements.
-- [ ] Remover dependencia de runtime em drivers SQL Server no Dockerfile, se nao forem mais necessarios.
+- [x] Trocar engine SQLAlchemy para mysql+pymysql em database.py.
+- [x] Ler variaveis MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD.
+- [x] Manter variaveis MSSQL apenas para scripts de migracao/validacao (nao para runtime da API).
+- [x] Garantir pymysql em requirements.
+- [x] Remover dependencia de runtime em drivers SQL Server no Dockerfile, se nao forem mais necessarios.
 
 Validacao esperada:
-- [ ] Endpoint de health sobe com backend conectado ao MySQL.
-- [ ] Log do backend nao mostra tentativa de conexao SQL Server em runtime.
+- [x] Endpoint de health sobe com backend conectado ao MySQL.
+- [x] Log do backend nao mostra tentativa de conexao SQL Server em runtime.
 
 ---
 
 ## Etapa 3 - Conversao inicial de queries criticas
 
-Status: [ ]
+Status: [x]
 
 Objetivo:
 Converter primeiro as queries de autenticacao, configuracao e fluxos principais.
@@ -109,14 +109,14 @@ Mapa de conversao SQL:
 - IF EXISTS + UPDATE/INSERT -> SELECT previo + UPDATE/INSERT ou INSERT ... ON DUPLICATE KEY UPDATE
 
 Checklist:
-- [ ] Remover prefixo dbo de todas as tabelas usadas nesses modulos.
-- [ ] Converter TOP/GETDATE/DATEADD/DATEDIFF/ISNULL/LEN.
-- [ ] Substituir blocos IF EXISTS/BEGIN/END por logica compativel com MySQL.
+- [x] Remover prefixo dbo de todas as tabelas usadas nesses modulos.
+- [x] Converter TOP/GETDATE/DATEADD/DATEDIFF/ISNULL/LEN.
+- [x] Substituir blocos IF EXISTS/BEGIN/END por logica compativel com MySQL.
 
 Validacao esperada:
-- [ ] Login funciona.
-- [ ] Leitura e escrita de configuracoes funciona.
-- [ ] Endpoints de respostas/clientes/chat retornam sem erro SQL.
+- [x] Login funciona.
+- [x] Leitura e escrita de configuracoes funciona.
+- [x] Endpoints de respostas/clientes/chat retornam sem erro SQL.
 
 ---
 

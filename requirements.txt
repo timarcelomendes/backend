@@ -7,11 +7,11 @@ gunicorn
 python-multipart
 
 # ==========================================
-# 🗄️ BANCO DE DADOS (SQL Server)
+# 🗄️ BANCO DE DADOS
 # ==========================================
 sqlalchemy
 pyodbc
-pymssql
+pymysql
 
 # ==========================================
 # 🔐 SEGURANÇA, AUTENTICAÇÃO E SSO
@@ -38,8 +38,3 @@ apscheduler
 # 🤖 INTELIGÊNCIA ARTIFICIAL
 # ==========================================
 openai
-
-# ==========================================
-# 🗄️ BANCO DE DADOS MYSQL (migração)
-# ==========================================
-pymysql
