@@ -582,6 +582,12 @@ async def login(requisicao: LoginRequest, request: Request):
                     status_code=status.HTTP_403_FORBIDDEN, 
                     detail="A sua conta está inativa ou aguarda aprovação do administrador."
                 )
+            
+            if len(requisicao.password.encode('utf-8')) > 72:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, 
+                    detail="A palavra-passe digitada está incorreta."
+                )
 
             try:
                 senha_correta = bcrypt.checkpw(
