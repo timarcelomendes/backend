@@ -582,10 +582,17 @@ async def login(requisicao: LoginRequest, request: Request):
                     status_code=status.HTTP_403_FORBIDDEN, 
                     detail="A sua conta está inativa ou aguarda aprovação do administrador."
                 )
+            
+            if len(requisicao.password.encode('utf-8')) > 72:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, 
+                    detail="A palavra-passe digitada está incorreta."
+                )
 
             try:
+                senha_segura = requisicao.password[:72]
                 senha_correta = bcrypt.checkpw(
-                    requisicao.password.encode('utf-8'), 
+                    senha_segura.encode('utf-8'), 
                     resultado["senha_hash"].encode('utf-8')
                 )
             except Exception as e:
@@ -938,8 +945,9 @@ async def resetar_senha(
 
         validar_senha_forte(req.nova_senha)
 
-        # 3. Mantém o mesmo padrão de hash usado nas outras rotas de senha
-        senha_encriptada = bcrypt.hashpw(req.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        # 3. Se a senha for forte, continua para a encriptação
+        senha_segura = req.nova_senha[:72] 
+        senha_encriptada = pwd_context.hash(senha_segura)
         
         with engine.begin() as conn:
             query_update = text("""
