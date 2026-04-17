@@ -622,15 +622,26 @@ def enviar_email_confirmacao(email_destino: str, nome_usuario: str, secret_key: 
         registrar_log_disparo(email_destino, nome_usuario, "Erro", "Confirme o seu e-mail", erro=str(e), url=link_confirmacao)
         return False
     
+import re
+from fastapi import HTTPException
+
 def validar_senha_forte(password: str):
     """
-    Critérios de segurança atualizados para evitar estouro do Bcrypt
+    Critérios de segurança atualizados para evitar o estouro físico do Bcrypt na Azure
     """
+    # 🎯 1. A PROTEÇÃO CONTRA O CRASH (Conta os BYTES reais, não apenas caracteres)
+    if len(password.encode('utf-8')) > 72:
+        raise HTTPException(
+            status_code=400, 
+            detail="A senha excede o limite máximo de tamanho seguro. Reduza a quantidade de caracteres."
+        )
+
+    # 2. As tuas validações de UX (Alinhadas com o Vue)
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 8 caracteres.")
     
-    if len(password) > 70:
-        raise HTTPException(status_code=400, detail="A senha é demasiado longa. O limite é de 70 caracteres.")
+    if len(password) > 50:
+        raise HTTPException(status_code=400, detail="A senha é demasiado longa. O limite é de 50 caracteres.")
     
     if not re.search(r"[A-Z]", password):
         raise HTTPException(status_code=400, detail="A senha deve conter pelo menos uma letra maiúscula.")
@@ -638,5 +649,5 @@ def validar_senha_forte(password: str):
     if not re.search(r"[0-9]", password):
         raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um número.")
         
-    if not re.search(r"[@$!%*?&]", password):
+    if not re.search(r"[^A-Za-z0-9]", password):
         raise HTTPException(status_code=400, detail="A senha deve conter pelo menos um caractere especial.")
