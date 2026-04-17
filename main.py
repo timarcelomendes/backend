@@ -590,8 +590,9 @@ async def login(requisicao: LoginRequest, request: Request):
                 )
 
             try:
+                senha_segura = requisicao.password[:72]
                 senha_correta = bcrypt.checkpw(
-                    requisicao.password.encode('utf-8'), 
+                    senha_segura.encode('utf-8'), 
                     resultado["senha_hash"].encode('utf-8')
                 )
             except Exception as e:
@@ -945,7 +946,8 @@ async def resetar_senha(
         validar_senha_forte(req.nova_senha)
 
         # 3. Se a senha for forte, continua para a encriptação
-        senha_encriptada = pwd_context.hash(req.nova_senha)
+        senha_segura = req.nova_senha[:72] 
+        senha_encriptada = pwd_context.hash(senha_segura)
         
         with engine.begin() as conn:
             query_update = text("""
