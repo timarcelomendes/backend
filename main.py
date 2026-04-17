@@ -930,8 +930,8 @@ async def resetar_senha(
 
         validar_senha_forte(req.nova_senha)
 
-        # 3. Se a senha for forte, continua para a encriptação
-        senha_encriptada = pwd_context.hash(req.nova_senha)
+        # 3. Mantém o mesmo padrão de hash usado nas outras rotas de senha
+        senha_encriptada = bcrypt.hashpw(req.nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         
         with engine.begin() as conn:
             query_update = text("""
@@ -2433,8 +2433,7 @@ def create_cliente_route(payload: ClienteCreate):
             payload.empresa_id,  # 👈 Passando o ID
             payload.perfil_id,   # 👈 Passando o ID
             payload.segmento_id, # 👈 Passando o ID
-            payload.cargo_id,    # 👈 Passando o ID
-            payload.gestor
+            payload.cargo_id     # 👈 Passando o ID
         )
         return {"status": "success", "cliente_id": novo_id, "message": "Cliente cadastrado!"}
     except Exception as e:
@@ -2658,24 +2657,33 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
         novo_id_resposta = f"manual_{uuid.uuid4().hex[:16]}"
 
         with engine.begin() as conn:
-            # 2. Obter o nome da empresa associada a este cliente
-            sql_cliente = text("SELECT empresa FROM nps_clientes WHERE cliente_id = :cliente_id")
+            # 2. Obter empresa_id e nome da empresa associados ao cliente
+            sql_cliente = text("""
+                SELECT
+                    c.empresa_id,
+                    COALESCE(e.nome, c.empresa) AS empresa_nome
+                FROM nps_clientes c
+                LEFT JOIN nps_empresas e ON c.empresa_id = e.id
+                WHERE c.cliente_id = :cliente_id
+            """)
             resultado_cliente = conn.execute(sql_cliente, {"cliente_id": resp.cliente_id}).fetchone()
             
             if not resultado_cliente:
                 raise HTTPException(status_code=404, detail="Cliente não encontrado.")
             
-            empresa_nome = resultado_cliente.empresa
+            empresa_id = resultado_cliente.empresa_id
+            empresa_nome = resultado_cliente.empresa_nome
 
             # 3. Inserir a resposta (Agora com o resposta_id obrigatório e fuso horário corrigido)
             sql_insert = text("""
                 INSERT INTO nps_respostas 
-                (resposta_id, cliente_id, empresa, nota, motivo, canal, data_resposta, created_at, excluido) 
-                VALUES (:res_id, :cliente_id, :empresa, :nota, :motivo, :canal, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0)
+                (resposta_id, cliente_id, empresa_id, empresa, nota, motivo, canal, data_resposta, created_at, excluido) 
+                VALUES (:res_id, :cliente_id, :empresa_id, :empresa, :nota, :motivo, :canal, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 0)
             """)
             conn.execute(sql_insert, {
                 "res_id": novo_id_resposta,
                 "cliente_id": resp.cliente_id,
+                "empresa_id": empresa_id,
                 "empresa": empresa_nome,
                 "nota": resp.nota,
                 "motivo": resp.motivo,
@@ -2699,18 +2707,14 @@ def inserir_resposta_manual(resp: RespostaManual, usuario_email: str = Depends(g
             conn.execute(sql_update_cliente, {"cliente_id": resp.cliente_id})
 
             # 5. CRIAR AÇÃO AUTOMÁTICA PARA DETRATORES
-            if resp.nota <= 6:
-                sql_empresa_id = text("SELECT id FROM nps_empresas WHERE nome = :nome")
-                res_emp = conn.execute(sql_empresa_id, {"nome": empresa_nome}).fetchone()
-                
-                if res_emp:
+            if resp.nota <= 6 and empresa_id:
                     sql_acao = text("""
                         INSERT INTO nps_acoes (empresa_id, resposta_id, descricao, prioridade, status, data_criacao)
                         VALUES (:emp_id, :res_id, :desc, 'Alta', 'Pendente', UTC_TIMESTAMP(6))
                     """)
                     desc = f"Tratar Detrator (Nota {resp.nota}). Feedback inserido manualmente via {resp.canal}."
                     conn.execute(sql_acao, {
-                        "emp_id": res_emp.id, 
+                        "emp_id": empresa_id,
                         "res_id": novo_id_resposta, # 🎯 Vincula a ação à resposta que acabámos de criar
                         "desc": desc
                     })
@@ -3696,10 +3700,11 @@ def salvar_configuracoes_seguranca(payload: SegurancaConfig, usuario_email: str 
         engine = get_engine()
         with engine.begin() as conn:
             conn.execute(text("""
-                IF EXISTS (SELECT 1 FROM nps_configuracoes WHERE chave = 'sessao_expiracao_minutos')
-                    UPDATE nps_configuracoes SET valor = :valor, updated_at = UTC_TIMESTAMP(6) WHERE chave = 'sessao_expiracao_minutos'
-                ELSE
-                    INSERT INTO nps_configuracoes (chave, valor, updated_at) VALUES ('sessao_expiracao_minutos', :valor, UTC_TIMESTAMP(6))
+                INSERT INTO nps_configuracoes (chave, valor, updated_at)
+                VALUES ('sessao_expiracao_minutos', :valor, UTC_TIMESTAMP(6))
+                ON DUPLICATE KEY UPDATE
+                    valor = VALUES(valor),
+                    updated_at = VALUES(updated_at)
             """), {"valor": str(payload.tempo_minutos)})
             
         return {"status": "success", "message": "Tempo de sessão atualizado com sucesso!"}

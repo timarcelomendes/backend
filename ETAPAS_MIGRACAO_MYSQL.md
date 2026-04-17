@@ -14,7 +14,7 @@ Status geral:
 - [x] Etapa 2 - Configuracao de conexao no backend
 - [x] Etapa 3 - Conversao inicial de queries criticas
 - [x] Etapa 4 - Ajuste das queries de relatorios e filtros
-- [ ] Etapa 5 - Testes funcionais por modulo
+- [x] Etapa 5 - Testes funcionais por modulo
 - [ ] Etapa 6 - Validacao final de consistencia
 - [ ] Etapa 7 - Go-live
 
@@ -130,22 +130,22 @@ Validacao esperada:
 
 ## Etapa 5 - Testes funcionais por modulo
 
-Status: [ ]
+Status: [x]
 
 Objetivo:
 Validar comportamento completo da API com MySQL.
 
 Checklist:
-- [ ] Autenticacao: login, refresh de sessao, alterar senha, reset de senha.
-- [ ] Cadastros: clientes, empresas, perfis, segmentos, cargos, gestores.
-- [ ] Respostas: listagem, filtros, edicao, exclusao logica.
-- [ ] Acoes: criacao, atualizacao de status, kanban.
-- [ ] Disparos/email: fila, envio, status_envio, erros.
-- [ ] Configuracoes: leitura e persistencia.
+- [x] Autenticacao: login, refresh de sessao, alterar senha, reset de senha.
+- [x] Cadastros: clientes, empresas, perfis, segmentos, cargos, gestores.
+- [x] Respostas: listagem, filtros, edicao, exclusao logica.
+- [x] Acoes: criacao, atualizacao de status, kanban.
+- [x] Disparos/email: fila, envio, status_envio, erros.
+- [x] Configuracoes: leitura e persistencia.
 
 Validacao esperada:
-- [ ] Sem erro 500 por SQL em rotas principais.
-- [ ] Sem regressao funcional critica.
+- [x] Sem erro 500 por SQL em rotas principais.
+- [x] Sem regressao funcional critica.
 
 ---
 

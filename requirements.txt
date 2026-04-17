@@ -30,6 +30,7 @@ slowapi
 # ==========================================
 python-dotenv
 requests
+pytest
 pandas
 openpyxl
 apscheduler
