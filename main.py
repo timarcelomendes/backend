@@ -974,7 +974,10 @@ async def resetar_senha(
         background_tasks.add_task(enviar_email_senha_alterada, email_usuario, nome_usuario)
             
         return {"status": "success", "message": "Palavra-passe alterada com sucesso!"}
-            
+    except Exception as e:
+        enviar_alerta_tecnico_teams(f"ERRO REAL NA AZURE: {type(e).__name__} - {str(e)}") 
+        print(f"❌ Erro: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro Técnico: {str(e)}")        
     except HTTPException: raise
     except Exception as e:
         enviar_alerta_tecnico_teams(f"Falha ao atualizar a Hash de Palavra-passe no BD: {str(e)}")
