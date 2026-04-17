@@ -7,11 +7,11 @@ gunicorn
 python-multipart
 
 # ==========================================
-# 🗄️ BANCO DE DADOS (SQL Server)
+# 🗄️ BANCO DE DADOS
 # ==========================================
 sqlalchemy
 pyodbc
-pymssql
+pymysql
 
 # ==========================================
 # 🔐 SEGURANÇA, AUTENTICAÇÃO E SSO
@@ -30,6 +30,7 @@ slowapi
 # ==========================================
 python-dotenv
 requests
+pytest
 pandas
 openpyxl
 apscheduler

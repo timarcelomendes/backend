@@ -5,15 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Dependencias necessarias para pacotes Python e conexao SQL Server via pymssql/pyodbc
+# Dependencias base para build de pacotes Python
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
-    freetds-dev \
-    freetds-bin \
-    unixodbc-dev \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

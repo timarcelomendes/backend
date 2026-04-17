@@ -11,7 +11,7 @@ def get_openai_token():
     try:
         engine = get_engine()
         with engine.connect() as conn:
-            sql = text("SELECT valor FROM dbo.nps_configuracoes WHERE chave = 'openai_api_key'")
+            sql = text("SELECT valor FROM nps_configuracoes WHERE chave = 'openai_api_key'")
             token = conn.execute(sql).scalar()
             
             if not token:

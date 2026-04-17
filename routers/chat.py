@@ -88,15 +88,15 @@ def db_obter_metricas_empresa(nome_empresa: str, comparar: bool = False):
 
             # 🎯 SQL TRIMESTRAL: Janelas de 0-90 dias vs 91-180 dias
             sql = text(f"""
-                SELECT 
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) <= 90 THEN 1 ELSE 0 END) as total_atual,
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) <= 90 AND nota >= 9 THEN 1 ELSE 0 END) as prom_atual,
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) <= 90 AND nota <= 6 THEN 1 ELSE 0 END) as detr_atual,
-                    
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) BETWEEN 91 AND 180 THEN 1 ELSE 0 END) as total_ant,
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) BETWEEN 91 AND 180 AND nota >= 9 THEN 1 ELSE 0 END) as prom_ant,
-                    SUM(CASE WHEN DATEDIFF(day, created_at, GETDATE()) BETWEEN 91 AND 180 AND nota <= 6 THEN 1 ELSE 0 END) as detr_ant
-                FROM dbo.nps_respostas r 
+                SELECT
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) <= 90 THEN 1 ELSE 0 END) as total_atual,
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) <= 90 AND nota >= 9 THEN 1 ELSE 0 END) as prom_atual,
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) <= 90 AND nota <= 6 THEN 1 ELSE 0 END) as detr_atual,
+
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) BETWEEN 91 AND 180 THEN 1 ELSE 0 END) as total_ant,
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) BETWEEN 91 AND 180 AND nota >= 9 THEN 1 ELSE 0 END) as prom_ant,
+                    SUM(CASE WHEN TIMESTAMPDIFF(DAY, created_at, NOW()) BETWEEN 91 AND 180 AND nota <= 6 THEN 1 ELSE 0 END) as detr_ant
+                FROM nps_respostas r
                 {filtro_empresa}
             """)
             
@@ -144,11 +144,12 @@ def db_listar_comentarios_recentes(nome_empresa: str, limite: int = 5):
         engine = get_engine()
         with engine.connect() as conn:
             sql = text("""
-                SELECT TOP (:limite) nota, motivo, created_at
-                FROM dbo.nps_respostas 
-                WHERE (empresa = :nome OR empresa_id = (SELECT id FROM dbo.nps_empresas WHERE nome = :nome))
+                SELECT nota, motivo, created_at
+                FROM nps_respostas
+                WHERE (empresa = :nome OR empresa_id = (SELECT id FROM nps_empresas WHERE nome = :nome))
                   AND motivo IS NOT NULL AND motivo <> '' AND excluido = 0
                 ORDER BY created_at DESC
+                LIMIT :limite
             """)
             res = conn.execute(sql, {"nome": nome_empresa, "limite": limite}).mappings().all()
             return json.dumps([{"nota": r.nota, "comentario": r.motivo} for r in res])
@@ -166,12 +167,13 @@ def db_obter_comentario_especifico(nome_empresa: str, trecho_comentario: str):
         with engine.connect() as conn:
             # 3. 🎯 Usamos UPPER e LIKE na empresa para ignorar espaços em branco
             sql = text("""
-                SELECT TOP 1 motivo, nota, created_at 
-                FROM dbo.nps_respostas 
+                SELECT motivo, nota, created_at
+                FROM nps_respostas
                 WHERE (UPPER(empresa) LIKE UPPER(:nome))
-                  AND motivo LIKE :busca 
+                  AND motivo LIKE :busca
                   AND excluido = 0
                 ORDER BY created_at DESC
+                LIMIT 1
             """)
             
             res = conn.execute(sql, {
@@ -204,16 +206,18 @@ def obter_sugestoes_dinamicas(nome_empresa: str = None):
         with engine.connect() as conn:
             # Busca o detrator mais recente
             detrator = conn.execute(text("""
-                SELECT TOP 1 motivo FROM dbo.nps_respostas 
-                WHERE empresa = :nome AND nota <= 6 AND motivo IS NOT NULL 
+                SELECT motivo FROM nps_respostas
+                WHERE empresa = :nome AND nota <= 6 AND motivo IS NOT NULL
                 ORDER BY created_at DESC
+                LIMIT 1
             """), {"nome": nome_empresa}).scalar()
 
             # Busca o promotor mais recente
             promotor = conn.execute(text("""
-                SELECT TOP 1 motivo FROM dbo.nps_respostas 
-                WHERE empresa = :nome AND nota >= 9 AND motivo IS NOT NULL 
+                SELECT motivo FROM nps_respostas
+                WHERE empresa = :nome AND nota >= 9 AND motivo IS NOT NULL
                 ORDER BY created_at DESC
+                LIMIT 1
             """), {"nome": nome_empresa}).scalar()
 
             sugestoes = []
