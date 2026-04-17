@@ -1789,34 +1789,43 @@ def get_dashboard_detalhes(
                 str_filtro_puro += " AND " + " AND ".join(filtros_sql_puro)
             
             sql_ranking = text(f"""
-                SELECT 
-                    {coluna_nome} as nome,
-                    MAX(g.nome) as gestor, 
-                    MAX(g.avatar) as gestor_avatar,
-                    MAX(CAST(COALESCE(e.ativo, 1) AS INT)) as ativo, 
-                    COUNT(r.resposta_id) as total,
-                    MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
+                WITH ranking_base AS (
+                    SELECT 
+                        {coluna_nome} as nome,
+                        MAX(g.nome) as gestor,
+                        MAX(g.avatar) as gestor_avatar,
+                        MAX(COALESCE(e.ativo, 1)) as ativo,
+                        COUNT(r.resposta_id) as total,
+                        MAX(COALESCE(r.data_resposta, r.created_at)) as data_ultima_resposta,
+                        MAX(e.id) as empresa_ref,
+                        ROUND(
+                            (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
+                            (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
+                        ) as nps
+                    FROM nps_respostas r
+                    LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
+                    LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id 
+                    LEFT JOIN nps_segmentos s ON c.segmento_id = s.id 
+                    LEFT JOIN nps_gestores g ON e.gestor_id = g.id
                     
-                    (SELECT a.id FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_id,
-                    (SELECT a.status FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_status,
-                    -- 🎯 A LINHA ABAIXO FOI ADICIONADA PARA TRAZER A DATA PARA O RADAR:
-                    (SELECT a.created_at FROM nps_acoes a WHERE a.empresa_id = MAX(e.id) ORDER BY a.created_at DESC LIMIT 1) as acao_criada_em,
-
-                    ROUND(
-                        (SUM(CASE WHEN r.nota >= 9 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100) - 
-                        (SUM(CASE WHEN r.nota <= 6 THEN 1.0 ELSE 0 END) / NULLIF(COUNT(r.resposta_id), 0) * 100), 0
-                    ) as nps
-                FROM nps_respostas r
-                LEFT JOIN nps_clientes c ON r.cliente_id = c.cliente_id
-                LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id 
-                LEFT JOIN nps_segmentos s ON c.segmento_id = s.id 
-                LEFT JOIN nps_gestores g ON e.gestor_id = g.id
-                
-                {str_filtro_c}
-                AND (:apenas_ativos = 0 OR e.ativo = 1)
-                
-                GROUP BY {coluna_nome}
-                ORDER BY nps DESC, data_ultima_resposta DESC;
+                    {str_filtro_c}
+                    AND (:apenas_ativos = 0 OR e.ativo = 1)
+                    
+                    GROUP BY {coluna_nome}
+                )
+                SELECT
+                    rb.nome,
+                    rb.gestor,
+                    rb.gestor_avatar,
+                    rb.ativo,
+                    rb.total,
+                    rb.data_ultima_resposta,
+                    (SELECT a.id FROM nps_acoes a WHERE a.empresa_id = rb.empresa_ref ORDER BY a.created_at DESC LIMIT 1) as acao_id,
+                    (SELECT a.status FROM nps_acoes a WHERE a.empresa_id = rb.empresa_ref ORDER BY a.created_at DESC LIMIT 1) as acao_status,
+                    (SELECT a.created_at FROM nps_acoes a WHERE a.empresa_id = rb.empresa_ref ORDER BY a.created_at DESC LIMIT 1) as acao_criada_em,
+                    rb.nps
+                FROM ranking_base rb
+                ORDER BY rb.nps DESC, rb.data_ultima_resposta DESC;
             """)
             
             ranking_raw = conn.execute(sql_ranking, params).mappings().all()
@@ -1891,7 +1900,7 @@ def get_dashboard_trend(
             sql_trend = text(f"""
                 WITH UltimosMeses AS (
                     SELECT
-                        LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) as mes,
+                        DATE_FORMAT(COALESCE(r.data_resposta, r.created_at), '%Y-%m') as mes,
                         COUNT(r.resposta_id) as total,
                         SUM(CASE WHEN r.nota >= 9 THEN 1 ELSE 0 END) as promotores,
                         SUM(CASE WHEN r.nota <= 6 THEN 1 ELSE 0 END) as detratores
@@ -1899,8 +1908,8 @@ def get_dashboard_trend(
                     {tipo_join} nps_clientes c ON r.cliente_id = c.cliente_id
                     LEFT JOIN nps_empresas e ON COALESCE(r.empresa_id, c.empresa_id) = e.id
                     {condicao}
-                    GROUP BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7)
-                    ORDER BY LEFT(CAST(COALESCE(r.data_resposta, r.created_at) AS VARCHAR(10)), 7) DESC
+                    GROUP BY DATE_FORMAT(COALESCE(r.data_resposta, r.created_at), '%Y-%m')
+                    ORDER BY DATE_FORMAT(COALESCE(r.data_resposta, r.created_at), '%Y-%m') DESC
                     LIMIT 6
                 )
                 SELECT * FROM UltimosMeses ORDER BY mes ASC;
